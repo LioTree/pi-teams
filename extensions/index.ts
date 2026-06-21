@@ -6,6 +6,7 @@ import * as teams from "../src/utils/teams";
 import * as tasks from "../src/utils/tasks";
 import * as messaging from "../src/utils/messaging";
 import * as runtime from "../src/utils/runtime";
+import { buildTeammateSystemPrompt } from "../src/utils/plan-mode-prompt";
 import { Member } from "../src/utils/models";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
@@ -465,25 +466,23 @@ export default function (pi: ExtensionAPI) {
         });
       }
 
-      let modelInfo = "";
+      let member: Member | undefined;
       if (teamName) {
         try {
           const teamConfig = await teams.readConfig(teamName);
-          const member = teamConfig.members.find(m => m.name === agentName);
-          if (member && member.model) {
-            modelInfo = `\nYou are currently using model: ${member.model}`;
-            if (member.thinking) {
-              modelInfo += ` with thinking level: ${member.thinking}`;
-            }
-            modelInfo += `. When reporting your model or thinking level, use these exact values.`;
-          }
+          member = teamConfig.members.find(m => m.name === agentName);
         } catch (e) {
           // Ignore
         }
       }
 
       return {
-        systemPrompt: event.systemPrompt + `\n\nYou are teammate '${agentName}' on team '${teamName}'.\nYour lead is 'team-lead'.${modelInfo}\nStart by calling read_inbox(team_name="${teamName}") to get your initial instructions.`,
+        systemPrompt: buildTeammateSystemPrompt({
+          baseSystemPrompt: event.systemPrompt,
+          agentName,
+          teamName,
+          member,
+        }),
       };
     }
   });
