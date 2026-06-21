@@ -357,6 +357,38 @@ read_inbox({ team_name: "my-team", agent_name: "security-bot" })
 
 ---
 
+### wait_for_inbox
+
+Block until the current agent receives unread inbox messages. Returned messages are marked as read.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `poll_interval_ms` (optional): Polling interval in milliseconds. Default: `1000`
+- `timeout_seconds` (optional): Maximum time to wait. Omit to wait indefinitely
+
+**Returns**:
+- `messages`: Messages received by the current agent
+- `count`: Number of returned messages
+- `waitedMs`: Time spent waiting in milliseconds
+- `timedOut`: Whether the optional timeout expired before any message arrived
+
+**Behavior**:
+- Validates that the target team exists and that the current agent belongs to it before waiting
+- Fails immediately if the team is missing, deleted while waiting, or the agent is not a member
+
+**Examples**:
+```javascript
+// Wait indefinitely for my next unread message
+wait_for_inbox({ team_name: "my-team" })
+
+// Wait up to five minutes
+wait_for_inbox({ team_name: "my-team", timeout_seconds: 300 })
+```
+
+Use this after delegating work to a teammate when the Team Lead should pause until the teammate reports back.
+
+---
+
 ## Task Planning & Approval
 
 ### task_submit_plan
@@ -371,6 +403,7 @@ For teammates to submit their implementation plans for approval.
 **Behavior**:
 - Updates task status to `planning`
 - Saves the plan to the task
+- Automatically sends a wake-up inbox message to the lead when submitted by a teammate
 - Lead agent can then review and approve/reject
 
 **Example**:

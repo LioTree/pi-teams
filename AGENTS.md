@@ -42,6 +42,7 @@ Communication flows naturally between team members:
 - **Direct Messaging**: Send specific instructions to one teammate.
 - **Broadcasts**: Announce global changes (like API updates) to everyone at once.
 - **Inbox Polling**: Teammates automatically "wake up" to check for new work every 30 seconds when idle.
+- **Blocking Waits**: Team Leads can call `wait_for_inbox` after delegation to pause until a teammate reports back.
 
 ### 🛡️ Plan Approval Mode
 For critical changes, you can require teammates to submit a plan before they start:
@@ -84,4 +85,5 @@ Use automated hooks to ensure standards.
 ## ⚠️ Best Practices
 - **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.
 - **Clear Prompts**: Be specific about the teammate's role and boundaries when spawning.
+- **Delegate Then Wait**: If you hand off the current work to a teammate, call `wait_for_inbox` instead of continuing that same work yourself.
 - **Check-ins**: Use `task_list` regularly to see the "big picture" of your team's progress.

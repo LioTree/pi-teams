@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { InboxMessage } from "./models";
+import { InboxMessage, TeamConfig } from "./models";
 import { withLock } from "./lock";
 import { inboxPath } from "./paths";
 import { readConfig } from "./teams";
@@ -52,6 +52,110 @@ export async function readInbox(
 
     return result;
   });
+}
+
+export interface WaitForInboxOptions {
+  pollIntervalMs?: number;
+  timeoutSeconds?: number;
+  signal?: AbortSignal;
+  onPoll?: () => void | Promise<void>;
+}
+
+export interface WaitForInboxResult {
+  messages: InboxMessage[];
+  count: number;
+  waitedMs: number;
+  timedOut: boolean;
+}
+
+async function validateWaitTarget(teamName: string, agentName: string): Promise<void> {
+  let config: TeamConfig;
+  try {
+    config = await readConfig(teamName);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("not found")) {
+      throw new Error(`Team ${teamName} does not exist`);
+    }
+    throw error;
+  }
+
+  const isMember = config.members.some(member => member.name === agentName);
+  if (!isMember) {
+    throw new Error(`Agent ${agentName} is not a member of team ${teamName}`);
+  }
+}
+
+function createAbortError(): Error {
+  const error = new Error("wait_for_inbox aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function waitForDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(createAbortError());
+
+  return new Promise((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout>;
+    const onAbort = () => {
+      clearTimeout(timeout);
+      cleanup();
+      reject(createAbortError());
+    };
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+
+    timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export async function waitForInbox(
+  teamName: string,
+  agentName: string,
+  options: WaitForInboxOptions = {}
+): Promise<WaitForInboxResult> {
+  const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 1000);
+  const timeoutMs = options.timeoutSeconds === undefined
+    ? undefined
+    : Math.max(0, options.timeoutSeconds * 1000);
+  const startedAt = Date.now();
+
+  if (options.signal?.aborted) throw createAbortError();
+  await validateWaitTarget(teamName, agentName);
+
+  while (true) {
+    if (options.signal?.aborted) throw createAbortError();
+
+    const messages = await readInbox(teamName, agentName, true, true);
+    if (messages.length > 0) {
+      return {
+        messages,
+        count: messages.length,
+        waitedMs: Date.now() - startedAt,
+        timedOut: false,
+      };
+    }
+
+    await validateWaitTarget(teamName, agentName);
+
+    const elapsed = Date.now() - startedAt;
+    if (timeoutMs !== undefined && elapsed >= timeoutMs) {
+      return {
+        messages: [],
+        count: 0,
+        waitedMs: elapsed,
+        timedOut: true,
+      };
+    }
+
+    await options.onPoll?.();
+
+    const remainingTimeoutMs = timeoutMs === undefined ? pollIntervalMs : timeoutMs - elapsed;
+    await waitForDelay(Math.min(pollIntervalMs, Math.max(1, remainingTimeoutMs)), options.signal);
+  }
 }
 
 export async function sendPlainMessage(

@@ -42,6 +42,7 @@ pi install npm:pi-teams
 - **Shared Task Board**: Keep everyone on the same page with a persistent list of tasks and their status.
 - **Agent Messaging**: Agents can send direct messages to each other and to you (the Team Lead) to report progress.
 - **Autonomous Work**: Teammates automatically "wake up," read their instructions, and poll their inboxes for new work while idle.
+- **Delegate and Wait**: Team Leads can pause with `wait_for_inbox` after handing off work, then resume when a teammate reports back.
 - **Beautiful UI**: Optimized vertical splits in `tmux` with clear labels so you always know who is doing what.
 
 ### Advanced Features
@@ -102,10 +103,15 @@ When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-
 Teammates in `planning` mode will use `task_submit_plan`. As the lead, review their work:
 > **You:** "Review refactor-bot's plan for task 5. If it looks good, approve it. If not, reject it with feedback on the test coverage."
 
-### 4. Broadcast to Team
+### 4. Delegate and Wait
+> **You:** "Wait for my inbox until a teammate reports back."
+
+Use this after spawning or assigning work when you want the Team Lead to stop and wait instead of continuing the delegated task.
+
+### 5. Broadcast to Team
 > **You:** "Broadcast to the entire team: 'The API endpoint has changed to /v2. Please update your work accordingly.'"
 
-### 5. Shut Down Team
+### 6. Shut Down Team
 > **You:** "We're done. Shut down the team and close the panes."
 
 **Automatic Cleanup:**

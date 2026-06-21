@@ -269,7 +269,15 @@ Bad task:
 "Fix signup form"
 ```
 
-### 6. Check Progress Regularly
+### 6. Delegate Then Wait
+
+When you assign all current work to teammates, wait for a report instead of continuing the same task as the lead.
+
+> **You:** "Wait for my inbox until a teammate reports back."
+
+This keeps the lead available for review, coordination, and follow-up decisions.
+
+### 7. Check Progress Regularly
 
 > **You:** "List all tasks"
 > **You:** "Check my inbox for messages"

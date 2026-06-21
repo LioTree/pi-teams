@@ -684,7 +684,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       return {
-        content: [{ type: "text", text: `Teammate ${params.name} spawned in ${isWindow ? 'window' : 'pane'} ${terminalId}.` }],
+        content: [{
+          type: "text",
+          text: `Teammate ${params.name} spawned in ${isWindow ? 'window' : 'pane'} ${terminalId}. If you delegated all current work to this teammate, call wait_for_inbox to pause until they report back.`
+        }],
         details: { agentId: member.agentId, terminalId, isWindow },
       };
     },
@@ -791,6 +794,50 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "wait_for_inbox",
+    label: "Wait For Inbox",
+    description: "Block until the current agent receives unread inbox messages, then return and mark them as read.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      poll_interval_ms: Type.Optional(Type.Number({ description: "Polling interval in milliseconds. Defaults to 1000." })),
+      timeout_seconds: Type.Optional(Type.Number({ description: "Optional timeout. Omit to wait indefinitely." })),
+    }),
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const result = await messaging.waitForInbox(params.team_name, agentName, {
+        pollIntervalMs: params.poll_interval_ms,
+        timeoutSeconds: params.timeout_seconds,
+        signal,
+        onPoll: async () => {
+          if (isTeammate && teamName && params.team_name === teamName) {
+            try {
+              await runtime.writeRuntimeStatus(teamName, agentName, {
+                lastHeartbeatAt: Date.now(),
+              });
+            } catch {
+              // Heartbeat is best-effort while this tool is blocking.
+            }
+          }
+        },
+      });
+
+      if (isTeammate && teamName && params.team_name === teamName) {
+        const runtimeUpdates: Partial<runtime.AgentRuntimeStatus> = {
+          lastHeartbeatAt: Date.now(),
+          ready: true,
+          lastError: undefined,
+        };
+        if (result.count > 0) runtimeUpdates.lastInboxReadAt = Date.now();
+        await runtime.writeRuntimeStatus(teamName, agentName, runtimeUpdates);
+      }
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        details: result,
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "task_create",
     label: "Create Task",
     description: "Create a new team task.",
@@ -818,7 +865,7 @@ export default function (pi: ExtensionAPI) {
       plan: Type.String(),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const updated = await tasks.submitPlan(params.team_name, params.task_id, params.plan);
+      const updated = await tasks.submitPlan(params.team_name, params.task_id, params.plan, agentName);
       return {
         content: [{ type: "text", text: `Plan submitted for task ${params.task_id}.` }],
         details: { task: updated },

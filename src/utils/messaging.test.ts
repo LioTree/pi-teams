@@ -2,11 +2,18 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { appendMessage, readInbox, sendPlainMessage, broadcastMessage } from "./messaging";
+import { appendMessage, readInbox, sendPlainMessage, broadcastMessage, waitForInbox } from "./messaging";
 import * as paths from "./paths";
 
 // Mock the paths to use a temporary directory
 const testDir = path.join(os.tmpdir(), "pi-teams-test-" + Date.now());
+
+function writeTeamConfig(members = ["team-lead", "sender", "receiver", "member1", "member2"]) {
+  fs.writeFileSync(path.join(testDir, "config.json"), JSON.stringify({
+    name: "test-team",
+    members: members.map(name => ({ name })),
+  }));
+}
 
 describe("Messaging Utilities", () => {
   beforeEach(() => {
@@ -21,6 +28,8 @@ describe("Messaging Utilities", () => {
     vi.spyOn(paths, "configPath").mockImplementation((teamName) => {
       return path.join(testDir, "config.json");
     });
+
+    writeTeamConfig();
   });
 
   afterEach(() => {
@@ -100,5 +109,85 @@ describe("Messaging Utilities", () => {
     // Check sender's inbox (should be empty)
     const inboxSender = await readInbox("test-team", "sender", false, false);
     expect(inboxSender.length).toBe(0);
+  });
+
+  it("should return immediately when unread inbox messages already exist", async () => {
+    await sendPlainMessage("test-team", "sender", "receiver", "ready", "ready");
+
+    const result = await waitForInbox("test-team", "receiver", { pollIntervalMs: 5 });
+
+    expect(result.timedOut).toBe(false);
+    expect(result.count).toBe(1);
+    expect(result.messages[0].text).toBe("ready");
+  });
+
+  it("should wait until an unread message arrives", async () => {
+    const waiting = waitForInbox("test-team", "receiver", { pollIntervalMs: 5 });
+
+    setTimeout(() => {
+      void sendPlainMessage("test-team", "sender", "receiver", "delayed", "delayed");
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.timedOut).toBe(false);
+    expect(result.count).toBe(1);
+    expect(result.messages[0].text).toBe("delayed");
+  });
+
+  it("should mark returned messages as read", async () => {
+    await sendPlainMessage("test-team", "sender", "receiver", "consume me", "consume");
+
+    await waitForInbox("test-team", "receiver", { pollIntervalMs: 5 });
+
+    const unread = await readInbox("test-team", "receiver", true, false);
+    expect(unread.length).toBe(0);
+  });
+
+  it("should time out when no message arrives before the deadline", async () => {
+    const result = await waitForInbox("test-team", "receiver", {
+      pollIntervalMs: 5,
+      timeoutSeconds: 0.02,
+    });
+
+    expect(result.timedOut).toBe(true);
+    expect(result.count).toBe(0);
+    expect(result.messages.length).toBe(0);
+  });
+
+  it("should stop waiting when aborted", async () => {
+    const controller = new AbortController();
+    const waiting = waitForInbox("test-team", "receiver", {
+      pollIntervalMs: 50,
+      signal: controller.signal,
+    });
+
+    controller.abort();
+
+    await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
+  });
+
+  it("should fail fast when the team does not exist", async () => {
+    fs.unlinkSync(path.join(testDir, "config.json"));
+
+    await expect(waitForInbox("test-team", "receiver", { pollIntervalMs: 5 }))
+      .rejects.toThrow("Team test-team does not exist");
+  });
+
+  it("should fail fast when the agent is not a team member", async () => {
+    writeTeamConfig(["team-lead", "sender"]);
+
+    await expect(waitForInbox("test-team", "receiver", { pollIntervalMs: 5 }))
+      .rejects.toThrow("Agent receiver is not a member of team test-team");
+  });
+
+  it("should stop waiting when the team is deleted while blocked", async () => {
+    const waiting = waitForInbox("test-team", "receiver", { pollIntervalMs: 5 });
+
+    setTimeout(() => {
+      fs.unlinkSync(path.join(testDir, "config.json"));
+    }, 20);
+
+    await expect(waiting).rejects.toThrow("Team test-team does not exist");
   });
 });

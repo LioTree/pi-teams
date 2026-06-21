@@ -17,7 +17,8 @@ Coordinate multiple agents working on a project using shared task lists and mess
     *   `task_update`: Update a task's status (`pending`, `in_progress`, `completed`, `deleted`) or owner.
 4.  **Communicate**: Use `send_message` to give instructions or receive updates. Teammates should use `read_inbox` to check for messages.
 5.  **Monitor**: Use `check_teammate` to see if they are still running and if they have sent messages back.
-6.  **Cleanup**:
+6.  **Wait after delegation**: When you have delegated all current work, use `wait_for_inbox` to pause until a teammate reports back instead of continuing the same work yourself.
+7.  **Cleanup**:
     *   `force_kill_teammate`: Forcibly stop a teammate and remove them from the team.
     *   `process_shutdown_approved`: Orderly removal of a teammate after they've finished.
     *   `team_delete`: Remove a team and all its associated data.
@@ -30,6 +31,7 @@ When you are spawned as a teammate:
 - Regularly check `read_inbox` for updates from the lead.
 - Use `send_message` to "team-lead" to report progress or ask questions.
 - Update your assigned tasks using `task_update`.
+- Always send a message to "team-lead" when you complete work, submit a plan, get blocked, or need review.
 - If you are idle for more than 30 seconds, you will automatically check your inbox for new messages.
 
 ## Best Practices for Teammates
@@ -45,5 +47,6 @@ When you are spawned as a teammate:
 - **Clear Assignments**: Use `task_create` for all significant work items.
 - **Contextual Prompts**: Provide enough context in `spawn_teammate` for the teammate to understand their specific role.
 - **Task List Monitoring**: Regularly call `task_list` to see the status of all work.
+- **Delegate Then Wait**: After spawning or assigning a teammate and having no independent work, call `wait_for_inbox` so you pause until the teammate reports back.
 - **Direct Feedback**: Use `send_message` to provide course corrections or new instructions to teammates.
 - **Read Config**: Use `read_config` to see the full team roster and their current status.

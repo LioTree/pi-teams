@@ -4,8 +4,8 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { createTask, updateTask, readTask, listTasks, submitPlan, evaluatePlan } from "./tasks";
+import * as messaging from "./messaging";
 import * as paths from "./paths";
-import * as teams from "./teams";
 
 // Mock the paths to use a temporary directory
 const testDir = path.join(os.tmpdir(), "pi-teams-test-" + Date.now());
@@ -18,9 +18,18 @@ describe("Tasks Utilities", () => {
     // Override paths to use testDir
     vi.spyOn(paths, "taskDir").mockReturnValue(testDir);
     vi.spyOn(paths, "configPath").mockReturnValue(path.join(testDir, "config.json"));
+    vi.spyOn(paths, "inboxPath").mockImplementation((teamName, agentName) => {
+      return path.join(testDir, "inboxes", `${agentName}.json`);
+    });
     
     // Create a dummy team config
-    fs.writeFileSync(path.join(testDir, "config.json"), JSON.stringify({ name: "test-team" }));
+    fs.writeFileSync(path.join(testDir, "config.json"), JSON.stringify({
+      name: "test-team",
+      members: [
+        { name: "team-lead", agentType: "lead" },
+        { name: "teammate", agentType: "teammate" },
+      ],
+    }));
   });
 
   afterEach(() => {
@@ -60,6 +69,36 @@ describe("Tasks Utilities", () => {
     const task = await createTask("test-team", "Empty Test", "Should fail");
     await expect(submitPlan("test-team", task.id, "")).rejects.toThrow("Plan must not be empty");
     await expect(submitPlan("test-team", task.id, "   ")).rejects.toThrow("Plan must not be empty");
+  });
+
+  it("should notify the lead when a teammate submits a plan", async () => {
+    const notifySpy = vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined);
+    const task = await createTask("test-team", "Test Subject", "Test Description");
+
+    await submitPlan("test-team", task.id, "Step 1: Do something", "teammate");
+
+    expect(notifySpy).toHaveBeenCalledWith(
+      "test-team",
+      "teammate",
+      "team-lead",
+      expect.stringContaining(`task ${task.id} (Test Subject)`),
+      `Plan submitted for task ${task.id}`
+    );
+  });
+
+  it("should wake the lead when a teammate submits a plan", async () => {
+    const task = await createTask("test-team", "Test Subject", "Test Description");
+    const waiting = messaging.waitForInbox("test-team", "team-lead", { pollIntervalMs: 5 });
+
+    setTimeout(() => {
+      void submitPlan("test-team", task.id, "Step 1: Do something", "teammate");
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.count).toBe(1);
+    expect(result.messages[0].from).toBe("teammate");
+    expect(result.messages[0].summary).toBe(`Plan submitted for task ${task.id}`);
   });
 
   it("should list tasks", async () => {

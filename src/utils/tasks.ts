@@ -3,7 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { TaskFile } from "./models";
 import { taskDir, sanitizeName } from "./paths";
-import { teamExists } from "./teams";
+import * as messaging from "./messaging";
+import { readConfig, teamExists } from "./teams";
 import { withLock } from "./lock";
 import { runHook } from "./hooks";
 
@@ -83,11 +84,41 @@ export async function updateTask(
  * @param teamName The name of the team
  * @param taskId The ID of the task
  * @param plan The content of the plan
+ * @param submittedBy Optional agent name used to notify the lead
  * @returns The updated task
  */
-export async function submitPlan(teamName: string, taskId: string, plan: string): Promise<TaskFile> {
+export async function submitPlan(
+  teamName: string,
+  taskId: string,
+  plan: string,
+  submittedBy?: string
+): Promise<TaskFile> {
   if (!plan || !plan.trim()) throw new Error("Plan must not be empty");
-  return await updateTask(teamName, taskId, { status: "planning", plan });
+
+  let leadName: string | undefined;
+  if (submittedBy) {
+    const config = await readConfig(teamName);
+    leadName = config.members.find(m => m.agentType === "lead")?.name
+      ?? config.members.find(m => m.name === "team-lead")?.name;
+
+    if (!leadName) {
+      throw new Error(`Team ${teamName} has no lead member to notify`);
+    }
+  }
+
+  const updated = await updateTask(teamName, taskId, { status: "planning", plan });
+
+  if (submittedBy && leadName && submittedBy !== leadName) {
+    await messaging.sendPlainMessage(
+      teamName,
+      submittedBy,
+      leadName,
+      `${submittedBy} submitted a plan for task ${taskId} (${updated.subject}). Review the task details to approve or reject it.`,
+      `Plan submitted for task ${taskId}`
+    );
+  }
+
+  return updated;
 }
 
 /**
