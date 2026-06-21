@@ -32,6 +32,10 @@ export interface WaitForPlanEvaluationResult {
   timedOut: boolean;
 }
 
+export interface SubmitPlanAndWaitOptions extends WaitForPlanEvaluationOptions {
+  submittedBy: string;
+}
+
 export function getTaskId(teamName: string): string {
   const dir = taskDir(teamName);
   const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
@@ -187,6 +191,31 @@ export async function submitPlan(
   }
 
   return updated;
+}
+
+export async function submitPlanAndWaitForEvaluation(
+  teamName: string,
+  taskId: string,
+  plan: string,
+  options: SubmitPlanAndWaitOptions
+): Promise<WaitForPlanEvaluationResult> {
+  const leadName = await getLeadName(teamName);
+  if (!leadName) {
+    throw new Error(`Team ${teamName} has no lead member to notify`);
+  }
+
+  if (options.submittedBy === leadName) {
+    throw new Error("task_submit_plan waits for lead evaluation and must be called by a teammate, not the team lead.");
+  }
+
+  await submitPlan(teamName, taskId, plan, options.submittedBy);
+
+  return waitForPlanEvaluation(teamName, taskId, {
+    pollIntervalMs: options.pollIntervalMs,
+    timeoutSeconds: options.timeoutSeconds,
+    signal: options.signal,
+    onPoll: options.onPoll,
+  });
 }
 
 /**

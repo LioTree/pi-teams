@@ -857,49 +857,33 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "task_submit_plan",
     label: "Submit Plan",
-    description: "Submit a plan for a task, updating its status to 'planning'.",
+    description: "Submit a plan for a task and wait until the lead approves or rejects it.",
     parameters: Type.Object({
       team_name: Type.String(),
       task_id: Type.String(),
       plan: Type.String(),
-      wait_for_evaluation: Type.Optional(Type.Boolean({ default: false, description: "Wait until this task's plan is approved or rejected." })),
-      poll_interval_ms: Type.Optional(Type.Number({ description: "Polling interval in milliseconds when wait_for_evaluation is true. Defaults to 1000." })),
-      timeout_seconds: Type.Optional(Type.Number({ description: "Optional timeout when wait_for_evaluation is true. Omit to wait indefinitely." })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const updated = await tasks.submitPlan(params.team_name, params.task_id, params.plan, agentName);
-
-      if (params.wait_for_evaluation) {
-        const evaluation = await tasks.waitForPlanEvaluation(params.team_name, params.task_id, {
-          pollIntervalMs: params.poll_interval_ms,
-          timeoutSeconds: params.timeout_seconds,
-          signal,
-          onPoll: async () => {
-            if (isTeammate && teamName && params.team_name === teamName) {
-              try {
-                await runtime.writeRuntimeStatus(teamName, agentName, {
-                  lastHeartbeatAt: Date.now(),
-                });
-              } catch {
-                // Heartbeat is best-effort while this tool is blocking.
-              }
+      const evaluation = await tasks.submitPlanAndWaitForEvaluation(params.team_name, params.task_id, params.plan, {
+        submittedBy: agentName,
+        signal,
+        onPoll: async () => {
+          if (isTeammate && teamName && params.team_name === teamName) {
+            try {
+              await runtime.writeRuntimeStatus(teamName, agentName, {
+                lastHeartbeatAt: Date.now(),
+              });
+            } catch {
+              // Heartbeat is best-effort while this tool is blocking.
             }
-          },
-        });
-
-        const text = evaluation.timedOut
-          ? `Plan submitted for task ${params.task_id}, but no evaluation was received before timeout.`
-          : `Plan submitted for task ${params.task_id} and ${evaluation.action}d.`;
-
-        return {
-          content: [{ type: "text", text }],
-          details: { task: evaluation.task, evaluation },
-        };
-      }
+          }
+        },
+      });
+      const actionText = evaluation.action === "approve" ? "approved" : "rejected";
 
       return {
-        content: [{ type: "text", text: `Plan submitted for task ${params.task_id}.` }],
-        details: { task: updated },
+        content: [{ type: "text", text: `Plan submitted for task ${params.task_id} and ${actionText}.` }],
+        details: { task: evaluation.task, evaluation },
       };
     },
   });
@@ -918,8 +902,9 @@ export default function (pi: ExtensionAPI) {
       const updated = await tasks.evaluatePlan(params.team_name, params.task_id, params.action as any, params.feedback, {
         evaluatedBy: agentName,
       });
+      const actionText = params.action === "approve" ? "approved" : "rejected";
       return {
-        content: [{ type: "text", text: `Plan for task ${params.task_id} has been ${params.action}d.` }],
+        content: [{ type: "text", text: `Plan for task ${params.task_id} has been ${actionText}.` }],
         details: { task: updated },
       };
     },

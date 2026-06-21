@@ -396,22 +396,22 @@ Use this after delegating work to a teammate when the Team Lead should pause unt
 
 ### task_submit_plan
 
-For teammates to submit their implementation plans for approval.
+For teammates to submit their implementation plans for approval. This tool blocks until the lead approves or rejects the plan.
 
 **Parameters**:
 - `team_name` (required): Name of the team
 - `task_id` (required): ID of the task
 - `plan` (required): Implementation plan description
-- `wait_for_evaluation` (optional): If `true`, block until this task's plan is approved or rejected
-- `poll_interval_ms` (optional): Polling interval while waiting. Default: `1000`
-- `timeout_seconds` (optional): Maximum time to wait. Omit to wait indefinitely
 
 **Behavior**:
 - Updates task status to `planning`
 - Saves the plan to the task
 - Automatically sends a wake-up inbox message to the lead when submitted by a teammate
 - Lead agent can then review and approve/reject
-- When `wait_for_evaluation` is true, returns after this specific task is approved, rejected, or times out
+- Waits until this specific task is approved or rejected
+- Returns the latest task and evaluation result
+- If the plan is approved, the task status is `in_progress` and the teammate may start implementation
+- If the plan is rejected, the task remains `planning` with `planFeedback`; revise and resubmit
 
 **Example**:
 ```javascript

@@ -100,7 +100,7 @@ When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-
 ### 3. Assign Task & Get Approval
 > **You:** "Create a task for security-bot: 'Check the .env.example file for sensitive defaults' and set it to in_progress."
 
-Teammates in `planning` mode will use `task_submit_plan`. As the lead, review their work:
+Teammates in `planning` mode will use `task_submit_plan`, which waits until you approve or reject the plan. As the lead, review their work:
 > **You:** "Review refactor-bot's plan for task 5. If it looks good, approve it. If not, reject it with feedback on the test coverage."
 
 ### 4. Delegate and Wait

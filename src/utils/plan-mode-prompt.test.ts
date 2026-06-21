@@ -30,7 +30,8 @@ describe("buildTeammateSystemPrompt", () => {
 
     expect(enabled).toContain(PLAN_MODE_REQUIRED_PROMPT);
     expect(enabled).toContain("task_submit_plan");
-    expect(enabled).toContain("wait_for_evaluation");
+    expect(enabled).toContain("waits for the lead to approve or reject");
+    expect(enabled).not.toContain("wait_for_evaluation");
     expect(disabled).not.toContain(PLAN_MODE_REQUIRED_PROMPT);
     expect(disabled).not.toContain("task_submit_plan");
     expect(disabled).not.toContain("wait_for_evaluation");

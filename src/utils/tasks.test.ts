@@ -3,7 +3,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { createTask, updateTask, readTask, listTasks, submitPlan, evaluatePlan, waitForPlanEvaluation } from "./tasks";
+import { createTask, updateTask, readTask, listTasks, submitPlan, submitPlanAndWaitForEvaluation, evaluatePlan, waitForPlanEvaluation } from "./tasks";
 import * as messaging from "./messaging";
 import * as paths from "./paths";
 
@@ -236,6 +236,25 @@ describe("Tasks Utilities", () => {
     expect(result.task.status).toBe("in_progress");
   });
 
+  it("should submit a plan and wait for approval", async () => {
+    const task = await createTask("test-team", "Plan Test", "Should submit and wait");
+    await updateTask("test-team", task.id, { owner: "teammate" });
+    const waiting = submitPlanAndWaitForEvaluation("test-team", task.id, "Wait for it...", {
+      submittedBy: "teammate",
+      pollIntervalMs: 5,
+    });
+
+    setTimeout(() => {
+      void evaluatePlan("test-team", task.id, "approve", undefined, { evaluatedBy: "team-lead" });
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.timedOut).toBe(false);
+    expect(result.action).toBe("approve");
+    expect(result.task.status).toBe("in_progress");
+  });
+
   it("should reject a plan with feedback", async () => {
     const task = await createTask("test-team", "Plan Test", "Should be rejected");
     await submitPlan("test-team", task.id, "Wait for it...");
@@ -281,6 +300,50 @@ describe("Tasks Utilities", () => {
     expect(result.action).toBe("reject");
     expect(result.task.status).toBe("planning");
     expect(result.task.planFeedback).toBe("Add tests");
+  });
+
+  it("should submit a plan and wait for rejection", async () => {
+    const task = await createTask("test-team", "Plan Test", "Should submit and wait for rejection");
+    await updateTask("test-team", task.id, { owner: "teammate" });
+    const waiting = submitPlanAndWaitForEvaluation("test-team", task.id, "Wait for it...", {
+      submittedBy: "teammate",
+      pollIntervalMs: 5,
+    });
+
+    setTimeout(() => {
+      void evaluatePlan("test-team", task.id, "reject", "Add tests", { evaluatedBy: "team-lead" });
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.timedOut).toBe(false);
+    expect(result.action).toBe("reject");
+    expect(result.task.status).toBe("planning");
+    expect(result.task.planFeedback).toBe("Add tests");
+  });
+
+  it("should clear previous feedback when resubmitting a plan", async () => {
+    const task = await createTask("test-team", "Plan Test", "Should clear feedback");
+    await submitPlan("test-team", task.id, "First plan");
+    await evaluatePlan("test-team", task.id, "reject", "Add tests");
+
+    const resubmitted = await submitPlan("test-team", task.id, "Revised plan");
+
+    expect(resubmitted.planFeedback).toBe("");
+    expect(resubmitted.plan).toBe("Revised plan");
+  });
+
+  it("should not let the lead submit and wait for their own evaluation", async () => {
+    const task = await createTask("test-team", "Plan Test", "Lead should not self-wait");
+
+    await expect(submitPlanAndWaitForEvaluation("test-team", task.id, "Wait for it...", {
+      submittedBy: "team-lead",
+      pollIntervalMs: 5,
+    })).rejects.toThrow("must be called by a teammate");
+
+    const unchanged = await readTask("test-team", task.id);
+    expect(unchanged.status).toBe("pending");
+    expect(unchanged.plan).toBeUndefined();
   });
 
   it("should time out while waiting for plan evaluation", async () => {
