@@ -8,6 +8,30 @@ import { readConfig, teamExists } from "./teams";
 import { withLock } from "./lock";
 import { runHook } from "./hooks";
 
+export interface EvaluatePlanOptions {
+  evaluatedBy?: string;
+  retries?: number;
+}
+
+export interface UpdateTaskOptions {
+  updatedBy?: string;
+  retries?: number;
+}
+
+export interface WaitForPlanEvaluationOptions {
+  pollIntervalMs?: number;
+  timeoutSeconds?: number;
+  signal?: AbortSignal;
+  onPoll?: () => void | Promise<void>;
+}
+
+export interface WaitForPlanEvaluationResult {
+  task: TaskFile;
+  action?: "approve" | "reject";
+  waitedMs: number;
+  timedOut: boolean;
+}
+
 export function getTaskId(teamName: string): string {
   const dir = taskDir(teamName);
   const files = fs.readdirSync(dir).filter(f => f.endsWith(".json"));
@@ -19,6 +43,12 @@ function getTaskPath(teamName: string, taskId: string): string {
   const dir = taskDir(teamName);
   const safeTaskId = sanitizeName(taskId);
   return path.join(dir, `${safeTaskId}.json`);
+}
+
+async function getLeadName(teamName: string): Promise<string | undefined> {
+  const config = await readConfig(teamName);
+  return config.members.find(m => m.agentType === "lead")?.name
+    ?? config.members.find(m => m.name === "team-lead")?.name;
 }
 
 export async function createTask(
@@ -55,18 +85,21 @@ export async function updateTask(
   teamName: string,
   taskId: string,
   updates: Partial<TaskFile>,
-  retries?: number
+  optionsOrRetries?: UpdateTaskOptions | number
 ): Promise<TaskFile> {
   const p = getTaskPath(teamName, taskId);
+  const options = typeof optionsOrRetries === "number"
+    ? { retries: optionsOrRetries }
+    : optionsOrRetries ?? {};
 
-  return await withLock(p, async () => {
+  const { original, updated } = await withLock(p, async () => {
     if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);
     const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
     const updated = { ...task, ...updates };
 
     if (updates.status === "deleted") {
       fs.unlinkSync(p);
-      return updated;
+      return { original: task, updated };
     }
 
     fs.writeFileSync(p, JSON.stringify(updated, null, 2));
@@ -75,8 +108,45 @@ export async function updateTask(
       await runHook(teamName, "task_completed", updated);
     }
 
-    return updated;
-  }, retries);
+    return { original: task, updated };
+  }, options.retries);
+
+  await sendTaskUpdateNotifications(teamName, taskId, original, updated, updates, options.updatedBy);
+  return updated;
+}
+
+async function sendTaskUpdateNotifications(
+  teamName: string,
+  taskId: string,
+  original: TaskFile,
+  updated: TaskFile,
+  updates: Partial<TaskFile>,
+  updatedBy?: string
+) {
+  const ownerChanged = updates.owner !== undefined && updates.owner !== original.owner;
+  if (ownerChanged && updated.owner && updated.owner !== updatedBy) {
+    await messaging.sendPlainMessage(
+      teamName,
+      updatedBy ?? "team-lead",
+      updated.owner,
+      `${updatedBy ?? "team-lead"} assigned you task ${taskId} (${updated.subject}). Current status: ${updated.status}.`,
+      `Task ${taskId} assigned to you`
+    );
+  }
+
+  const completedNow = updates.status === "completed" && original.status !== "completed";
+  if (completedNow) {
+    const leadName = await getLeadName(teamName);
+    if (leadName && updatedBy !== leadName) {
+      await messaging.sendPlainMessage(
+        teamName,
+        updatedBy ?? updated.owner ?? "system",
+        leadName,
+        `Task ${taskId} (${updated.subject}) was marked completed${updated.owner ? ` by ${updated.owner}` : ""}.`,
+        `Task ${taskId} completed`
+      );
+    }
+  }
 }
 
 /**
@@ -97,16 +167,14 @@ export async function submitPlan(
 
   let leadName: string | undefined;
   if (submittedBy) {
-    const config = await readConfig(teamName);
-    leadName = config.members.find(m => m.agentType === "lead")?.name
-      ?? config.members.find(m => m.name === "team-lead")?.name;
+    leadName = await getLeadName(teamName);
 
     if (!leadName) {
       throw new Error(`Team ${teamName} has no lead member to notify`);
     }
   }
 
-  const updated = await updateTask(teamName, taskId, { status: "planning", plan });
+  const updated = await updateTask(teamName, taskId, { status: "planning", plan, planFeedback: "" });
 
   if (submittedBy && leadName && submittedBy !== leadName) {
     await messaging.sendPlainMessage(
@@ -135,11 +203,14 @@ export async function evaluatePlan(
   taskId: string,
   action: "approve" | "reject",
   feedback?: string,
-  retries?: number
+  optionsOrRetries?: EvaluatePlanOptions | number
 ): Promise<TaskFile> {
   const p = getTaskPath(teamName, taskId);
+  const options = typeof optionsOrRetries === "number"
+    ? { retries: optionsOrRetries }
+    : optionsOrRetries ?? {};
 
-  return await withLock(p, async () => {
+  const updated = await withLock(p, async () => {
     if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);
     const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
 
@@ -169,7 +240,89 @@ export async function evaluatePlan(
     const updated = { ...task, ...updates };
     fs.writeFileSync(p, JSON.stringify(updated, null, 2));
     return updated;
-  }, retries);
+  }, options.retries);
+
+  if (options.evaluatedBy && updated.owner && updated.owner !== options.evaluatedBy) {
+    const approved = action === "approve";
+    await messaging.sendPlainMessage(
+      teamName,
+      options.evaluatedBy,
+      updated.owner,
+      approved
+        ? `${options.evaluatedBy} approved your plan for task ${taskId} (${updated.subject}). You may begin implementation.`
+        : `${options.evaluatedBy} rejected your plan for task ${taskId} (${updated.subject}). Feedback: ${feedback}`,
+      `Plan ${approved ? "approved" : "rejected"} for task ${taskId}`
+    );
+  }
+
+  return updated;
+}
+
+function createAbortError(): Error {
+  const error = new Error("wait_for_plan_evaluation aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function waitForDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(createAbortError());
+
+  return new Promise((resolve, reject) => {
+    let timeout: ReturnType<typeof setTimeout>;
+    const onAbort = () => {
+      clearTimeout(timeout);
+      cleanup();
+      reject(createAbortError());
+    };
+    const cleanup = () => signal?.removeEventListener("abort", onAbort);
+
+    timeout = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function getPlanEvaluationAction(task: TaskFile): "approve" | "reject" | undefined {
+  if (task.status === "in_progress" || task.status === "completed") return "approve";
+  if (task.status === "planning" && task.planFeedback?.trim()) return "reject";
+  return undefined;
+}
+
+export async function waitForPlanEvaluation(
+  teamName: string,
+  taskId: string,
+  options: WaitForPlanEvaluationOptions = {}
+): Promise<WaitForPlanEvaluationResult> {
+  const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 1000);
+  const timeoutMs = options.timeoutSeconds === undefined
+    ? undefined
+    : Math.max(0, options.timeoutSeconds * 1000);
+  const startedAt = Date.now();
+
+  if (options.signal?.aborted) throw createAbortError();
+
+  while (true) {
+    if (options.signal?.aborted) throw createAbortError();
+
+    const task = await readTask(teamName, taskId);
+    const action = getPlanEvaluationAction(task);
+    const waitedMs = Date.now() - startedAt;
+    if (action) {
+      return { task, action, waitedMs, timedOut: false };
+    }
+
+    if (timeoutMs !== undefined && waitedMs >= timeoutMs) {
+      return { task, waitedMs, timedOut: true };
+    }
+
+    await options.onPoll?.();
+
+    const remainingTimeoutMs = timeoutMs === undefined ? pollIntervalMs : timeoutMs - waitedMs;
+    await waitForDelay(Math.min(pollIntervalMs, Math.max(1, remainingTimeoutMs)), options.signal);
+  }
 }
 
 export async function readTask(teamName: string, taskId: string, retries?: number): Promise<TaskFile> {

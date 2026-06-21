@@ -30,10 +30,10 @@ describe("buildTeammateSystemPrompt", () => {
 
     expect(enabled).toContain(PLAN_MODE_REQUIRED_PROMPT);
     expect(enabled).toContain("task_submit_plan");
-    expect(enabled).toContain("task_evaluate_plan");
+    expect(enabled).toContain("wait_for_evaluation");
     expect(disabled).not.toContain(PLAN_MODE_REQUIRED_PROMPT);
     expect(disabled).not.toContain("task_submit_plan");
-    expect(disabled).not.toContain("task_evaluate_plan");
+    expect(disabled).not.toContain("wait_for_evaluation");
   });
 
   it("preserves model and thinking metadata in the startup prompt", () => {

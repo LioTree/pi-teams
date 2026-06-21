@@ -1,8 +1,8 @@
 import { Member } from "./models";
 
 export const PLAN_MODE_REQUIRED_PROMPT = `Plan approval mode is required for you:
-- Before making repository changes or marking implementation work complete, submit a plan with task_submit_plan.
-- Wait for the lead to approve the plan with task_evaluate_plan before editing files or executing the implementation.
+- Before making repository changes or marking implementation work complete, submit a plan with task_submit_plan and set wait_for_evaluation to true.
+- Wait until task_submit_plan returns an approved evaluation before editing files or executing the implementation.
 - If the plan is rejected, use the task feedback to revise and resubmit the plan.
 - You may inspect files, read docs, list tasks, read your inbox, and do other non-mutating analysis before submitting the plan.`;
 

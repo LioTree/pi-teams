@@ -276,7 +276,10 @@ task_update({
 })
 ```
 
-**Note**: When status changes to `completed`, any hook script at `.pi/team-hooks/task_completed.sh` will automatically run.
+**Behavior**:
+- When `owner` changes to a teammate, that teammate receives a wake-up inbox message
+- When status changes to `completed`, the lead receives a wake-up inbox message
+- When status changes to `completed`, any hook script at `.pi/team-hooks/task_completed.sh` will automatically run
 
 ---
 
@@ -399,12 +402,16 @@ For teammates to submit their implementation plans for approval.
 - `team_name` (required): Name of the team
 - `task_id` (required): ID of the task
 - `plan` (required): Implementation plan description
+- `wait_for_evaluation` (optional): If `true`, block until this task's plan is approved or rejected
+- `poll_interval_ms` (optional): Polling interval while waiting. Default: `1000`
+- `timeout_seconds` (optional): Maximum time to wait. Omit to wait indefinitely
 
 **Behavior**:
 - Updates task status to `planning`
 - Saves the plan to the task
 - Automatically sends a wake-up inbox message to the lead when submitted by a teammate
 - Lead agent can then review and approve/reject
+- When `wait_for_evaluation` is true, returns after this specific task is approved, rejected, or times out
 
 **Example**:
 ```javascript
@@ -429,7 +436,8 @@ For the lead agent to approve or reject a submitted plan.
 
 **Behavior**:
 - **Approve**: Sets task status to `in_progress`, clears any previous feedback
-- **Reject**: Sets task status back to `in_progress` (for revision), saves feedback
+- **Reject**: Keeps task status as `planning` (for revision), saves feedback
+- Automatically sends a wake-up inbox message to the task owner when evaluated by another agent
 
 **Examples**:
 ```javascript

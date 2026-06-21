@@ -3,7 +3,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { createTask, updateTask, readTask, listTasks, submitPlan, evaluatePlan } from "./tasks";
+import { createTask, updateTask, readTask, listTasks, submitPlan, evaluatePlan, waitForPlanEvaluation } from "./tasks";
 import * as messaging from "./messaging";
 import * as paths from "./paths";
 
@@ -51,6 +51,48 @@ describe("Tasks Utilities", () => {
     
     const taskData = JSON.parse(fs.readFileSync(path.join(testDir, "1.json"), "utf-8"));
     expect(taskData.status).toBe("in_progress");
+  });
+
+  it("should wake the task owner when a task is assigned", async () => {
+    const task = await createTask("test-team", "Assignment Test", "Should wake owner");
+    const waiting = messaging.waitForInbox("test-team", "teammate", { pollIntervalMs: 5 });
+
+    setTimeout(() => {
+      void updateTask("test-team", task.id, {
+        owner: "teammate",
+        status: "in_progress",
+      }, {
+        updatedBy: "team-lead",
+      });
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.count).toBe(1);
+    expect(result.messages[0].from).toBe("team-lead");
+    expect(result.messages[0].summary).toBe(`Task ${task.id} assigned to you`);
+  });
+
+  it("should wake the lead when a task is completed", async () => {
+    const task = await createTask("test-team", "Completion Test", "Should wake lead");
+    await updateTask("test-team", task.id, {
+      owner: "teammate",
+      status: "in_progress",
+    }, {
+      updatedBy: "team-lead",
+    });
+    await messaging.readInbox("test-team", "teammate", true, true);
+    const waiting = messaging.waitForInbox("test-team", "team-lead", { pollIntervalMs: 5 });
+
+    setTimeout(() => {
+      void updateTask("test-team", task.id, { status: "completed" }, { updatedBy: "teammate" });
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.count).toBe(1);
+    expect(result.messages[0].from).toBe("teammate");
+    expect(result.messages[0].summary).toBe(`Task ${task.id} completed`);
   });
 
   it("should submit a plan successfully", async () => {
@@ -142,6 +184,58 @@ describe("Tasks Utilities", () => {
     expect(approved.planFeedback).toBe("");
   });
 
+  it("should notify the task owner when a plan is approved", async () => {
+    const notifySpy = vi.spyOn(messaging, "sendPlainMessage").mockResolvedValue(undefined);
+    const task = await createTask("test-team", "Plan Test", "Should notify owner");
+    await updateTask("test-team", task.id, { owner: "teammate" });
+    await submitPlan("test-team", task.id, "Wait for it...");
+
+    await evaluatePlan("test-team", task.id, "approve", undefined, { evaluatedBy: "team-lead" });
+
+    expect(notifySpy).toHaveBeenCalledWith(
+      "test-team",
+      "team-lead",
+      "teammate",
+      expect.stringContaining(`approved your plan for task ${task.id}`),
+      `Plan approved for task ${task.id}`
+    );
+  });
+
+  it("should wake the task owner when a plan is approved", async () => {
+    const task = await createTask("test-team", "Plan Test", "Should wake owner");
+    await updateTask("test-team", task.id, { owner: "teammate" });
+    await submitPlan("test-team", task.id, "Wait for it...");
+    await messaging.readInbox("test-team", "teammate", true, true);
+    const waiting = messaging.waitForInbox("test-team", "teammate", { pollIntervalMs: 5 });
+
+    setTimeout(() => {
+      void evaluatePlan("test-team", task.id, "approve", undefined, { evaluatedBy: "team-lead" });
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.count).toBe(1);
+    expect(result.messages[0].from).toBe("team-lead");
+    expect(result.messages[0].summary).toBe(`Plan approved for task ${task.id}`);
+  });
+
+  it("should wait for plan approval", async () => {
+    const task = await createTask("test-team", "Plan Test", "Should wait for approval");
+    await updateTask("test-team", task.id, { owner: "teammate" });
+    await submitPlan("test-team", task.id, "Wait for it...");
+    const waiting = waitForPlanEvaluation("test-team", task.id, { pollIntervalMs: 5 });
+
+    setTimeout(() => {
+      void evaluatePlan("test-team", task.id, "approve", undefined, { evaluatedBy: "team-lead" });
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.timedOut).toBe(false);
+    expect(result.action).toBe("approve");
+    expect(result.task.status).toBe("in_progress");
+  });
+
   it("should reject a plan with feedback", async () => {
     const task = await createTask("test-team", "Plan Test", "Should be rejected");
     await submitPlan("test-team", task.id, "Wait for it...");
@@ -150,6 +244,57 @@ describe("Tasks Utilities", () => {
     const rejected = await evaluatePlan("test-team", task.id, "reject", feedback);
     expect(rejected.status).toBe("planning");
     expect(rejected.planFeedback).toBe(feedback);
+  });
+
+  it("should wake the task owner when a plan is rejected", async () => {
+    const task = await createTask("test-team", "Plan Test", "Should wake owner on rejection");
+    await updateTask("test-team", task.id, { owner: "teammate" });
+    await submitPlan("test-team", task.id, "Wait for it...");
+    await messaging.readInbox("test-team", "teammate", true, true);
+    const waiting = messaging.waitForInbox("test-team", "teammate", { pollIntervalMs: 5 });
+
+    setTimeout(() => {
+      void evaluatePlan("test-team", task.id, "reject", "Add tests", { evaluatedBy: "team-lead" });
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.count).toBe(1);
+    expect(result.messages[0].from).toBe("team-lead");
+    expect(result.messages[0].summary).toBe(`Plan rejected for task ${task.id}`);
+    expect(result.messages[0].text).toContain("Add tests");
+  });
+
+  it("should wait for plan rejection", async () => {
+    const task = await createTask("test-team", "Plan Test", "Should wait for rejection");
+    await updateTask("test-team", task.id, { owner: "teammate" });
+    await submitPlan("test-team", task.id, "Wait for it...");
+    const waiting = waitForPlanEvaluation("test-team", task.id, { pollIntervalMs: 5 });
+
+    setTimeout(() => {
+      void evaluatePlan("test-team", task.id, "reject", "Add tests", { evaluatedBy: "team-lead" });
+    }, 20);
+
+    const result = await waiting;
+
+    expect(result.timedOut).toBe(false);
+    expect(result.action).toBe("reject");
+    expect(result.task.status).toBe("planning");
+    expect(result.task.planFeedback).toBe("Add tests");
+  });
+
+  it("should time out while waiting for plan evaluation", async () => {
+    const task = await createTask("test-team", "Plan Test", "Should time out");
+    await submitPlan("test-team", task.id, "Wait for it...");
+
+    const result = await waitForPlanEvaluation("test-team", task.id, {
+      pollIntervalMs: 5,
+      timeoutSeconds: 0.01,
+    });
+
+    expect(result.timedOut).toBe(true);
+    expect(result.action).toBeUndefined();
+    expect(result.task.status).toBe("planning");
   });
 
   it("should fail to evaluate a task not in 'planning' status", async () => {
