@@ -85,5 +85,5 @@ Use automated hooks to ensure standards.
 ## ⚠️ Best Practices
 - **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.
 - **Clear Prompts**: Be specific about the teammate's role and boundaries when spawning.
-- **Delegate Then Wait**: If you hand off the current work to a teammate, call `wait_for_inbox` instead of continuing that same work yourself.
+- **Delegate Then Wait**: If you hand off the current work to a teammate, call `team_wait` instead of continuing that same work yourself.
 - **Check-ins**: Use `task_list` regularly to see the "big picture" of your team's progress.

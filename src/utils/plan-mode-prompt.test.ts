@@ -31,10 +31,12 @@ describe("buildTeammateSystemPrompt", () => {
     expect(enabled).toContain(PLAN_MODE_REQUIRED_PROMPT);
     expect(enabled).toContain("plan_submit");
     expect(enabled).toContain("waits for the lead to approve or reject");
+    expect(enabled).toContain('team_wait(team_name="refactor-squad", event="message")');
     expect(enabled).not.toContain("wait_for_evaluation");
     expect(disabled).not.toContain(PLAN_MODE_REQUIRED_PROMPT);
     expect(disabled).toContain(TASK_PLAN_REQUIRED_PROMPT);
     expect(disabled).toContain("plan_submit");
+    expect(disabled).toContain('team_wait(team_name="refactor-squad", event="message")');
     expect(disabled).not.toContain("wait_for_evaluation");
   });
 

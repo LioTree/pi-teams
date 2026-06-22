@@ -4,7 +4,7 @@ export const PLAN_MODE_REQUIRED_PROMPT = `Plan approval mode is required for you
 - Before making repository changes or marking implementation work complete, submit a plan with plan_submit.
 - plan_submit waits for the lead to approve or reject the plan; do not continue implementation until it returns an approved evaluation.
 - If the plan is rejected, use the task feedback to revise and resubmit the plan.
-- You may inspect files, read docs, list tasks, read your inbox, and do other non-mutating analysis before submitting the plan.`;
+- You may inspect files, read docs, list tasks, wait for team messages, and do other non-mutating analysis before submitting the plan.`;
 
 export const TASK_PLAN_REQUIRED_PROMPT = `If an assigned task or message says plan approval is required, or the task has planRequired=true, submit a plan with plan_submit before making repository changes for that task.`;
 
@@ -25,7 +25,7 @@ export function buildTeammateSystemPrompt(options: TeammateSystemPromptOptions):
   return options.baseSystemPrompt +
     `\n\nYou are teammate '${options.agentName}' on team '${options.teamName}'.` +
     `\nYour lead is 'team-lead'.${modelInfo}${planModeInfo}` +
-    `\nStart by calling read_inbox(team_name="${options.teamName}") to get your initial instructions.`;
+    `\nStart by calling team_wait(team_name="${options.teamName}", event="message") to get your initial instructions.`;
 }
 
 function buildModelInfo(member?: Member): string {

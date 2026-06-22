@@ -15,8 +15,7 @@ Coordinate multiple agents working on a project using shared task lists and mess
     *   `task_complete`: Mark owned work complete.
     *   `task_list`: List all tasks to monitor progress or find available work.
     *   `task_read`: Get full details of a specific task by ID.
-    *   `task_update`: Low-level direct status or owner changes. Completion follows `task_complete` rules.
-4.  **Communicate**: Prefer `team_message`; use `read_inbox` for low-level inbox inspection.
+4.  **Communicate**: Use `team_message`.
 5.  **Monitor**: Use `team_status` for the full board, or `check_teammate` for one teammate.
 6.  **Wait after delegation**: When you have delegated all current work, use `team_wait` to pause for a message, plan, completion, or all tasks done.
 7.  **Cleanup**:
@@ -27,8 +26,8 @@ Coordinate multiple agents working on a project using shared task lists and mess
 
 When you are spawned as a teammate:
 - Your status bar will show "Teammate: name @ team".
-- You will automatically start by calling `read_inbox` to get your initial instructions.
-- Regularly check `read_inbox` for updates from the lead.
+- You will automatically start by calling `team_wait` with `event="message"` to get your initial instructions.
+- Regularly call `team_wait` with `event="message"` for updates from the lead.
 - Use `team_message` to "team-lead" to report progress or ask questions.
 - Complete assigned tasks using `task_complete`.
 - Always send a message to "team-lead" when you complete work, submit a plan, get blocked, or need review.

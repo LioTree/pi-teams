@@ -36,107 +36,7 @@ team_create({ team_name: "research", default_model: "gpt-4o" })
 
 ---
 
-### team_delete
-
-Delete a team and all its data (configuration, tasks, messages).
-
-**Parameters**:
-- `team_name` (required): Name of the team to delete
-
-**Example**:
-```javascript
-team_delete({ team_name: "my-team" })
-```
-
----
-
-### read_config
-
-Get details about the team and its members.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-
-**Returns**: Team configuration including:
-- Team name and description
-- Default model
-- List of members with their models and thinking levels
-- Creation timestamp
-
-**Example**:
-```javascript
-read_config({ team_name: "my-team" })
-```
-
----
-
 ## Teammates
-
-### spawn_teammate
-
-Launch a new agent into a terminal pane with a role and instructions.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `name` (required): Friendly name for the teammate (e.g., "security-bot")
-- `prompt` (required): Instructions for the teammate's role and initial task
-- `cwd` (required): Working directory for the teammate
-- `model` (optional): AI model for this teammate (overrides team default)
-- `thinking` (optional): Thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`)
-- `plan_mode_required` (optional): If `true`, teammate must submit plans for approval
-
-**Model Options**:
-- Any model available in your pi configuration
-- Common models: `gpt-4o`, `haiku` (Anthropic), `glm-4.7`, `glm-5` (Zhipu AI)
-
-**Thinking Levels**:
-- `off`: No thinking blocks (fastest)
-- `minimal`: Minimal reasoning overhead
-- `low`: Light reasoning for quick decisions
-- `medium`: Balanced reasoning (default)
-- `high`: Extended reasoning for complex problems
-- `xhigh`: Maximum available reasoning for the hardest tasks
-
-**Examples**:
-```javascript
-// Basic spawn
-spawn_teammate({
-  team_name: "my-team",
-  name: "security-bot",
-  prompt: "Scan the codebase for hardcoded API keys",
-  cwd: "/path/to/project"
-})
-
-// With custom model
-spawn_teammate({
-  team_name: "my-team",
-  name: "speed-bot",
-  prompt: "Run benchmarks on the API endpoints",
-  cwd: "/path/to/project",
-  model: "haiku"
-})
-
-// With plan approval
-spawn_teammate({
-  team_name: "my-team",
-  name: "refactor-bot",
-  prompt: "Refactor the user service",
-  cwd: "/path/to/project",
-  plan_mode_required: true
-})
-
-// With custom model and thinking
-spawn_teammate({
-  team_name: "my-team",
-  name: "architect-bot",
-  prompt: "Design the new feature architecture",
-  cwd: "/path/to/project",
-  model: "gpt-4o",
-  thinking: "xhigh"
-})
-```
-
----
 
 ### check_teammate
 
@@ -162,21 +62,6 @@ check_teammate({ team_name: "my-team", agent_name: "security-bot" })
 
 ---
 
-### force_kill_teammate
-
-Forcibly kill a teammate's tmux pane and remove them from the team.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `agent_name` (required): Name of the teammate to kill
-
-**Example**:
-```javascript
-force_kill_teammate({ team_name: "my-team", agent_name: "security-bot" })
-```
-
----
-
 ### process_shutdown_approved
 
 Initiate orderly shutdown for a finished teammate.
@@ -196,14 +81,12 @@ process_shutdown_approved({ team_name: "my-team", agent_name: "security-bot" })
 
 ### Recommended Semantic Workflow
 
-Prefer these higher-level tools for normal coordination:
+Use these semantic tools for normal coordination:
 - `delegate_task`: create a task, assign it, and spawn or reuse the teammate in one call
 - `team_message`: send to one teammate, the lead, or everyone
 - `team_wait`: wait for a message, plan, task completion, or all tasks being done
 - `plan_submit` / `plan_review`: submit and review task plans
 - `task_claim` / `task_complete`: self-claim work and complete owned tasks
-
-The lower-level tools (`spawn_teammate`, `task_create`, `task_update`, `read_inbox`, `wait_for_inbox`) remain available for advanced/admin/debug workflows.
 
 ---
 
@@ -246,26 +129,6 @@ delegate_task({
 
 ---
 
-### task_create
-
-Create a new task for the team. Prefer `delegate_task` for normal delegation.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `subject` (required): Brief task title
-- `description` (required): Detailed task description
-
-**Example**:
-```javascript
-task_create({
-  team_name: "my-team",
-  subject: "Audit auth endpoints",
-  description: "Review all authentication endpoints for SQL injection vulnerabilities"
-})
-```
-
----
-
 ### task_list
 
 List all tasks and their current status.
@@ -301,34 +164,6 @@ Get full details of a specific task.
 ```javascript
 task_read({ team_name: "my-team", task_id: "task_abc123" })
 ```
-
----
-
-### task_update
-
-Low-level task status or owner update. Prefer `delegate_task`, `task_claim`, and `task_complete` for normal workflows.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `task_id` (required): ID of the task to update
-- `status` (optional): New status (`pending`, `planning`, `in_progress`, `completed`, `deleted`)
-- `owner` (optional): New owner (teammate name)
-
-**Example**:
-```javascript
-task_update({
-  team_name: "my-team",
-  task_id: "task_abc123",
-  status: "in_progress",
-  owner: "security-bot"
-})
-```
-
-**Behavior**:
-- When `owner` changes to a teammate, that teammate receives a wake-up inbox message
-- When status changes to `completed`, the public tool uses the same semantic completion path as `task_complete`
-- Completion requires `in_progress`, enforces `planRequired`, and blocks if `.pi/team-hooks/task_completed.sh` fails
-- Completion cannot be combined with owner reassignment; assign the task first, then complete it
 
 ---
 
@@ -386,113 +221,6 @@ team_message({
   content: "The API endpoint has changed to /v2."
 })
 ```
-
----
-
-### send_message
-
-Low-level direct message tool. Prefer `team_message`.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `recipient` (required): Name of the agent receiving the message
-- `content` (required): Full message content
-- `summary` (required): Brief summary for message list
-- `color` (optional): Message color for UI highlighting
-
-**Example**:
-```javascript
-send_message({
-  team_name: "my-team",
-  recipient: "security-bot",
-  content: "Please focus on the auth module first",
-  summary: "Focus on auth module"
-})
-```
-
----
-
-### broadcast_message
-
-Low-level broadcast tool. Prefer `team_message({ to: "all" })`.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `content` (required): Full message content
-- `summary` (required): Brief summary for message list
-- `color` (optional): Message color for UI highlighting
-
-**Use cases**:
-- API endpoint changes
-- Database schema updates
-- Team announcements
-- Priority shifts
-
-**Example**:
-```javascript
-broadcast_message({
-  team_name: "my-team",
-  content: "The API endpoint has changed to /v2. Please update your work accordingly.",
-  summary: "API endpoint changed to v2"
-})
-```
-
----
-
-### read_inbox
-
-Read incoming messages for an agent.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `agent_name` (optional): Whose inbox to read. Defaults to current agent.
-- `unread_only` (optional): Only show unread messages. Default: `true`
-
-**Returns**: Array of messages with sender, content, timestamp, and read status.
-
-**Examples**:
-```javascript
-// Read my unread messages
-read_inbox({ team_name: "my-team" })
-
-// Read all messages (including read)
-read_inbox({ team_name: "my-team", unread_only: false })
-
-// Read a teammate's inbox (as lead)
-read_inbox({ team_name: "my-team", agent_name: "security-bot" })
-```
-
----
-
-### wait_for_inbox
-
-Block until the current agent receives unread inbox messages. Returned messages are marked as read.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `poll_interval_ms` (optional): Polling interval in milliseconds. Default: `1000`
-- `timeout_seconds` (optional): Maximum time to wait. Omit to wait indefinitely
-
-**Returns**:
-- `messages`: Messages received by the current agent
-- `count`: Number of returned messages
-- `waitedMs`: Time spent waiting in milliseconds
-- `timedOut`: Whether the optional timeout expired before any message arrived
-
-**Behavior**:
-- Validates that the target team exists and that the current agent belongs to it before waiting
-- Fails immediately if the team is missing, deleted while waiting, or the agent is not a member
-
-**Examples**:
-```javascript
-// Wait indefinitely for my next unread message
-wait_for_inbox({ team_name: "my-team" })
-
-// Wait up to five minutes
-wait_for_inbox({ team_name: "my-team", timeout_seconds: 300 })
-```
-
-Use this after delegating work to a teammate when the Team Lead should pause until the teammate reports back.
 
 ---
 

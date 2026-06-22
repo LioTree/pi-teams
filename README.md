@@ -24,14 +24,11 @@ pi install npm:pi-teams
 # 1. Start a team (inside tmux, Zellij, or iTerm2)
 "Create a team named 'my-team' using 'gpt-4o'"
 
-# 2. Spawn teammates
-"Spawn 'security-bot' to scan for vulnerabilities"
-"Spawn 'frontend-dev' using 'haiku' for quick iterations"
-
-# 3. Delegate a task
+# 2. Delegate tasks
 "Delegate a task to security-bot: 'Audit auth endpoints'"
+"Delegate a task to frontend-dev using haiku: 'Review the dashboard UI'"
 
-# 4. Review and approve work
+# 3. Review and approve work
 "List all tasks and approve any pending plans"
 ```
 
@@ -42,7 +39,7 @@ pi install npm:pi-teams
 - **Shared Task Board**: Keep everyone on the same page with a persistent list of tasks and their status.
 - **Agent Messaging**: Agents can send direct messages to each other and to you (the Team Lead) to report progress.
 - **Autonomous Work**: Teammates automatically "wake up," read their instructions, and poll their inboxes for new work while idle.
-- **Delegate and Wait**: Team Leads can pause with `wait_for_inbox` after handing off work, then resume when a teammate reports back.
+- **Delegate and Wait**: Team Leads can pause with `team_wait` after handing off work, then resume when a teammate reports back.
 - **Beautiful UI**: Optimized vertical splits in `tmux` with clear labels so you always know who is doing what.
 
 ### Advanced Features
@@ -67,24 +64,24 @@ pi install npm:pi-teams
 > **You:** "Create a team named 'Dev' and open everyone in separate windows."
 *(Supported in iTerm2 and WezTerm only)*
 
-### 2. Spawn Teammate with Custom Settings
-> **You:** "Spawn a teammate named 'security-bot' in the current folder. Tell them to scan for hardcoded API keys."
+### 2. Delegate Work with Custom Settings
+> **You:** "Delegate a task to security-bot in the current folder: scan for hardcoded API keys."
 
-**Spawn a specific teammate in a separate window:**
-> **You:** "Spawn 'researcher' in a separate window."
+**Delegate to a teammate in a separate window:**
+> **You:** "Delegate research to researcher in a separate window."
 
 **Move the Team Lead to a separate window:**
 > **You:** "Open the team lead in its own window."
 *(Requires separate_windows mode enabled or iTerm2/WezTerm)*
 
 **Use a different model:**
-> **You:** "Spawn a teammate named 'speed-bot' using 'haiku' to quickly run some benchmarks."
+> **You:** "Delegate benchmarks to speed-bot using haiku."
 
 **Require plan approval:**
-> **You:** "Spawn a teammate named 'refactor-bot' and require plan approval before they make any changes."
+> **You:** "Delegate the refactor to refactor-bot and require plan approval before they make any changes."
 
 **Customize model and thinking level:**
-> **You:** "Spawn a teammate named 'architect-bot' using 'gpt-4o' with 'high' thinking level for deep reasoning."
+> **You:** "Delegate architecture review to architect-bot using gpt-4o with high thinking level."
 
 **Smart Model Resolution:**
 When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-teams automatically:
@@ -97,16 +94,16 @@ When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-
 
 > **Example:** Specifying `gemini-2.5-flash` will automatically use `google-gemini-cli/gemini-2.5-flash` if available, saving API costs.
 
-### 3. Assign Task & Get Approval
-> **You:** "Create a task for security-bot: 'Check the .env.example file for sensitive defaults' and set it to in_progress."
+### 3. Delegate Task & Get Approval
+> **You:** "Delegate to security-bot: check the .env.example file for sensitive defaults."
 
 Teammates with plan approval will use `plan_submit`, which waits until you approve or reject the plan. As the lead, review their work:
 > **You:** "Review refactor-bot's plan for task 5. If it looks good, approve it. If not, reject it with feedback on the test coverage."
 
 ### 4. Delegate and Wait
-> **You:** "Wait for my inbox until a teammate reports back."
+> **You:** "Wait for security-bot to complete task 1."
 
-Use this after spawning or assigning work when you want the Team Lead to stop and wait instead of continuing the delegated task.
+Use this after delegating work when you want the Team Lead to stop and wait instead of continuing the delegated task.
 
 ### 5. Broadcast to Team
 > **You:** "Broadcast to the entire team: 'The API endpoint has changed to /v2. Please update your work accordingly.'"
