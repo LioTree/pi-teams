@@ -26,8 +26,8 @@ Agents spawned in separate panes. They are designed for:
 ## 🛠 Capabilities
 
 ### 🚀 Specialist Spawning
-You can create teammates with custom identities, models, and reasoning depths:
-- **Custom Roles**: "Spawn a 'CSS Expert' to fix the layout shifts."
+You can delegate work to teammates with custom identities, models, and reasoning depths:
+- **Custom Roles**: "Delegate a layout task to a 'CSS Expert'."
 - **Model Selection**: Use `gpt-4o` for complex architecture and `haiku` for fast, repetitive tasks.
 - **Thinking Levels**: Set thinking to `high` for deep reasoning or `off` for maximum speed.
 
@@ -42,11 +42,11 @@ Communication flows naturally between team members:
 - **Direct Messaging**: Send specific instructions to one teammate.
 - **Broadcasts**: Announce global changes (like API updates) to everyone at once.
 - **Inbox Polling**: Teammates automatically "wake up" to check for new work every 30 seconds when idle.
-- **Blocking Waits**: Team Leads can call `wait_for_inbox` after delegation to pause until a teammate reports back.
+- **Blocking Waits**: Team Leads can call `team_wait` after delegation to pause until a teammate reports back, submits a plan, or completes work.
 
 ### 🛡️ Plan Approval Mode
 For critical changes, you can require teammates to submit a plan before they start:
-1. Teammate analyzes the task and calls `task_submit_plan`.
+1. Teammate analyzes the task and calls `plan_submit`.
 2. You review the plan in the Lead pane.
 3. You `approve` (to start work) or `reject` (with feedback for revision).
 
@@ -57,14 +57,14 @@ For critical changes, you can require teammates to submit a plan before they sta
 ### Pattern 1: The "Parallel Sprint"
 Use this when you have 3-4 independent features to build.
 1. Create a team: `team_create({ team_name: "feature-sprint" })`
-2. Spawn specialists for each feature.
-3. Create tasks for each specialist.
+2. Use `delegate_task` for each specialist and feature.
+3. Use `team_wait` or `team_status` to monitor progress.
 4. Monitor progress while you work on the core architecture.
 
 ### Pattern 2: The "Safety First" Audit
 Use this for refactoring or security work.
-1. Spawn a teammate with `plan_mode_required: true`.
-2. Assign the refactoring task.
+1. Delegate the refactoring task with `plan_required: true`.
+2. Wait for the submitted plan.
 3. Review their proposed changes before any code is touched.
 4. Approve the plan to let them execute.
 

@@ -28,8 +28,8 @@ pi install npm:pi-teams
 "Spawn 'security-bot' to scan for vulnerabilities"
 "Spawn 'frontend-dev' using 'haiku' for quick iterations"
 
-# 3. Create and assign tasks
-"Create a task for security-bot: 'Audit auth endpoints'"
+# 3. Delegate a task
+"Delegate a task to security-bot: 'Audit auth endpoints'"
 
 # 4. Review and approve work
 "List all tasks and approve any pending plans"
@@ -100,7 +100,7 @@ When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-
 ### 3. Assign Task & Get Approval
 > **You:** "Create a task for security-bot: 'Check the .env.example file for sensitive defaults' and set it to in_progress."
 
-Teammates in `planning` mode will use `task_submit_plan`, which waits until you approve or reject the plan. As the lead, review their work:
+Teammates with plan approval will use `plan_submit`, which waits until you approve or reject the plan. As the lead, review their work:
 > **You:** "Review refactor-bot's plan for task 5. If it looks good, approve it. If not, reject it with feedback on the test coverage."
 
 ### 4. Delegate and Wait

@@ -15,6 +15,32 @@ export interface EvaluatePlanOptions {
 
 export interface UpdateTaskOptions {
   updatedBy?: string;
+  notifyOwner?: boolean;
+  retries?: number;
+}
+
+export interface CreateTaskOptions {
+  activeForm?: string;
+  metadata?: Record<string, any>;
+  planRequired?: boolean;
+}
+
+export interface AssignTaskOptions {
+  assignedBy?: string;
+  notifyOwner?: boolean;
+  status?: TaskFile["status"];
+  planRequired?: boolean;
+  retries?: number;
+}
+
+export interface ClaimTaskOptions {
+  claimedBy: string;
+  retries?: number;
+}
+
+export interface CompleteTaskOptions {
+  completedBy: string;
+  summary?: string;
   retries?: number;
 }
 
@@ -55,15 +81,37 @@ async function getLeadName(teamName: string): Promise<string | undefined> {
     ?? config.members.find(m => m.name === "team-lead")?.name;
 }
 
+async function getMember(teamName: string, agentName: string) {
+  const config = await readConfig(teamName);
+  return config.members.find(m => m.name === agentName);
+}
+
+async function assertTeamMember(teamName: string, agentName: string) {
+  const member = await getMember(teamName, agentName);
+  if (!member) {
+    throw new Error(`Agent ${agentName} is not a member of team ${teamName}`);
+  }
+  return member;
+}
+
+async function isLead(teamName: string, agentName?: string): Promise<boolean> {
+  if (!agentName) return false;
+  return (await getLeadName(teamName)) === agentName;
+}
+
 export async function createTask(
   teamName: string,
   subject: string,
   description: string,
-  activeForm = "",
+  activeFormOrOptions: string | CreateTaskOptions = "",
   metadata?: Record<string, any>
 ): Promise<TaskFile> {
   if (!subject || !subject.trim()) throw new Error("Task subject must not be empty");
   if (!teamExists(teamName)) throw new Error(`Team ${teamName} does not exist`);
+
+  const options: CreateTaskOptions = typeof activeFormOrOptions === "string"
+    ? { activeForm: activeFormOrOptions, metadata }
+    : activeFormOrOptions;
 
   const dir = taskDir(teamName);
   const lockPath = dir;
@@ -74,11 +122,12 @@ export async function createTask(
       id,
       subject,
       description,
-      activeForm,
+      activeForm: options.activeForm ?? "",
+      planRequired: options.planRequired,
       status: "pending",
       blocks: [],
       blockedBy: [],
-      metadata,
+      metadata: options.metadata,
     };
     fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(task, null, 2));
     return task;
@@ -96,6 +145,18 @@ export async function updateTask(
     ? { retries: optionsOrRetries }
     : optionsOrRetries ?? {};
 
+  if (updates.status === "completed") {
+    const current = await readTask(teamName, taskId, options.retries);
+    if (updates.owner && updates.owner !== current.owner) {
+      throw new Error(`Cannot combine owner reassignment with completing task ${taskId}. Assign the task first, then complete it.`);
+    }
+
+    return completeTask(teamName, taskId, {
+      completedBy: options.updatedBy ?? current.owner ?? "team-lead",
+      retries: options.retries,
+    });
+  }
+
   const { original, updated } = await withLock(p, async () => {
     if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);
     const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
@@ -108,14 +169,127 @@ export async function updateTask(
 
     fs.writeFileSync(p, JSON.stringify(updated, null, 2));
 
-    if (updates.status === "completed") {
-      await runHook(teamName, "task_completed", updated);
-    }
-
     return { original: task, updated };
   }, options.retries);
 
-  await sendTaskUpdateNotifications(teamName, taskId, original, updated, updates, options.updatedBy);
+  await sendTaskUpdateNotifications(teamName, taskId, original, updated, updates, options.updatedBy, options.notifyOwner ?? true);
+  return updated;
+}
+
+export async function assignTask(
+  teamName: string,
+  taskId: string,
+  owner: string,
+  options: AssignTaskOptions = {}
+): Promise<TaskFile> {
+  await assertTeamMember(teamName, owner);
+
+  const updates: Partial<TaskFile> = { owner };
+  if (options.status) updates.status = options.status;
+  if (options.planRequired !== undefined) updates.planRequired = options.planRequired;
+
+  return updateTask(teamName, taskId, updates, {
+    updatedBy: options.assignedBy,
+    notifyOwner: options.notifyOwner,
+    retries: options.retries,
+  });
+}
+
+export async function claimTask(
+  teamName: string,
+  taskId: string,
+  options: ClaimTaskOptions
+): Promise<TaskFile> {
+  await assertTeamMember(teamName, options.claimedBy);
+  const p = getTaskPath(teamName, taskId);
+
+  const { original, updated } = await withLock(p, async () => {
+    if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);
+    const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
+
+    if (task.status !== "pending") {
+      throw new Error(`Cannot claim task ${taskId} because its status is '${task.status}'.`);
+    }
+
+    if (task.owner && task.owner !== options.claimedBy) {
+      throw new Error(`Cannot claim task ${taskId} because it is already assigned to ${task.owner}.`);
+    }
+
+    const updated: TaskFile = {
+      ...task,
+      owner: options.claimedBy,
+      status: task.planRequired ? "pending" : "in_progress",
+    };
+    fs.writeFileSync(p, JSON.stringify(updated, null, 2));
+    return { original: task, updated };
+  }, options.retries);
+
+  await sendTaskUpdateNotifications(teamName, taskId, original, updated, {
+    owner: options.claimedBy,
+    status: updated.status,
+  }, options.claimedBy);
+  return updated;
+}
+
+export async function completeTask(
+  teamName: string,
+  taskId: string,
+  options: CompleteTaskOptions
+): Promise<TaskFile> {
+  await assertTeamMember(teamName, options.completedBy);
+  const p = getTaskPath(teamName, taskId);
+
+  const { original, candidate } = await withLock(p, async () => {
+    if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);
+    const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
+
+    if (task.status === "deleted") {
+      throw new Error(`Cannot complete task ${taskId} because it is deleted.`);
+    }
+    if (task.status === "completed") {
+      throw new Error(`Cannot complete task ${taskId} because it is already completed.`);
+    }
+    if (task.planRequired && task.status !== "in_progress") {
+      throw new Error(`Cannot complete task ${taskId} before its required plan is approved.`);
+    }
+    if (task.status !== "in_progress") {
+      throw new Error(`Cannot complete task ${taskId} because its status is '${task.status}'.`);
+    }
+    if (task.owner && task.owner !== options.completedBy && !(await isLead(teamName, options.completedBy))) {
+      throw new Error(`Cannot complete task ${taskId} because it is assigned to ${task.owner}.`);
+    }
+
+    const updated: TaskFile = {
+      ...task,
+      owner: task.owner ?? options.completedBy,
+      status: "completed",
+      metadata: options.summary
+        ? { ...(task.metadata ?? {}), completionSummary: options.summary }
+        : task.metadata,
+    };
+
+    return { original: task, candidate: updated };
+  }, options.retries);
+
+  const hookOk = await runHook(teamName, "task_completed", candidate);
+  if (!hookOk) {
+    throw new Error(`task_completed hook failed; task ${taskId} was not completed.`);
+  }
+
+  const updated = await withLock(p, async () => {
+    if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);
+    const current: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
+    if (JSON.stringify(current) !== JSON.stringify(original)) {
+      throw new Error(`Task ${taskId} changed while completion hook was running; completion was not applied.`);
+    }
+
+    fs.writeFileSync(p, JSON.stringify(candidate, null, 2));
+    return candidate;
+  }, options.retries);
+
+  await sendTaskUpdateNotifications(teamName, taskId, original, updated, {
+    status: "completed",
+  }, options.completedBy);
   return updated;
 }
 
@@ -125,10 +299,11 @@ async function sendTaskUpdateNotifications(
   original: TaskFile,
   updated: TaskFile,
   updates: Partial<TaskFile>,
-  updatedBy?: string
+  updatedBy?: string,
+  notifyOwner = true
 ) {
   const ownerChanged = updates.owner !== undefined && updates.owner !== original.owner;
-  if (ownerChanged && updated.owner && updated.owner !== updatedBy) {
+  if (notifyOwner && ownerChanged && updated.owner && updated.owner !== updatedBy) {
     await messaging.sendPlainMessage(
       teamName,
       updatedBy ?? "team-lead",
@@ -171,6 +346,7 @@ export async function submitPlan(
 
   let leadName: string | undefined;
   if (submittedBy) {
+    await assertTeamMember(teamName, submittedBy);
     leadName = await getLeadName(teamName);
 
     if (!leadName) {
@@ -178,7 +354,28 @@ export async function submitPlan(
     }
   }
 
-  const updated = await updateTask(teamName, taskId, { status: "planning", plan, planFeedback: "" });
+  const p = getTaskPath(teamName, taskId);
+  const { original, updated, updates } = await withLock(p, async () => {
+    if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);
+    const task: TaskFile = JSON.parse(fs.readFileSync(p, "utf-8"));
+    const updates: Partial<TaskFile> = { status: "planning", plan, planFeedback: "" };
+
+    if (submittedBy) {
+      if (task.owner && task.owner !== submittedBy && submittedBy !== leadName) {
+        throw new Error(`Cannot submit a plan for task ${taskId} because it is assigned to ${task.owner}.`);
+      }
+
+      if (!task.owner && submittedBy !== leadName) {
+        updates.owner = submittedBy;
+      }
+    }
+
+    const updated = { ...task, ...updates };
+    fs.writeFileSync(p, JSON.stringify(updated, null, 2));
+    return { original: task, updated, updates };
+  });
+
+  await sendTaskUpdateNotifications(teamName, taskId, original, updated, updates, submittedBy, true);
 
   if (submittedBy && leadName && submittedBy !== leadName) {
     await messaging.sendPlainMessage(
@@ -205,7 +402,7 @@ export async function submitPlanAndWaitForEvaluation(
   }
 
   if (options.submittedBy === leadName) {
-    throw new Error("task_submit_plan waits for lead evaluation and must be called by a teammate, not the team lead.");
+    throw new Error("plan_submit waits for lead evaluation and must be called by a teammate, not the team lead.");
   }
 
   await submitPlan(teamName, taskId, plan, options.submittedBy);
@@ -238,6 +435,10 @@ export async function evaluatePlan(
   const options = typeof optionsOrRetries === "number"
     ? { retries: optionsOrRetries }
     : optionsOrRetries ?? {};
+
+  if (options.evaluatedBy && !(await isLead(teamName, options.evaluatedBy))) {
+    throw new Error(`Only the team lead can evaluate plans for task ${taskId}.`);
+  }
 
   const updated = await withLock(p, async () => {
     if (!fs.existsSync(p)) throw new Error(`Task ${taskId} not found`);

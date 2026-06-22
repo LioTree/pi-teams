@@ -194,25 +194,73 @@ process_shutdown_approved({ team_name: "my-team", agent_name: "security-bot" })
 
 ## Task Management
 
+### Recommended Semantic Workflow
+
+Prefer these higher-level tools for normal coordination:
+- `delegate_task`: create a task, assign it, and spawn or reuse the teammate in one call
+- `team_message`: send to one teammate, the lead, or everyone
+- `team_wait`: wait for a message, plan, task completion, or all tasks being done
+- `plan_submit` / `plan_review`: submit and review task plans
+- `task_claim` / `task_complete`: self-claim work and complete owned tasks
+
+The lower-level tools (`spawn_teammate`, `task_create`, `task_update`, `read_inbox`, `wait_for_inbox`) remain available for advanced/admin/debug workflows.
+
+---
+
+### delegate_task
+
+Create a task, assign it to a teammate, and spawn or reuse that teammate as needed.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `teammate_name` (required): Teammate to assign
+- `cwd` (required): Working directory if the teammate must be spawned
+- `task_subject` (required): Task title
+- `task_description` (required): Task details
+- `prompt` (optional): Extra instructions sent with the task
+- `model` / `thinking` (optional): Teammate runtime settings when spawning
+- `plan_required` (optional): If true, the task prompt tells the teammate to submit a plan before implementation
+- `reuse` (optional): `existing`, `replace`, or `error`. Default: `existing`
+- `wait` (optional): `none`, `plan`, or `completion`. Default: `none`
+- `timeout_seconds` (optional): Timeout when waiting
+- `separate_window` (optional): Spawn in a separate OS window when supported
+
+**Behavior**:
+- Reuses an existing live teammate by default
+- Replaces a dead same-name teammate automatically
+- Only restarts a live same-name teammate when `reuse: "replace"` is explicit
+- Creates a task with optional `planRequired`, assigns it, sends an inbox prompt with the task id, then spawns if needed
+
+**Example**:
+```javascript
+delegate_task({
+  team_name: "my-team",
+  teammate_name: "security-bot",
+  cwd: "/path/to/project",
+  task_subject: "Audit auth endpoints",
+  task_description: "Review all authentication endpoints for SQL injection vulnerabilities",
+  plan_required: true,
+  wait: "plan"
+})
+```
+
+---
+
 ### task_create
 
-Create a new task for the team.
+Create a new task for the team. Prefer `delegate_task` for normal delegation.
 
 **Parameters**:
 - `team_name` (required): Name of the team
 - `subject` (required): Brief task title
 - `description` (required): Detailed task description
-- `status` (optional): Initial status (`pending`, `in_progress`, `planning`, `completed`, `deleted`). Default: `pending`
-- `owner` (optional): Name of the teammate assigned to the task
 
 **Example**:
 ```javascript
 task_create({
   team_name: "my-team",
   subject: "Audit auth endpoints",
-  description: "Review all authentication endpoints for SQL injection vulnerabilities",
-  status: "pending",
-  owner: "security-bot"
+  description: "Review all authentication endpoints for SQL injection vulnerabilities"
 })
 ```
 
@@ -234,7 +282,7 @@ task_list({ team_name: "my-team" })
 
 ---
 
-### task_get
+### task_read
 
 Get full details of a specific task.
 
@@ -251,14 +299,14 @@ Get full details of a specific task.
 
 **Example**:
 ```javascript
-task_get({ team_name: "my-team", task_id: "task_abc123" })
+task_read({ team_name: "my-team", task_id: "task_abc123" })
 ```
 
 ---
 
 ### task_update
 
-Update a task's status or owner.
+Low-level task status or owner update. Prefer `delegate_task`, `task_claim`, and `task_complete` for normal workflows.
 
 **Parameters**:
 - `team_name` (required): Name of the team
@@ -278,16 +326,72 @@ task_update({
 
 **Behavior**:
 - When `owner` changes to a teammate, that teammate receives a wake-up inbox message
-- When status changes to `completed`, the lead receives a wake-up inbox message
-- When status changes to `completed`, any hook script at `.pi/team-hooks/task_completed.sh` will automatically run
+- When status changes to `completed`, the public tool uses the same semantic completion path as `task_complete`
+- Completion requires `in_progress`, enforces `planRequired`, and blocks if `.pi/team-hooks/task_completed.sh` fails
+- Completion cannot be combined with owner reassignment; assign the task first, then complete it
+
+---
+
+### task_claim
+
+Claim an unassigned task for the current agent using a task file lock.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `task_id` (required): ID of the task to claim
+
+**Behavior**:
+- Fails if the task is already assigned to another agent
+- Sets the current agent as owner
+- Sets status to `in_progress`, unless the task has `planRequired`, in which case it stays `pending` until a plan is submitted
+
+---
+
+### task_complete
+
+Mark the current agent's task complete.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `task_id` (required): ID of the task to complete
+- `summary` (optional): Completion summary stored in task metadata
+
+**Behavior**:
+- Only the task owner or lead can complete an assigned task
+- Task status must be `in_progress`
+- Runs `.pi/team-hooks/task_completed.sh` before writing `completed`
+- If the hook fails, the task remains unchanged
+- Sends the lead a wake-up inbox message when completed by a teammate
 
 ---
 
 ## Messaging
 
+### team_message
+
+Send a message to one teammate, the lead, or everyone.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `to` (required): Recipient name, `team-lead`, or `all`
+- `content` (required): Full message content
+- `summary` (optional): Summary. Defaults to the first line of content
+- `color` (optional): Message color
+
+**Example**:
+```javascript
+team_message({
+  team_name: "my-team",
+  to: "all",
+  content: "The API endpoint has changed to /v2."
+})
+```
+
+---
+
 ### send_message
 
-Send a message to a specific teammate or the team lead.
+Low-level direct message tool. Prefer `team_message`.
 
 **Parameters**:
 - `team_name` (required): Name of the team
@@ -310,7 +414,7 @@ send_message({
 
 ### broadcast_message
 
-Send a message to the entire team (excluding the sender).
+Low-level broadcast tool. Prefer `team_message({ to: "all" })`.
 
 **Parameters**:
 - `team_name` (required): Name of the team
@@ -392,9 +496,30 @@ Use this after delegating work to a teammate when the Team Lead should pause unt
 
 ---
 
+### team_wait
+
+Wait for a semantic team event.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `event` (required): `message`, `plan`, `task_completed`, or `all_tasks_done`
+- `task_id` (required for `plan` and `task_completed`): Limit the wait to one task, avoiding historical task matches
+- `poll_interval_ms` (optional): Polling interval in milliseconds. Default: `1000`
+- `timeout_seconds` (optional): Maximum time to wait. Omit to wait indefinitely
+
+`all_tasks_done` requires at least one task on the board; an empty team returns an error instead of waiting forever.
+
+**Examples**:
+```javascript
+team_wait({ team_name: "my-team", event: "plan", task_id: "1" })
+team_wait({ team_name: "my-team", event: "all_tasks_done", timeout_seconds: 600 })
+```
+
+---
+
 ## Task Planning & Approval
 
-### task_submit_plan
+### plan_submit
 
 For teammates to submit their implementation plans for approval. This tool blocks until the lead approves or rejects the plan.
 
@@ -406,6 +531,7 @@ For teammates to submit their implementation plans for approval. This tool block
 **Behavior**:
 - Updates task status to `planning`
 - Saves the plan to the task
+- A teammate can submit a plan only for their own task; an unowned task is assigned to the submitting teammate
 - Automatically sends a wake-up inbox message to the lead when submitted by a teammate
 - Lead agent can then review and approve/reject
 - Waits until this specific task is approved or rejected
@@ -415,7 +541,7 @@ For teammates to submit their implementation plans for approval. This tool block
 
 **Example**:
 ```javascript
-task_submit_plan({
+plan_submit({
   team_name: "my-team",
   task_id: "task_abc123",
   plan: "1. Add password strength validator component\n2. Integrate with existing signup form\n3. Add unit tests using zxcvbn library"
@@ -424,17 +550,18 @@ task_submit_plan({
 
 ---
 
-### task_evaluate_plan
+### plan_review
 
 For the lead agent to approve or reject a submitted plan.
 
 **Parameters**:
 - `team_name` (required): Name of the team
 - `task_id` (required): ID of the task
-- `action` (required): `"approve"` or `"reject"`
+- `decision` (required): `"approve"` or `"reject"`
 - `feedback` (optional): Feedback message (required when rejecting)
 
 **Behavior**:
+- Only the team lead can review plans
 - **Approve**: Sets task status to `in_progress`, clears any previous feedback
 - **Reject**: Keeps task status as `planning` (for revision), saves feedback
 - Automatically sends a wake-up inbox message to the task owner when evaluated by another agent
@@ -442,22 +569,20 @@ For the lead agent to approve or reject a submitted plan.
 **Examples**:
 ```javascript
 // Approve plan
-task_evaluate_plan({
+plan_review({
   team_name: "my-team",
   task_id: "task_abc123",
-  action: "approve"
+  decision: "approve"
 })
 
 // Reject with feedback
-task_evaluate_plan({
+plan_review({
   team_name: "my-team",
   task_id: "task_abc123",
-  action: "reject",
+  decision: "reject",
   feedback: "Please add more detail about error handling and edge cases"
 })
 ```
-
----
 
 ## Automated Behavior
 

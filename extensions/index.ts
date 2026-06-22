@@ -512,6 +512,186 @@ export default function (pi: ExtensionAPI) {
     await runtime.deleteRuntimeStatus(teamName, member.name);
   }
 
+  function isMemberAlive(member: Member): boolean {
+    if (!terminal) return false;
+    if (member.windowId) return terminal.isWindowAlive(member.windowId);
+    if (member.tmuxPaneId) return terminal.isAlive(member.tmuxPaneId);
+    return false;
+  }
+
+  function resolveChosenModel(teamConfig: any, model?: string): string | undefined {
+    let chosenModel = model || teamConfig.defaultModel;
+
+    if (chosenModel && !chosenModel.includes('/')) {
+      const resolved = resolveModelWithProvider(chosenModel);
+      if (resolved) {
+        chosenModel = resolved;
+      } else if (teamConfig.defaultModel && teamConfig.defaultModel.includes('/')) {
+        const [provider] = teamConfig.defaultModel.split('/');
+        chosenModel = `${provider}/${chosenModel}`;
+      }
+    }
+
+    return chosenModel;
+  }
+
+  function buildPiCommand(model?: string, thinking?: string): string {
+    const piBinary = getPiLaunchCommand();
+    if (model) {
+      return thinking ? `${piBinary} --model ${model}:${thinking}` : `${piBinary} --model ${model}`;
+    }
+    return thinking ? `${piBinary} --thinking ${thinking}` : piBinary;
+  }
+
+  async function spawnTeammateProcess(
+    safeTeamName: string,
+    safeName: string,
+    cwd: string,
+    chosenModel: string | undefined,
+    thinking: any,
+    useSeparateWindow: boolean,
+    teamConfig: any
+  ): Promise<{ terminalId: string; isWindow: boolean }> {
+    if (!terminal) {
+      throw new Error("No terminal adapter detected.");
+    }
+    if (useSeparateWindow && !terminal.supportsWindows()) {
+      throw new Error(`Separate windows mode is not supported in ${terminal.name}.`);
+    }
+
+    const piCmd = buildPiCommand(chosenModel, thinking);
+    const env: Record<string, string> = {
+      ...process.env,
+      PI_TEAM_NAME: safeTeamName,
+      PI_AGENT_NAME: safeName,
+    };
+
+    if (useSeparateWindow) {
+      const terminalId = terminal.spawnWindow({
+        name: safeName,
+        cwd,
+        command: piCmd,
+        env,
+        teamName: safeTeamName,
+      });
+      await teams.updateMember(safeTeamName, safeName, { windowId: terminalId });
+      return { terminalId, isWindow: true };
+    }
+
+    if (terminal instanceof Iterm2Adapter) {
+      const teammates = teamConfig.members.filter((m: Member) => m.agentType === "teammate" && m.tmuxPaneId.startsWith("iterm_"));
+      const lastTeammate = teammates.length > 0 ? teammates[teammates.length - 1] : null;
+      terminal.setSpawnContext(lastTeammate?.tmuxPaneId
+        ? { lastSessionId: lastTeammate.tmuxPaneId.replace("iterm_", "") }
+        : {});
+    }
+
+    const leadMember = teamConfig.members.find((m: Member) => m.name === "team-lead");
+    const anchorPaneId = terminal.name === "tmux"
+      ? leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined
+      : undefined;
+
+    const terminalId = terminal.spawn({
+      name: safeName,
+      cwd,
+      command: piCmd,
+      env,
+      anchorPaneId,
+    });
+    await teams.updateMember(safeTeamName, safeName, { tmuxPaneId: terminalId });
+    return { terminalId, isWindow: false };
+  }
+
+  function delegatedTaskPrompt(task: any, prompt: string | undefined, planRequired: boolean): string {
+    return [
+      `You have been assigned task ${task.id}: ${task.subject}`,
+      "",
+      task.description,
+      planRequired
+        ? `\nThis task requires plan approval. Before editing files or executing implementation, call plan_submit with task_id="${task.id}" and wait for approval.`
+        : "",
+      prompt ? `\nAdditional instructions:\n${prompt}` : "",
+    ].filter(Boolean).join("\n");
+  }
+
+  async function waitForTaskEvent(
+    teamName: string,
+    event: "plan" | "task_completed" | "all_tasks_done",
+    options: {
+      taskId?: string;
+      pollIntervalMs?: number;
+      timeoutSeconds?: number;
+      signal?: AbortSignal;
+      onPoll?: () => void | Promise<void>;
+    } = {}
+  ) {
+    const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 1000);
+    const timeoutMs = options.timeoutSeconds === undefined
+      ? undefined
+      : Math.max(0, options.timeoutSeconds * 1000);
+    const startedAt = Date.now();
+
+    const createAbortError = () => {
+      const error = new Error("team_wait aborted");
+      error.name = "AbortError";
+      return error;
+    };
+
+    const delay = (ms: number) => new Promise<void>((resolve, reject) => {
+      if (options.signal?.aborted) {
+        reject(createAbortError());
+        return;
+      }
+      let timeout: ReturnType<typeof setTimeout>;
+      const cleanup = () => options.signal?.removeEventListener("abort", onAbort);
+      const onAbort = () => {
+        clearTimeout(timeout);
+        cleanup();
+        reject(createAbortError());
+      };
+      timeout = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, ms);
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+    });
+
+    while (true) {
+      if (options.signal?.aborted) {
+        throw createAbortError();
+      }
+
+      const waitedMs = Date.now() - startedAt;
+      const taskList = options.taskId
+        ? [await tasks.readTask(teamName, options.taskId)]
+        : await tasks.listTasks(teamName);
+
+      if (event === "all_tasks_done" && !options.taskId && taskList.length === 0) {
+        throw new Error(`No tasks to wait for in team ${teamName}.`);
+      }
+
+      const matchedTasks = event === "plan"
+        ? taskList.filter(task => task.status === "planning" && task.plan?.trim() && !task.planFeedback?.trim())
+        : event === "task_completed"
+          ? taskList.filter(task => task.status === "completed")
+          : taskList.length > 0 && taskList.every(task => task.status === "completed")
+            ? taskList
+            : [];
+
+      if (matchedTasks.length > 0) {
+        return { event, tasks: matchedTasks, waitedMs, timedOut: false };
+      }
+
+      if (timeoutMs !== undefined && waitedMs >= timeoutMs) {
+        return { event, tasks: [], waitedMs, timedOut: true };
+      }
+
+      await options.onPoll?.();
+      const remainingTimeoutMs = timeoutMs === undefined ? pollIntervalMs : timeoutMs - waitedMs;
+      await delay(Math.min(pollIntervalMs, Math.max(1, remainingTimeoutMs)));
+    }
+  }
+
   // Tools
   pi.registerTool({
     name: "team_create",
@@ -613,6 +793,7 @@ export default function (pi: ExtensionAPI) {
         prompt: params.prompt,
         color: "blue",
         thinking: params.thinking,
+        defaultPlanRequired: params.plan_mode_required,
         planModeRequired: params.plan_mode_required,
       };
 
@@ -693,6 +874,176 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "delegate_task",
+    label: "Delegate Task",
+    description: "Create a task, assign it to a teammate, and spawn or reuse that teammate as needed.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      teammate_name: Type.String(),
+      cwd: Type.String(),
+      task_subject: Type.String(),
+      task_description: Type.String(),
+      prompt: Type.Optional(Type.String({ description: "Additional teammate instructions for this task." })),
+      model: Type.Optional(Type.String()),
+      thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
+      plan_required: Type.Optional(Type.Boolean({ default: false })),
+      reuse: Type.Optional(StringEnum(["existing", "replace", "error"])),
+      wait: Type.Optional(StringEnum(["none", "plan", "completion"])),
+      timeout_seconds: Type.Optional(Type.Number({ description: "Optional timeout when wait is plan or completion." })),
+      separate_window: Type.Optional(Type.Boolean({ default: false })),
+    }),
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const safeTeamName = paths.sanitizeName(params.team_name);
+      const safeName = paths.sanitizeName(params.teammate_name);
+      const reuse = params.reuse ?? "existing";
+      const waitMode = params.wait ?? "none";
+
+      if (!teams.teamExists(safeTeamName)) {
+        throw new Error(`Team ${params.team_name} does not exist`);
+      }
+
+      let teamConfig = await teams.readConfig(safeTeamName);
+      let member = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
+      const memberAlive = member ? isMemberAlive(member) : false;
+      const memberDefaultPlanRequired = member?.defaultPlanRequired ?? member?.planModeRequired ?? false;
+      const willSpawn = !member || reuse === "replace" || !memberAlive;
+      const requestedSeparateWindow = params.separate_window ?? teamConfig.separateWindows ?? false;
+
+      if (member && reuse === "error") {
+        throw new Error(`Teammate ${safeName} already exists in team ${safeTeamName}`);
+      }
+
+      if (member && memberAlive && reuse === "existing" && member.cwd && path.resolve(member.cwd) !== path.resolve(params.cwd)) {
+        throw new Error(`Teammate ${safeName} is already running in ${member.cwd}. Use reuse="replace" to restart it in ${params.cwd}.`);
+      }
+
+      if (willSpawn) {
+        if (!terminal) {
+          throw new Error("No terminal adapter detected.");
+        }
+        if (requestedSeparateWindow && !terminal.supportsWindows()) {
+          throw new Error(`Separate windows mode is not supported in ${terminal.name}.`);
+        }
+      }
+
+      if (member && (reuse === "replace" || !memberAlive)) {
+        await killTeammate(safeTeamName, member);
+        await teams.removeMember(safeTeamName, safeName);
+        member = undefined;
+        teamConfig = await teams.readConfig(safeTeamName);
+      }
+
+      const planRequired = params.plan_required ?? memberDefaultPlanRequired;
+      const task = await tasks.createTask(safeTeamName, params.task_subject, params.task_description, {
+        planRequired,
+        metadata: { createdBy: "delegate_task" },
+      });
+
+      let terminalId = member?.windowId || member?.tmuxPaneId || "";
+      let isWindow = !!member?.windowId;
+      let spawned = false;
+      let spawnConfig: { chosenModel?: string; useSeparateWindow: boolean } | undefined;
+
+      if (!member) {
+        const chosenModel = resolveChosenModel(teamConfig, params.model);
+        const newMember: Member = {
+          agentId: `${safeName}@${safeTeamName}`,
+          name: safeName,
+          agentType: "teammate",
+          model: chosenModel,
+          joinedAt: Date.now(),
+          tmuxPaneId: "",
+          cwd: params.cwd,
+          subscriptions: [],
+          prompt: delegatedTaskPrompt(task, params.prompt, planRequired),
+          color: "blue",
+          thinking: params.thinking,
+          defaultPlanRequired: false,
+          planModeRequired: false,
+        };
+
+        await teams.addMember(safeTeamName, newMember);
+        member = newMember;
+        spawnConfig = { chosenModel, useSeparateWindow: requestedSeparateWindow };
+      }
+
+      const assigned = await tasks.assignTask(safeTeamName, task.id, safeName, {
+        assignedBy: agentName,
+        notifyOwner: false,
+        status: planRequired ? "pending" : "in_progress",
+        planRequired,
+      });
+
+      await messaging.sendPlainMessage(
+        safeTeamName,
+        agentName,
+        safeName,
+        delegatedTaskPrompt(assigned, params.prompt, planRequired),
+        `Task ${task.id} delegated to you`
+      );
+
+      if (spawnConfig) {
+        try {
+          const spawnResult = await spawnTeammateProcess(
+            safeTeamName,
+            safeName,
+            params.cwd,
+            spawnConfig.chosenModel,
+            params.thinking,
+            spawnConfig.useSeparateWindow,
+            teamConfig
+          );
+          terminalId = spawnResult.terminalId;
+          isWindow = spawnResult.isWindow;
+          spawned = true;
+        } catch (error) {
+          await teams.removeMember(safeTeamName, safeName);
+          const inbox = paths.inboxPath(safeTeamName, safeName);
+          if (fs.existsSync(inbox)) fs.unlinkSync(inbox);
+          await tasks.updateTask(safeTeamName, task.id, {
+            owner: undefined,
+            status: "pending",
+            metadata: {
+              ...(assigned.metadata ?? {}),
+              delegationError: error instanceof Error ? error.message : String(error),
+            },
+          });
+          throw error;
+        }
+      }
+
+      let waitResult: any = undefined;
+      if (waitMode === "plan") {
+        waitResult = await waitForTaskEvent(safeTeamName, "plan", {
+          taskId: task.id,
+          timeoutSeconds: params.timeout_seconds,
+          signal,
+        });
+      } else if (waitMode === "completion") {
+        waitResult = await waitForTaskEvent(safeTeamName, "task_completed", {
+          taskId: task.id,
+          timeoutSeconds: params.timeout_seconds,
+          signal,
+        });
+      }
+
+      const waitText = waitResult
+        ? waitResult.timedOut
+          ? ` Wait for ${waitMode} timed out.`
+          : ` Wait for ${waitMode} completed.`
+        : "";
+
+      return {
+        content: [{
+          type: "text",
+          text: `Task ${task.id} delegated to ${safeName}${spawned ? ` in ${isWindow ? "window" : "pane"} ${terminalId}` : ""}.${waitText}`,
+        }],
+        details: { task: assigned, teammate: member, spawned, terminalId, isWindow, wait: waitResult },
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "spawn_lead_window",
     label: "Spawn Lead Window",
     description: "Open the team lead in a separate OS window.",
@@ -759,6 +1110,40 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: `Message broadcasted to all team members.` }],
         details: {},
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "team_message",
+    label: "Team Message",
+    description: "Send a message to one teammate, the lead, or everyone on the team.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      to: Type.String({ description: "Recipient name, 'team-lead', or 'all'." }),
+      content: Type.String(),
+      summary: Type.Optional(Type.String()),
+      color: Type.Optional(Type.String()),
+    }),
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const summary = params.summary || params.content.split("\n")[0].slice(0, 80);
+      if (params.to === "all") {
+        await messaging.broadcastMessage(params.team_name, agentName, params.content, summary, params.color);
+        return {
+          content: [{ type: "text", text: "Message sent to all team members." }],
+          details: { to: "all" },
+        };
+      }
+
+      const config = await teams.readConfig(params.team_name);
+      if (!config.members.some(m => m.name === params.to)) {
+        throw new Error(`Agent ${params.to} is not a member of team ${params.team_name}`);
+      }
+
+      await messaging.sendPlainMessage(params.team_name, agentName, params.to, params.content, summary, params.color);
+      return {
+        content: [{ type: "text", text: `Message sent to ${params.to}.` }],
+        details: { to: params.to },
       };
     },
   });
@@ -837,6 +1222,79 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
+    name: "team_wait",
+    label: "Team Wait",
+    description: "Wait for a team event such as a message, submitted plan, task completion, or all tasks being done.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      event: StringEnum(["message", "plan", "task_completed", "all_tasks_done"]),
+      task_id: Type.Optional(Type.String({ description: "Optional task id for plan or task_completed waits." })),
+      poll_interval_ms: Type.Optional(Type.Number({ description: "Polling interval in milliseconds. Defaults to 1000." })),
+      timeout_seconds: Type.Optional(Type.Number({ description: "Optional timeout. Omit to wait indefinitely." })),
+    }),
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      if (params.event === "message") {
+        const result = await messaging.waitForInbox(params.team_name, agentName, {
+          pollIntervalMs: params.poll_interval_ms,
+          timeoutSeconds: params.timeout_seconds,
+          signal,
+          onPoll: async () => {
+            if (isTeammate && teamName && params.team_name === teamName) {
+              try {
+                await runtime.writeRuntimeStatus(teamName, agentName, {
+                  lastHeartbeatAt: Date.now(),
+                });
+              } catch {
+                // Heartbeat is best-effort while this tool is blocking.
+              }
+            }
+          },
+        });
+        if (isTeammate && teamName && params.team_name === teamName) {
+          const runtimeUpdates: Partial<runtime.AgentRuntimeStatus> = {
+            lastHeartbeatAt: Date.now(),
+            ready: true,
+            lastError: undefined,
+          };
+          if (result.count > 0) runtimeUpdates.lastInboxReadAt = Date.now();
+          await runtime.writeRuntimeStatus(teamName, agentName, runtimeUpdates);
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          details: result,
+        };
+      }
+
+      if ((params.event === "plan" || params.event === "task_completed") && !params.task_id) {
+        throw new Error(`team_wait event '${params.event}' requires task_id to avoid matching historical task state.`);
+      }
+
+      const result = await waitForTaskEvent(params.team_name, params.event, {
+        taskId: params.task_id,
+        pollIntervalMs: params.poll_interval_ms,
+        timeoutSeconds: params.timeout_seconds,
+        signal,
+        onPoll: async () => {
+          if (isTeammate && teamName && params.team_name === teamName) {
+            try {
+              await runtime.writeRuntimeStatus(teamName, agentName, {
+                lastHeartbeatAt: Date.now(),
+              });
+            } catch {
+              // Heartbeat is best-effort while this tool is blocking.
+            }
+          }
+        },
+      });
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        details: result,
+      };
+    },
+  });
+
+  pi.registerTool({
     name: "task_create",
     label: "Create Task",
     description: "Create a new team task.",
@@ -855,7 +1313,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "task_submit_plan",
+    name: "plan_submit",
     label: "Submit Plan",
     description: "Submit a plan for a task and wait until the lead approves or rejects it.",
     parameters: Type.Object({
@@ -889,20 +1347,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "task_evaluate_plan",
-    label: "Evaluate Plan",
-    description: "Evaluate a submitted plan for a task.",
+    name: "plan_review",
+    label: "Review Plan",
+    description: "Approve or reject a submitted task plan.",
     parameters: Type.Object({
       team_name: Type.String(),
       task_id: Type.String(),
-      action: StringEnum(["approve", "reject"]),
+      decision: StringEnum(["approve", "reject"]),
       feedback: Type.Optional(Type.String({ description: "Required for rejection" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const updated = await tasks.evaluatePlan(params.team_name, params.task_id, params.action as any, params.feedback, {
+      const updated = await tasks.evaluatePlan(params.team_name, params.task_id, params.decision as any, params.feedback, {
         evaluatedBy: agentName,
       });
-      const actionText = params.action === "approve" ? "approved" : "rejected";
+      const actionText = params.decision === "approve" ? "approved" : "rejected";
       return {
         content: [{ type: "text", text: `Plan for task ${params.task_id} has been ${actionText}.` }],
         details: { task: updated },
@@ -929,7 +1387,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "task_update",
     label: "Update Task",
-    description: "Update a task's status or owner.",
+    description: "Low-level task status or owner update. Prefer delegate_task, task_claim, and task_complete for normal workflows. If status is completed, task_complete rules apply.",
     parameters: Type.Object({
       team_name: Type.String(),
       task_id: Type.String(),
@@ -937,6 +1395,20 @@ export default function (pi: ExtensionAPI) {
       owner: Type.Optional(Type.String()),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      if (params.status === "completed") {
+        if (params.owner) {
+          throw new Error("Cannot combine owner reassignment with completion. Assign the task first, then complete it.");
+        }
+
+        const completed = await tasks.completeTask(params.team_name, params.task_id, {
+          completedBy: agentName,
+        });
+        return {
+          content: [{ type: "text", text: `Task ${params.task_id} completed.` }],
+          details: { task: completed },
+        };
+      }
+
       const updated = await tasks.updateTask(params.team_name, params.task_id, {
         status: params.status as any,
         owner: params.owner,
@@ -946,6 +1418,46 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: `Task ${params.task_id} updated.` }],
         details: { task: updated },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "task_claim",
+    label: "Claim Task",
+    description: "Claim an unassigned task for the current agent using task locking.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      task_id: Type.String(),
+    }),
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const task = await tasks.claimTask(params.team_name, params.task_id, {
+        claimedBy: agentName,
+      });
+      return {
+        content: [{ type: "text", text: `Task ${params.task_id} claimed.` }],
+        details: { task },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "task_complete",
+    label: "Complete Task",
+    description: "Mark the current agent's task complete, running completion hooks before the status changes.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      task_id: Type.String(),
+      summary: Type.Optional(Type.String()),
+    }),
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const task = await tasks.completeTask(params.team_name, params.task_id, {
+        completedBy: agentName,
+        summary: params.summary,
+      });
+      return {
+        content: [{ type: "text", text: `Task ${params.task_id} completed.` }],
+        details: { task },
       };
     },
   });
@@ -1078,6 +1590,46 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
         details,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "team_status",
+    label: "Team Status",
+    description: "Show team members, task board, and runtime health in one response.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+    }),
+    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const config = await teams.readConfig(params.team_name);
+      const taskList = await tasks.listTasks(params.team_name);
+      const members = await Promise.all(config.members.map(async (member) => {
+        const runtimeStatus = await runtime.readRuntimeStatus(params.team_name, member.name);
+        const alive = member.name === "team-lead"
+          ? true
+          : member.windowId && terminal
+            ? terminal.isWindowAlive(member.windowId)
+            : member.tmuxPaneId && terminal
+              ? terminal.isAlive(member.tmuxPaneId)
+              : false;
+        const unreadCount = (await messaging.readInbox(params.team_name, member.name, true, false)).length;
+        return {
+          name: member.name,
+          agentType: member.agentType,
+          alive,
+          unreadCount,
+          model: member.model,
+          thinking: member.thinking,
+          planModeRequired: member.planModeRequired,
+          runtime: runtimeStatus,
+        };
+      }));
+
+      const result = { team: config.name, members, tasks: taskList };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        details: result,
       };
     },
   });

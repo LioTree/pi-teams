@@ -3,7 +3,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { createTask, updateTask, readTask, listTasks, submitPlan, submitPlanAndWaitForEvaluation, evaluatePlan, waitForPlanEvaluation } from "./tasks";
+import { createTask, updateTask, readTask, listTasks, submitPlan, submitPlanAndWaitForEvaluation, evaluatePlan, waitForPlanEvaluation, assignTask, claimTask, completeTask } from "./tasks";
 import * as messaging from "./messaging";
 import * as paths from "./paths";
 
@@ -28,6 +28,7 @@ describe("Tasks Utilities", () => {
       members: [
         { name: "team-lead", agentType: "lead" },
         { name: "teammate", agentType: "teammate" },
+        { name: "other", agentType: "teammate" },
       ],
     }));
   });
@@ -42,6 +43,16 @@ describe("Tasks Utilities", () => {
     expect(task.id).toBe("1");
     expect(task.subject).toBe("Test Subject");
     expect(fs.existsSync(path.join(testDir, "1.json"))).toBe(true);
+  });
+
+  it("should create a task with plan approval metadata", async () => {
+    const task = await createTask("test-team", "Plan Required", "Needs approval", {
+      planRequired: true,
+      metadata: { source: "delegate_task" },
+    });
+
+    expect(task.planRequired).toBe(true);
+    expect(task.metadata).toEqual({ source: "delegate_task" });
   });
 
   it("should update a task successfully", async () => {
@@ -73,6 +84,77 @@ describe("Tasks Utilities", () => {
     expect(result.messages[0].summary).toBe(`Task ${task.id} assigned to you`);
   });
 
+  it("should assign a task to a team member", async () => {
+    const task = await createTask("test-team", "Assign Test", "Should assign owner");
+
+    const assigned = await assignTask("test-team", task.id, "teammate", {
+      assignedBy: "team-lead",
+      status: "in_progress",
+      planRequired: true,
+    });
+
+    expect(assigned.owner).toBe("teammate");
+    expect(assigned.status).toBe("in_progress");
+    expect(assigned.planRequired).toBe(true);
+  });
+
+  it("should optionally suppress assignment wake-up messages", async () => {
+    const task = await createTask("test-team", "Assign Test", "Should suppress wake-up");
+
+    await assignTask("test-team", task.id, "teammate", {
+      assignedBy: "team-lead",
+      status: "in_progress",
+      notifyOwner: false,
+    });
+
+    const inbox = await messaging.readInbox("test-team", "teammate");
+    expect(inbox).toEqual([]);
+  });
+
+  it("should reject assignment to a non-member", async () => {
+    const task = await createTask("test-team", "Assign Test", "Should reject unknown owner");
+
+    await expect(assignTask("test-team", task.id, "stranger", {
+      assignedBy: "team-lead",
+    })).rejects.toThrow("is not a member");
+  });
+
+  it("should let a teammate claim an unassigned task", async () => {
+    const task = await createTask("test-team", "Claim Test", "Should be claimable");
+
+    const claimed = await claimTask("test-team", task.id, { claimedBy: "teammate" });
+
+    expect(claimed.owner).toBe("teammate");
+    expect(claimed.status).toBe("in_progress");
+  });
+
+  it("should keep a plan-required claimed task pending until plan submission", async () => {
+    const task = await createTask("test-team", "Claim Test", "Should stay pending", {
+      planRequired: true,
+    });
+
+    const claimed = await claimTask("test-team", task.id, { claimedBy: "teammate" });
+
+    expect(claimed.owner).toBe("teammate");
+    expect(claimed.status).toBe("pending");
+  });
+
+  it("should reject claim for a task assigned to someone else", async () => {
+    const task = await createTask("test-team", "Claim Test", "Should reject claim");
+    await assignTask("test-team", task.id, "teammate", { assignedBy: "team-lead" });
+
+    await expect(claimTask("test-team", task.id, { claimedBy: "team-lead" }))
+      .rejects.toThrow("already assigned to teammate");
+  });
+
+  it("should reject claim for a non-pending task", async () => {
+    const task = await createTask("test-team", "Claim Test", "Should reject non-pending");
+    await updateTask("test-team", task.id, { status: "in_progress" });
+
+    await expect(claimTask("test-team", task.id, { claimedBy: "teammate" }))
+      .rejects.toThrow("status is 'in_progress'");
+  });
+
   it("should wake the lead when a task is completed", async () => {
     const task = await createTask("test-team", "Completion Test", "Should wake lead");
     await updateTask("test-team", task.id, {
@@ -93,6 +175,131 @@ describe("Tasks Utilities", () => {
     expect(result.count).toBe(1);
     expect(result.messages[0].from).toBe("teammate");
     expect(result.messages[0].summary).toBe(`Task ${task.id} completed`);
+  });
+
+  it("should not combine owner reassignment with updateTask completion", async () => {
+    const task = await createTask("test-team", "Completion Test", "Should reject combined update");
+    await assignTask("test-team", task.id, "teammate", {
+      assignedBy: "team-lead",
+      status: "in_progress",
+    });
+
+    await expect(updateTask("test-team", task.id, {
+      owner: "other",
+      status: "completed",
+    }, {
+      updatedBy: "team-lead",
+    })).rejects.toThrow("Cannot combine owner reassignment with completing task");
+
+    const unchanged = await readTask("test-team", task.id);
+    expect(unchanged.owner).toBe("teammate");
+    expect(unchanged.status).toBe("in_progress");
+  });
+
+  it("should complete a task with semantic completion metadata", async () => {
+    const task = await createTask("test-team", "Completion Test", "Should complete");
+    await assignTask("test-team", task.id, "teammate", {
+      assignedBy: "team-lead",
+      status: "in_progress",
+    });
+
+    const completed = await completeTask("test-team", task.id, {
+      completedBy: "teammate",
+      summary: "Done with tests",
+    });
+
+    expect(completed.status).toBe("completed");
+    expect(completed.metadata?.completionSummary).toBe("Done with tests");
+  });
+
+  it("should not let a non-owner complete someone else's task", async () => {
+    const task = await createTask("test-team", "Completion Test", "Should reject wrong owner");
+    await assignTask("test-team", task.id, "teammate", {
+      assignedBy: "team-lead",
+      status: "in_progress",
+    });
+
+    await expect(completeTask("test-team", task.id, {
+      completedBy: "other",
+    })).rejects.toThrow("assigned to teammate");
+
+    const unchanged = await readTask("test-team", task.id);
+    expect(unchanged.status).toBe("in_progress");
+  });
+
+  it("should not complete a plan-required task before plan approval", async () => {
+    const task = await createTask("test-team", "Completion Test", "Requires approval", {
+      planRequired: true,
+    });
+    await assignTask("test-team", task.id, "teammate", {
+      assignedBy: "team-lead",
+      status: "pending",
+      planRequired: true,
+    });
+
+    await expect(completeTask("test-team", task.id, {
+      completedBy: "teammate",
+    })).rejects.toThrow("before its required plan is approved");
+
+    const unchanged = await readTask("test-team", task.id);
+    expect(unchanged.status).toBe("pending");
+  });
+
+  it("should not complete a pending task", async () => {
+    const task = await createTask("test-team", "Completion Test", "Should require in_progress");
+    await assignTask("test-team", task.id, "teammate", {
+      assignedBy: "team-lead",
+      status: "pending",
+    });
+
+    await expect(completeTask("test-team", task.id, {
+      completedBy: "teammate",
+    })).rejects.toThrow("status is 'pending'");
+  });
+
+  it("should not complete an already completed task again", async () => {
+    const task = await createTask("test-team", "Completion Test", "Should reject duplicate completion");
+    await assignTask("test-team", task.id, "teammate", {
+      assignedBy: "team-lead",
+      status: "in_progress",
+    });
+    await completeTask("test-team", task.id, { completedBy: "teammate" });
+
+    await expect(completeTask("test-team", task.id, {
+      completedBy: "teammate",
+    })).rejects.toThrow("already completed");
+  });
+
+  it("should block semantic completion when the completion hook fails", async () => {
+    const hooksDir = path.join(process.cwd(), ".pi", "team-hooks");
+    const hookPath = path.join(hooksDir, "task_completed.sh");
+    const originalHook = fs.existsSync(hookPath) ? fs.readFileSync(hookPath, "utf-8") : undefined;
+    const originalMode = fs.existsSync(hookPath) ? fs.statSync(hookPath).mode : undefined;
+    if (!fs.existsSync(hooksDir)) fs.mkdirSync(hooksDir, { recursive: true });
+    fs.writeFileSync(hookPath, "#!/bin/bash\nexit 1", { mode: 0o755 });
+    const consoleSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    try {
+      const task = await createTask("test-team", "Completion Test", "Should block hook failure");
+      await assignTask("test-team", task.id, "teammate", {
+        assignedBy: "team-lead",
+        status: "in_progress",
+      });
+
+      await expect(completeTask("test-team", task.id, {
+        completedBy: "teammate",
+      })).rejects.toThrow("hook failed");
+
+      const unchanged = await readTask("test-team", task.id);
+      expect(unchanged.status).toBe("in_progress");
+    } finally {
+      consoleSpy.mockRestore();
+      if (originalHook !== undefined) {
+        fs.writeFileSync(hookPath, originalHook, { mode: originalMode });
+      } else if (fs.existsSync(hookPath)) {
+        fs.unlinkSync(hookPath);
+      }
+    }
   });
 
   it("should submit a plan successfully", async () => {
@@ -126,6 +333,23 @@ describe("Tasks Utilities", () => {
       expect.stringContaining(`task ${task.id} (Test Subject)`),
       `Plan submitted for task ${task.id}`
     );
+  });
+
+  it("should assign an unowned task to the teammate that submits a plan", async () => {
+    const task = await createTask("test-team", "Test Subject", "Test Description");
+
+    const updated = await submitPlan("test-team", task.id, "Step 1: Do something", "teammate");
+
+    expect(updated.owner).toBe("teammate");
+    expect(updated.status).toBe("planning");
+  });
+
+  it("should reject plan submission by a non-owner", async () => {
+    const task = await createTask("test-team", "Test Subject", "Test Description");
+    await assignTask("test-team", task.id, "teammate", { assignedBy: "team-lead" });
+
+    await expect(submitPlan("test-team", task.id, "Step 1: Do something", "other"))
+      .rejects.toThrow("assigned to teammate");
   });
 
   it("should wake the lead when a teammate submits a plan", async () => {
@@ -182,6 +406,15 @@ describe("Tasks Utilities", () => {
     const approved = await evaluatePlan("test-team", task.id, "approve");
     expect(approved.status).toBe("in_progress");
     expect(approved.planFeedback).toBe("");
+  });
+
+  it("should reject plan evaluation by a non-lead", async () => {
+    const task = await createTask("test-team", "Plan Test", "Should require lead approval");
+    await assignTask("test-team", task.id, "teammate", { assignedBy: "team-lead" });
+    await submitPlan("test-team", task.id, "Wait for it...", "teammate");
+
+    await expect(evaluatePlan("test-team", task.id, "approve", undefined, { evaluatedBy: "other" }))
+      .rejects.toThrow("Only the team lead");
   });
 
   it("should notify the task owner when a plan is approved", async () => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Member } from "./models";
-import { buildTeammateSystemPrompt, PLAN_MODE_REQUIRED_PROMPT } from "./plan-mode-prompt";
+import { buildTeammateSystemPrompt, PLAN_MODE_REQUIRED_PROMPT, TASK_PLAN_REQUIRED_PROMPT } from "./plan-mode-prompt";
 
 describe("buildTeammateSystemPrompt", () => {
   const baseMember: Member = {
@@ -13,7 +13,7 @@ describe("buildTeammateSystemPrompt", () => {
     subscriptions: [],
   };
 
-  it("adds plan mode instructions only when the member requires plan approval", () => {
+  it("adds default plan mode instructions only when the member requires plan approval", () => {
     const enabled = buildTeammateSystemPrompt({
       baseSystemPrompt: "Base system prompt.",
       agentName: "refactor-bot",
@@ -29,11 +29,12 @@ describe("buildTeammateSystemPrompt", () => {
     });
 
     expect(enabled).toContain(PLAN_MODE_REQUIRED_PROMPT);
-    expect(enabled).toContain("task_submit_plan");
+    expect(enabled).toContain("plan_submit");
     expect(enabled).toContain("waits for the lead to approve or reject");
     expect(enabled).not.toContain("wait_for_evaluation");
     expect(disabled).not.toContain(PLAN_MODE_REQUIRED_PROMPT);
-    expect(disabled).not.toContain("task_submit_plan");
+    expect(disabled).toContain(TASK_PLAN_REQUIRED_PROMPT);
+    expect(disabled).toContain("plan_submit");
     expect(disabled).not.toContain("wait_for_evaluation");
   });
 

@@ -15,6 +15,7 @@ export interface Member {
   prompt?: string;
   color?: string;
   thinking?: ThinkingLevel;
+  defaultPlanRequired?: boolean;
   planModeRequired?: boolean;
   backendType?: string;
   isActive?: boolean;
@@ -37,6 +38,7 @@ export interface TaskFile {
   description: string;
   activeForm?: string;
   status: "pending" | "planning" | "in_progress" | "completed" | "deleted";
+  planRequired?: boolean;
   plan?: string;
   planFeedback?: string;
   blocks: string[];
