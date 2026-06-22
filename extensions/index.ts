@@ -1,6 +1,5 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
-import { StringEnum } from "@mariozechner/pi-ai";
+import { StringEnum, Type } from "@mariozechner/pi-ai";
 import * as paths from "../src/utils/paths";
 import * as teams from "../src/utils/teams";
 import * as tasks from "../src/utils/tasks";

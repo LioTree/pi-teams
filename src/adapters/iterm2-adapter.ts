@@ -215,8 +215,9 @@ end tell`;
         member.tmuxPaneId.startsWith("iterm_") &&
         !member.tmuxPaneId.startsWith("iterm_win_")
       ) {
-        this.cachedOwnSessionId = member.tmuxPaneId.replace("iterm_", "");
-        return this.cachedOwnSessionId;
+        const sessionId = member.tmuxPaneId.replace("iterm_", "");
+        this.cachedOwnSessionId = sessionId;
+        return sessionId;
       }
     } catch {
       // Config not yet available — will retry on next call
