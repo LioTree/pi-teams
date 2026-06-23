@@ -5,7 +5,8 @@ import * as teams from "../src/utils/teams";
 import * as tasks from "../src/utils/tasks";
 import * as messaging from "../src/utils/messaging";
 import * as runtime from "../src/utils/runtime";
-import { buildTeammateSystemPrompt } from "../src/utils/plan-mode-prompt";
+import { resolveAgentRole } from "../src/utils/agent-role";
+import { buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/plan-mode-prompt";
 import { Member } from "../src/utils/models";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
@@ -340,8 +341,7 @@ function cleanupAgentSessionFolders(maxAgeMs: number = 24 * 60 * 60 * 1000): num
 }
 
 export default function (pi: ExtensionAPI) {
-  const isTeammate = !!process.env.PI_AGENT_NAME;
-  const agentName = process.env.PI_AGENT_NAME || "team-lead";
+  const { agentName, isTeammate } = resolveAgentRole(process.env.PI_AGENT_NAME);
   const envTeamName = process.env.PI_TEAM_NAME;
 
   // For leads without PI_TEAM_NAME, check if we're registered as lead for a team
@@ -456,9 +456,10 @@ export default function (pi: ExtensionAPI) {
 
   let firstTurn = true;
   pi.on("before_agent_start", async (event, ctx) => {
-    if (isTeammate && firstTurn) {
-      firstTurn = false;
+    if (!firstTurn) return;
+    firstTurn = false;
 
+    if (isTeammate) {
       if (teamName) {
         await runtime.writeRuntimeStatus(teamName, agentName, {
           lastHeartbeatAt: Date.now(),
@@ -484,6 +485,13 @@ export default function (pi: ExtensionAPI) {
         }),
       };
     }
+
+    return {
+      systemPrompt: buildLeadSystemPrompt({
+        baseSystemPrompt: event.systemPrompt,
+        teamName,
+      }),
+    };
   });
 
   async function killTeammate(teamName: string, member: Member) {

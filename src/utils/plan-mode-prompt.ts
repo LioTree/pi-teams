@@ -15,6 +15,26 @@ export interface TeammateSystemPromptOptions {
   member?: Member;
 }
 
+export interface LeadSystemPromptOptions {
+  baseSystemPrompt: string;
+  teamName?: string | null;
+}
+
+export function buildLeadSystemPrompt(options: LeadSystemPromptOptions): string {
+  const roleLine = options.teamName
+    ? `You are the team lead for team '${options.teamName}'.`
+    : "You are the pi-teams team lead. Create a team with team_create when teammate coordination is useful.";
+
+  return options.baseSystemPrompt +
+    `\n\n${roleLine}` +
+    `\n- Follow the Agent Teams skill guidance for detailed team workflow and tool usage.` +
+    `\n- Use delegate_task for significant teammate work so the task board, ownership, initial message, and process lifecycle stay in sync.` +
+    `\n- Give each teammate a clear role, task, input context, expected output, boundaries, and completion condition.` +
+    `\n- Use plan_review to approve or reject submitted teammate plans when plan approval is required.` +
+    `\n- After delegating work, use team_wait to wait for plans, task completion, messages, or all tasks done instead of duplicating the delegated work.` +
+    `\n- Use team_status, task_read, and team_message to monitor progress, review evidence, and send corrections.`;
+}
+
 export function buildTeammateSystemPrompt(options: TeammateSystemPromptOptions): string {
   const modelInfo = buildModelInfo(options.member);
   const defaultPlanRequired = options.member?.defaultPlanRequired ?? options.member?.planModeRequired;
