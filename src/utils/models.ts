@@ -48,6 +48,7 @@ export interface TaskFile {
 }
 
 export interface InboxMessage {
+  id: string;
   from: string;
   text: string;
   timestamp: string;

@@ -13,13 +13,13 @@ The agent in your main terminal window. You are responsible for:
 - **Strategy**: Creating the team and defining its goals.
 - **Delegation**: Spawning teammates and assigning them specific roles.
 - **Coordination**: Managing the shared task board and broadcasting updates.
-- **Quality Control**: Reviewing plans and approving finished work.
+- **Quality Control**: Reviewing teammate results and deciding follow-up work.
 
 ### 2. Teammates (The Specialists)
 Agents spawned in separate panes. They are designed for:
 - **Focus**: Executing specific, isolated tasks (e.g., "Security Audit", "Frontend Refactor").
 - **Parallelism**: Working on multiple parts of the project simultaneously.
-- **Autonomy**: Checking their own inboxes, submitting plans, and reporting progress without constant hand-holding.
+- **Autonomy**: Receiving inbox messages, executing assigned work, and reporting progress without constant hand-holding.
 
 ---
 
@@ -34,21 +34,16 @@ You can delegate work to teammates with custom identities, models, and reasoning
 ### 📋 Shared Task Board
 A centralized source of truth for the entire team:
 - **Visibility**: Everyone can see the full task list and who owns what.
-- **Status Tracking**: Tasks move through `pending` ➔ `planning` ➔ `in_progress` ➔ `completed`.
+- **Status Tracking**: Tasks move through `pending` ➔ `in_progress` ➔ `completed`.
 - **Ownership**: Assigning a task to a teammate automatically notifies them.
 
 ### 💬 Coordination & Messaging
 Communication flows naturally between team members:
 - **Direct Messaging**: Send specific instructions to one teammate.
 - **Broadcasts**: Announce global changes (like API updates) to everyone at once.
-- **Inbox Polling**: Teammates automatically "wake up" to check for new work every 30 seconds when idle.
-- **Blocking Waits**: Team Leads can call `team_wait` after delegation to pause until a teammate reports back, submits a plan, or completes work.
-
-### 🛡️ Plan Approval Mode
-For critical changes, you can require teammates to submit a plan before they start:
-1. Teammate analyzes the task and calls `plan_submit`.
-2. You review the plan in the Lead pane.
-3. You `approve` (to start work) or `reject` (with feedback for revision).
+- **Inbox Delivery**: About once per second, an idle teammate receives the actual contents of unread inbox messages. Busy agents leave messages unread; an agent in `team_wait` consumes them through the active wait.
+- **Blocking Waits**: Any member can call `team_wait({ team_name, timeout_seconds? })`. Omit the timeout for a long-lived barrier; it returns on a message, timeout, or when no other member can make progress.
+- **Activity Tracking**: Members report `starting`, `queued`, `running`, `waiting`, `idle`, or `stopped`, independently from process liveness.
 
 ---
 
@@ -58,15 +53,14 @@ For critical changes, you can require teammates to submit a plan before they sta
 Use this when you have 3-4 independent features to build.
 1. Create a team: `team_create({ team_name: "feature-sprint" })`
 2. Use `delegate_task` for each specialist and feature.
-3. Use `team_wait` or `team_status` to monitor progress.
-4. Monitor progress while you work on the core architecture.
+3. Call `team_wait({ team_name: "feature-sprint" })` after delegation.
+4. On return, coordinate from the message and status snapshot. If specialists are still active, wait again; do not duplicate their assigned work.
 
-### Pattern 2: The "Safety First" Audit
-Use this for refactoring or security work.
-1. Delegate the refactoring task with `plan_required: true`.
-2. Wait for the submitted plan.
-3. Review their proposed changes before any code is touched.
-4. Approve the plan to let them execute.
+### Pattern 2: The "Dependency Handoff"
+Use this when one teammate unexpectedly needs information or work from another.
+1. Send the dependency request with `team_message`.
+2. Call `team_wait({ team_name: "feature-sprint" })` only while that dependency is outstanding.
+3. Resume when the reply arrives. If `no_active_agents` is returned, report the blocked dependency instead of waiting forever.
 
 ### Pattern 3: The "Quality Gate"
 Use automated hooks to ensure standards.
@@ -85,5 +79,7 @@ Use automated hooks to ensure standards.
 ## ⚠️ Best Practices
 - **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.
 - **Clear Prompts**: Be specific about the teammate's role and boundaries when spawning.
-- **Delegate Then Wait**: If you hand off the current work to a teammate, call `team_wait` instead of continuing that same work yourself.
+- **Delegate Then Wait**: `delegate_task` returns immediately. After handing off the current work, call `team_wait` instead of continuing the same work yourself.
+- **Coordinate on Return**: Handle messages and blockers, then wait again while teammates remain active.
+- **Wait Only for Dependencies**: Teammates should not call `team_wait` just to idle. For a real dependency, send a message first and then wait.
 - **Check-ins**: Use `task_list` regularly to see the "big picture" of your team's progress.

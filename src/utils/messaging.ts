@@ -1,26 +1,63 @@
 import fs from "node:fs";
 import path from "node:path";
-import { InboxMessage, TeamConfig } from "./models";
+import { randomUUID } from "node:crypto";
+import { InboxMessage } from "./models";
 import { withLock } from "./lock";
 import { inboxPath } from "./paths";
+import { markRuntimeQueuedIfIdle } from "./runtime";
 import { readConfig } from "./teams";
+import { atomicWriteJsonSync } from "./atomic-file";
 
 export function nowIso(): string {
   return new Date().toISOString();
 }
 
-export async function appendMessage(teamName: string, agentName: string, message: InboxMessage) {
+type InboxMessageInput = Omit<InboxMessage, "id"> & { id?: string };
+
+function hasUsableId(message: Partial<InboxMessage>): message is Partial<InboxMessage> & { id: string } {
+  return typeof message.id === "string" && message.id.length > 0;
+}
+
+function ensureMessageIds(messages: InboxMessage[]): boolean {
+  const seen = new Set<string>();
+  let changed = false;
+
+  for (const message of messages) {
+    if (!hasUsableId(message) || seen.has(message.id)) {
+      message.id = randomUUID();
+      changed = true;
+    }
+    seen.add(message.id);
+  }
+
+  return changed;
+}
+
+export async function appendMessage(
+  teamName: string,
+  agentName: string,
+  message: InboxMessageInput
+): Promise<InboxMessage> {
   const p = inboxPath(teamName, agentName);
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
-  await withLock(p, async () => {
+  return await withLock(p, async () => {
     let msgs: InboxMessage[] = [];
     if (fs.existsSync(p)) {
       msgs = JSON.parse(fs.readFileSync(p, "utf-8"));
     }
-    msgs.push(message);
-    fs.writeFileSync(p, JSON.stringify(msgs, null, 2));
+    ensureMessageIds(msgs);
+
+    const usedIds = new Set(msgs.map(existing => existing.id));
+    const requestedId = hasUsableId(message) ? message.id : undefined;
+    const storedMessage: InboxMessage = {
+      ...message,
+      id: requestedId && !usedIds.has(requestedId) ? requestedId : randomUUID(),
+    } as InboxMessage;
+    msgs.push(storedMessage);
+    atomicWriteJsonSync(p, msgs);
+    return storedMessage;
   });
 }
 
@@ -35,6 +72,7 @@ export async function readInbox(
 
   return await withLock(p, async () => {
     const allMsgs: InboxMessage[] = JSON.parse(fs.readFileSync(p, "utf-8"));
+    let changed = ensureMessageIds(allMsgs);
     let result = allMsgs;
 
     if (unreadOnly) {
@@ -42,120 +80,55 @@ export async function readInbox(
     }
 
     if (markAsRead && result.length > 0) {
+      const resultIds = new Set(result.map(message => message.id));
       for (const m of allMsgs) {
-        if (result.includes(m)) {
+        if (resultIds.has(m.id) && !m.read) {
           m.read = true;
+          changed = true;
         }
       }
-      fs.writeFileSync(p, JSON.stringify(allMsgs, null, 2));
+    }
+
+    if (changed) {
+      atomicWriteJsonSync(p, allMsgs);
     }
 
     return result;
   });
 }
 
-export interface WaitForInboxOptions {
-  pollIntervalMs?: number;
-  timeoutSeconds?: number;
-  signal?: AbortSignal;
-  onPoll?: () => void | Promise<void>;
-}
-
-export interface WaitForInboxResult {
-  messages: InboxMessage[];
-  count: number;
-  waitedMs: number;
-  timedOut: boolean;
-}
-
-async function validateWaitTarget(teamName: string, agentName: string): Promise<void> {
-  let config: TeamConfig;
-  try {
-    config = await readConfig(teamName);
-  } catch (error) {
-    if (error instanceof Error && error.message.includes("not found")) {
-      throw new Error(`Team ${teamName} does not exist`);
-    }
-    throw error;
-  }
-
-  const isMember = config.members.some(member => member.name === agentName);
-  if (!isMember) {
-    throw new Error(`Agent ${agentName} is not a member of team ${teamName}`);
-  }
-}
-
-function createAbortError(): Error {
-  const error = new Error("wait_for_inbox aborted");
-  error.name = "AbortError";
-  return error;
-}
-
-function waitForDelay(ms: number, signal?: AbortSignal): Promise<void> {
-  if (signal?.aborted) return Promise.reject(createAbortError());
-
-  return new Promise((resolve, reject) => {
-    let timeout: ReturnType<typeof setTimeout>;
-    const onAbort = () => {
-      clearTimeout(timeout);
-      cleanup();
-      reject(createAbortError());
-    };
-    const cleanup = () => signal?.removeEventListener("abort", onAbort);
-
-    timeout = setTimeout(() => {
-      cleanup();
-      resolve();
-    }, ms);
-
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-export async function waitForInbox(
+/**
+ * Marks only the messages that were successfully delivered to an agent
+ * session. Messages appended after the caller's inbox snapshot remain unread.
+ */
+export async function markMessagesRead(
   teamName: string,
   agentName: string,
-  options: WaitForInboxOptions = {}
-): Promise<WaitForInboxResult> {
-  const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 1000);
-  const timeoutMs = options.timeoutSeconds === undefined
-    ? undefined
-    : Math.max(0, options.timeoutSeconds * 1000);
-  const startedAt = Date.now();
+  ids: readonly string[]
+): Promise<number> {
+  const p = inboxPath(teamName, agentName);
+  if (!fs.existsSync(p)) return 0;
 
-  if (options.signal?.aborted) throw createAbortError();
-  await validateWaitTarget(teamName, agentName);
+  return await withLock(p, async () => {
+    if (!fs.existsSync(p)) return 0;
+    const allMsgs: InboxMessage[] = JSON.parse(fs.readFileSync(p, "utf-8"));
+    let changed = ensureMessageIds(allMsgs);
+    let marked = 0;
+    const requestedIds = new Set(ids);
 
-  while (true) {
-    if (options.signal?.aborted) throw createAbortError();
-
-    const messages = await readInbox(teamName, agentName, true, true);
-    if (messages.length > 0) {
-      return {
-        messages,
-        count: messages.length,
-        waitedMs: Date.now() - startedAt,
-        timedOut: false,
-      };
+    for (const message of allMsgs) {
+      if (requestedIds.has(message.id) && !message.read) {
+        message.read = true;
+        marked++;
+        changed = true;
+      }
     }
 
-    await validateWaitTarget(teamName, agentName);
-
-    const elapsed = Date.now() - startedAt;
-    if (timeoutMs !== undefined && elapsed >= timeoutMs) {
-      return {
-        messages: [],
-        count: 0,
-        waitedMs: elapsed,
-        timedOut: true,
-      };
+    if (changed) {
+      atomicWriteJsonSync(p, allMsgs);
     }
-
-    await options.onPoll?.();
-
-    const remainingTimeoutMs = timeoutMs === undefined ? pollIntervalMs : timeoutMs - elapsed;
-    await waitForDelay(Math.min(pollIntervalMs, Math.max(1, remainingTimeoutMs)), options.signal);
-  }
+    return marked;
+  });
 }
 
 export async function sendPlainMessage(
@@ -165,8 +138,9 @@ export async function sendPlainMessage(
   text: string,
   summary: string,
   color?: string
-) {
+): Promise<InboxMessage> {
   const msg: InboxMessage = {
+    id: randomUUID(),
     from: fromName,
     text,
     timestamp: nowIso(),
@@ -174,7 +148,18 @@ export async function sendPlainMessage(
     summary,
     color,
   };
-  await appendMessage(teamName, toName, msg);
+  const storedMessage = await appendMessage(teamName, toName, msg);
+
+  // Runtime signalling is intentionally best-effort: the inbox append above is
+  // the durable delivery and must not be reported as failed if runtime metadata
+  // is temporarily unavailable.
+  try {
+    await markRuntimeQueuedIfIdle(teamName, toName);
+  } catch (error) {
+    console.error(`Message delivered, but failed to queue ${toName}:`, error);
+  }
+
+  return storedMessage;
 }
 
 /**

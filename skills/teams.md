@@ -17,7 +17,7 @@ Coordinate multiple agents working on a project using shared task lists and mess
     *   `task_read`: Get full details of a specific task by ID.
 4.  **Communicate**: Use `team_message`.
 5.  **Monitor**: Use `team_status` for the full board, or `check_teammate` for one teammate.
-6.  **Wait after delegation**: When you have delegated all current work, use `team_wait` to pause for a message, plan, completion, or all tasks done.
+6.  **Wait after delegation**: `delegate_task` returns immediately. When you have delegated all current work, call `team_wait({ team_name })` so you do not duplicate a teammate's assignment. Omit `timeout_seconds` for an indefinite wait.
 7.  **Cleanup**:
     *   `process_shutdown_approved`: Orderly removal of a teammate after they've finished.
     *   `team_shutdown`: Remove a team and all its associated data.
@@ -26,12 +26,12 @@ Coordinate multiple agents working on a project using shared task lists and mess
 
 When you are spawned as a teammate:
 - Your status bar will show "Teammate: name @ team".
-- You will automatically start by calling `team_wait` with `event="message"` to get your initial instructions.
-- Regularly call `team_wait` with `event="message"` for updates from the lead.
+- Your initial assignment and later unread messages are delivered automatically when your Pi session is idle; do not call `team_wait` just to receive routine work.
 - Use `team_message` to "team-lead" to report progress or ask questions.
 - Complete assigned tasks using `task_complete`.
-- Always send a message to "team-lead" when you complete work, submit a plan, get blocked, or need review.
-- If you are idle for more than 30 seconds, you will automatically check your inbox for new messages.
+- Always send a message to "team-lead" when you complete work, get blocked, or need review.
+- If you encounter a real dependency on another member, send that member a `team_message` first, then call `team_wait({ team_name })` while the dependency is outstanding.
+- Idle inbox delivery runs about once per second. Messages remain unread while you are busy; an active `team_wait` consumes them and resumes you.
 
 ## Best Practices for Teammates
 
@@ -46,6 +46,17 @@ When you are spawned as a teammate:
 - **Clear Assignments**: Use `delegate_task` for significant work items.
 - **Contextual Prompts**: Provide enough task context in `delegate_task` for the teammate to understand their boundaries.
 - **Task List Monitoring**: Regularly call `team_status` to see the status of all work.
-- **Delegate Then Wait**: After delegating and having no independent work, call `team_wait` so you pause until the teammate reports back.
+- **Delegate Then Wait**: After delegating, call `team_wait({ team_name })` so you pause until a message arrives or no teammate can make progress. Do not perform the teammate's assigned work.
+- **Coordinate, Then Wait Again**: When a wait returns, handle reports and blockers only. If teammates are still active, call `team_wait` again.
 - **Direct Feedback**: Use `team_message` to provide course corrections or new instructions to teammates.
 - **Read Status**: Use `team_status` to see the full team roster and current task board.
+
+## `team_wait` Result
+
+`team_wait({ team_name, timeout_seconds? })` is available to every member. It returns:
+
+- `outcome: "message"` when the caller receives inbox messages
+- `outcome: "no_active_agents"` after repeated checks find no other progress-capable member
+- `outcome: "timeout"` only when an explicit positive timeout expires
+
+The result also includes `messages`, `waitedMs`, `timedOut`, and a member activity snapshot when available. Activity is separate from process liveness and uses `starting`, `queued`, `running`, `waiting`, `idle`, or `stopped`.

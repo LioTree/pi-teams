@@ -2,7 +2,14 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { appendMessage, readInbox, sendPlainMessage, broadcastMessage, waitForInbox } from "./messaging";
+import {
+  appendMessage,
+  readInbox,
+  sendPlainMessage,
+  broadcastMessage,
+  markMessagesRead,
+} from "./messaging";
+import { readRuntimeStatus, setRuntimeActivity } from "./runtime";
 import * as paths from "./paths";
 
 // Mock the paths to use a temporary directory
@@ -28,6 +35,9 @@ describe("Messaging Utilities", () => {
     vi.spyOn(paths, "configPath").mockImplementation((teamName) => {
       return path.join(testDir, "config.json");
     });
+    vi.spyOn(paths, "runtimeStatusPath").mockImplementation((teamName, agentName) => {
+      return path.join(testDir, "runtime", `${agentName}.json`);
+    });
 
     writeTeamConfig();
   });
@@ -44,6 +54,23 @@ describe("Messaging Utilities", () => {
     const inbox = await readInbox("test-team", "receiver", false, false);
     expect(inbox.length).toBe(1);
     expect(inbox[0].text).toBe("hello");
+    expect(inbox[0].id).toEqual(expect.any(String));
+  });
+
+  it("assigns stable unique IDs to legacy inbox messages", async () => {
+    const p = path.join(testDir, "inboxes", "receiver.json");
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify([
+      { from: "sender", text: "old-1", timestamp: "now", read: false },
+      { from: "sender", text: "old-2", timestamp: "now", read: false },
+    ]));
+
+    const firstRead = await readInbox("test-team", "receiver", false, false);
+    const secondRead = await readInbox("test-team", "receiver", false, false);
+
+    expect(firstRead.map(message => message.id)).toHaveLength(2);
+    expect(new Set(firstRead.map(message => message.id)).size).toBe(2);
+    expect(secondRead.map(message => message.id)).toEqual(firstRead.map(message => message.id));
   });
 
   it("should handle concurrent appends (Stress Test)", async () => {
@@ -79,6 +106,39 @@ describe("Messaging Utilities", () => {
     expect(all.every(m => m.read)).toBe(true);
   });
 
+  it("marks only acknowledged IDs and leaves concurrently appended messages unread", async () => {
+    await sendPlainMessage("test-team", "sender", "receiver", "msg1", "summary1");
+    await sendPlainMessage("test-team", "sender", "receiver", "msg2", "summary2");
+    const deliveryBatch = await readInbox("test-team", "receiver", true, false);
+
+    await sendPlainMessage("test-team", "sender", "receiver", "concurrent", "concurrent");
+    expect(await markMessagesRead(
+      "test-team",
+      "receiver",
+      deliveryBatch.map(message => message.id)
+    )).toBe(2);
+
+    const unread = await readInbox("test-team", "receiver", true, false);
+    expect(unread.map(message => message.text)).toEqual(["concurrent"]);
+  });
+
+  it("queues an idle recipient after durable message delivery", async () => {
+    await setRuntimeActivity("test-team", "receiver", "idle", {
+      activityChangedAt: 1000,
+    });
+
+    const delivered = await sendPlainMessage(
+      "test-team",
+      "sender",
+      "receiver",
+      "wake up",
+      "wake up"
+    );
+
+    expect(delivered.id).toEqual(expect.any(String));
+    expect((await readRuntimeStatus("test-team", "receiver"))?.activity).toBe("queued");
+  });
+
   it("should broadcast message to all members except the sender", async () => {
     // Setup team config
     const config = {
@@ -111,83 +171,4 @@ describe("Messaging Utilities", () => {
     expect(inboxSender.length).toBe(0);
   });
 
-  it("should return immediately when unread inbox messages already exist", async () => {
-    await sendPlainMessage("test-team", "sender", "receiver", "ready", "ready");
-
-    const result = await waitForInbox("test-team", "receiver", { pollIntervalMs: 5 });
-
-    expect(result.timedOut).toBe(false);
-    expect(result.count).toBe(1);
-    expect(result.messages[0].text).toBe("ready");
-  });
-
-  it("should wait until an unread message arrives", async () => {
-    const waiting = waitForInbox("test-team", "receiver", { pollIntervalMs: 5 });
-
-    setTimeout(() => {
-      void sendPlainMessage("test-team", "sender", "receiver", "delayed", "delayed");
-    }, 20);
-
-    const result = await waiting;
-
-    expect(result.timedOut).toBe(false);
-    expect(result.count).toBe(1);
-    expect(result.messages[0].text).toBe("delayed");
-  });
-
-  it("should mark returned messages as read", async () => {
-    await sendPlainMessage("test-team", "sender", "receiver", "consume me", "consume");
-
-    await waitForInbox("test-team", "receiver", { pollIntervalMs: 5 });
-
-    const unread = await readInbox("test-team", "receiver", true, false);
-    expect(unread.length).toBe(0);
-  });
-
-  it("should time out when no message arrives before the deadline", async () => {
-    const result = await waitForInbox("test-team", "receiver", {
-      pollIntervalMs: 5,
-      timeoutSeconds: 0.02,
-    });
-
-    expect(result.timedOut).toBe(true);
-    expect(result.count).toBe(0);
-    expect(result.messages.length).toBe(0);
-  });
-
-  it("should stop waiting when aborted", async () => {
-    const controller = new AbortController();
-    const waiting = waitForInbox("test-team", "receiver", {
-      pollIntervalMs: 50,
-      signal: controller.signal,
-    });
-
-    controller.abort();
-
-    await expect(waiting).rejects.toMatchObject({ name: "AbortError" });
-  });
-
-  it("should fail fast when the team does not exist", async () => {
-    fs.unlinkSync(path.join(testDir, "config.json"));
-
-    await expect(waitForInbox("test-team", "receiver", { pollIntervalMs: 5 }))
-      .rejects.toThrow("Team test-team does not exist");
-  });
-
-  it("should fail fast when the agent is not a team member", async () => {
-    writeTeamConfig(["team-lead", "sender"]);
-
-    await expect(waitForInbox("test-team", "receiver", { pollIntervalMs: 5 }))
-      .rejects.toThrow("Agent receiver is not a member of team test-team");
-  });
-
-  it("should stop waiting when the team is deleted while blocked", async () => {
-    const waiting = waitForInbox("test-team", "receiver", { pollIntervalMs: 5 });
-
-    setTimeout(() => {
-      fs.unlinkSync(path.join(testDir, "config.json"));
-    }, 20);
-
-    await expect(waiting).rejects.toThrow("Team test-team does not exist");
-  });
 });

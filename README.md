@@ -12,6 +12,8 @@
 
 ## 🛠 Installation
 
+Requires Pi `0.80.6` or newer and Node.js `22.19.0` or newer. Pi `0.80.6` provides the settled-agent lifecycle event and sequential custom-tool execution used by the coordination barrier.
+
 Open your Pi terminal and type:
 
 ```bash
@@ -28,8 +30,8 @@ pi install npm:pi-teams
 "Delegate a task to security-bot: 'Audit auth endpoints'"
 "Delegate a task to frontend-dev using haiku: 'Review the dashboard UI'"
 
-# 3. Review and approve work
-"List all tasks and approve any pending plans"
+# 3. Wait for reports without duplicating delegated work
+"Wait until a teammate reports back"
 ```
 
 ## 🌟 What can it do?
@@ -38,8 +40,8 @@ pi install npm:pi-teams
 - **Spawn Specialists**: Create agents like "Security Expert" or "Frontend Pro" to handle sub-tasks in parallel.
 - **Shared Task Board**: Keep everyone on the same page with a persistent list of tasks and their status.
 - **Agent Messaging**: Agents can send direct messages to each other and to you (the Team Lead) to report progress.
-- **Autonomous Work**: Teammates automatically "wake up," read their instructions, and poll their inboxes for new work while idle.
-- **Delegate and Wait**: Team Leads can pause with `team_wait` after handing off work, then resume when a teammate reports back.
+- **Autonomous Work**: Teammates automatically receive the actual contents of unread inbox messages whenever their Pi session is idle.
+- **Delegate and Wait**: Any team member can block with `team_wait` while another member is making progress. With no timeout, the wait is indefinite.
 - **Beautiful UI**: Optimized vertical splits in `tmux` with clear labels so you always know who is doing what.
 
 ### Advanced Features
@@ -47,7 +49,6 @@ pi install npm:pi-teams
 - **Save Teams as Templates**: Convert any runtime team into a reusable template with a single command.
 - **Isolated OS Windows**: Launch teammates in true separate OS windows instead of panes.
 - **Persistent Window Titles**: Windows are automatically titled `[team-name]: [agent-name]` for easy identification in your window manager.
-- **Plan Approval Mode**: Require teammates to submit their implementation plans for your approval before they touch any code.
 - **Broadcast Messaging**: Send a message to the entire team at once for global coordination and announcements.
 - **Quality Gate Hooks**: Automated shell scripts run when tasks are completed (e.g., to run tests or linting).
 - **Thinking Level Control**: Set per-teammate thinking levels (`off`, `minimal`, `low`, `medium`, `high`) to balance speed vs. reasoning depth.
@@ -72,13 +73,10 @@ pi install npm:pi-teams
 
 **Move the Team Lead to a separate window:**
 > **You:** "Open the team lead in its own window."
-*(Requires separate_windows mode enabled or iTerm2/WezTerm)*
+*(Requires separate_windows mode enabled or iTerm2/WezTerm. This is a handoff: the original lead session exits so only the new window owns the lead inbox.)*
 
 **Use a different model:**
 > **You:** "Delegate benchmarks to speed-bot using haiku."
-
-**Require plan approval:**
-> **You:** "Delegate the refactor to refactor-bot and require plan approval before they make any changes."
 
 **Customize model and thinking level:**
 > **You:** "Delegate architecture review to architect-bot using gpt-4o with high thinking level."
@@ -94,21 +92,34 @@ When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-
 
 > **Example:** Specifying `gemini-2.5-flash` will automatically use `google-gemini-cli/gemini-2.5-flash` if available, saving API costs.
 
-### 3. Delegate Task & Get Approval
-> **You:** "Delegate to security-bot: check the .env.example file for sensitive defaults."
+### 3. Delegate and Wait
+> **You:** "Delegate to security-bot: check the .env.example file for sensitive defaults, then wait for the team."
 
-Teammates with plan approval will use `plan_submit`, which waits until you approve or reject the plan. As the lead, review their work:
-> **You:** "Review refactor-bot's plan for task 5. If it looks good, approve it. If not, reject it with feedback on the test coverage."
+`delegate_task` returns immediately after assigning the work. The lead should then call:
 
-### 4. Delegate and Wait
-> **You:** "Wait for security-bot to complete task 1."
+```javascript
+team_wait({ team_name: "my-team" })
+```
 
-Use this after delegating work when you want the Team Lead to stop and wait instead of continuing the delegated task.
+Without `timeout_seconds`, this blocks indefinitely until an inbox message arrives or no other member can make progress. It returns an `outcome` of `message`, `no_active_agents`, or `timeout`. After it returns, coordinate based on the result instead of performing the teammate's delegated work; if teammates are still active, wait again.
 
-### 5. Broadcast to Team
+Teammates can use the same barrier for a real dependency. First send the request, then wait:
+
+```javascript
+team_message({
+  team_name: "my-team",
+  to: "api-owner",
+  content: "Please send me the finalized response schema."
+})
+team_wait({ team_name: "my-team" })
+```
+
+Teammates do not call `team_wait` merely because they are idle; idle inbox delivery is automatic.
+
+### 4. Broadcast to Team
 > **You:** "Broadcast to the entire team: 'The API endpoint has changed to /v2. Please update your work accordingly.'"
 
-### 6. Shut Down Team
+### 5. Shut Down Team
 > **You:** "We're done. Shut down the team and close the panes."
 
 **Automatic Cleanup:**
@@ -338,7 +349,7 @@ wt -- pwsh -c "pi"
 
 This project is a port of the excellent [claude-code-teams-mcp](https://github.com/cs50victor/claude-code-teams-mcp) by [cs50victor](https://github.com/cs50victor).
 
-We have adapted the original MCP coordination protocol to work natively as a **Pi Package**, adding features like auto-starting teammates, balanced vertical UI layouts, automatic inbox polling, plan approval mode, broadcast messaging, and quality gate hooks.
+We have adapted the original MCP coordination protocol to work natively as a **Pi Package**, adding features like auto-starting teammates, balanced vertical UI layouts, automatic inbox delivery, blocking team waits, broadcast messaging, and quality gate hooks.
 
 ## 📄 License
 MIT

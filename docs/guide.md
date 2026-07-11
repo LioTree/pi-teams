@@ -48,21 +48,15 @@ Set a default model for all teammates:
 > **You:** "Create a task for security-reviewer: 'Review the auth module for SQL injection risks' and set it to in_progress"
 > **You:** "Create a task for performance-reviewer: 'Analyze the database queries for N+1 issues' and set it to in_progress"
 
-### 2. Refactor with Plan Approval
+### 2. Long-Running Security Audit
 
-> **You:** "Create a team named 'refactor-squad'"
-> **You:** "Spawn a teammate named 'refactor-bot' and require plan approval before they make any changes"
-> **You:** "Create a task for refactor-bot: 'Refactor the user service to use dependency injection' and set it to in_progress"
+> **You:** "Create a team named 'security-audit'"
+> **You:** "Delegate authentication review to auth-auditor and session review to session-auditor"
+> **You:** "Wait for the security-audit team"
 
-Teammate submits a plan. Review it:
+Delegation returns immediately, so the final instruction should call `team_wait({ team_name: "security-audit" })`. With no timeout, the lead can remain blocked for as long as a live teammate is running. The wait returns when a message arrives or when no other member can make progress.
 
-> **You:** "List all tasks and show me refactor-bot's plan for task 1"
-
-Approve or reject:
-
-> **You:** "Approve refactor-bot's plan for task 1"
-
-> **You:** "Reject refactor-bot's plan for task 1 with feedback: 'Add unit tests for the new injection pattern'"
+When it returns, the lead should process reports and coordinate follow-up work. It should not independently repeat the delegated audit. If teammates are still active, call `team_wait` again.
 
 ### 3. Testing with Automated Hooks
 
@@ -100,6 +94,8 @@ When qa-bot marks the task as completed, the hook automatically runs tests and l
 After db-migrator completes, broadcast the schema change:
 
 > **You:** "Broadcast to the team: 'New columns added to users table: phone, email_verified. Please update your code accordingly.'"
+
+If api-updater unexpectedly needs the exact schema before it can continue, it should send db-migrator a `team_message` and then call `team_wait`. It should not wait merely because it has no current work; idle inbox delivery is automatic.
 
 ### 5. Mixed-Speed Team
 
@@ -234,18 +230,15 @@ spawn "frontend-dev" using "haiku" with "low" thinking
 spawn "test-writer" using "haiku" with "off" thinking
 ```
 
-### 3. Plan Approval for High-Risk Changes
+### 3. Make Dependencies Explicit
 
-Enable plan approval mode for:
-- Database schema changes
-- API contract changes
-- Security-related work
-- Performance-critical code
+Avoid splitting work with known blocking dependencies when independent tasks are available. If an unexpected dependency appears:
 
-Disable for:
-- Documentation updates
-- Test additions
-- Simple bug fixes
+1. Send the needed request to the responsible teammate with `team_message`.
+2. Call `team_wait({ team_name: "my-team" })` while that dependency is outstanding.
+3. Resume on the reply. Treat `no_active_agents` as a blocker to report or reassign, not a reason to spin forever.
+
+This works for teammate-to-teammate dependencies as well as lead-to-teammate delegation.
 
 ### 4. Broadcast for Coordination
 
@@ -271,11 +264,11 @@ Bad task:
 
 ### 6. Delegate Then Wait
 
-When you assign all current work to teammates, wait for a report instead of continuing the same task as the lead.
+`delegate_task` returns immediately. When you assign all current work to teammates, wait for a report instead of continuing the same task as the lead.
 
 > **You:** "Wait for my inbox until a teammate reports back."
 
-This keeps the lead available for review, coordination, and follow-up decisions.
+With no `timeout_seconds`, `team_wait` is an indefinite barrier: long security reviews are not cut off by a default deadline. It returns with `outcome: "message"`, `"no_active_agents"`, or `"timeout"`. Use the result for review, coordination, and follow-up decisions; if teammates remain active, wait again.
 
 ### 7. Check Progress Regularly
 
@@ -371,6 +364,19 @@ Backend Bot → Frontend Bot: "Returns {id, name, email, created_at}"
 
 This enables autonomous coordination. You can see these messages by:
 > **You:** "Read backend-bot's inbox"
+
+When one teammate cannot continue without a reply, use an explicit request followed by a wait:
+
+```javascript
+team_message({
+  team_name: "my-team",
+  to: "backend-bot",
+  content: "Please confirm the final /api/users response shape."
+})
+team_wait({ team_name: "my-team" })
+```
+
+Ordinary idle teammates do not call `team_wait`; pi-teams delivers their unread messages automatically when their session is idle.
 
 ---
 

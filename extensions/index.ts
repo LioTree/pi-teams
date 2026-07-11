@@ -1,12 +1,15 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { StringEnum, Type } from "@mariozechner/pi-ai";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { StringEnum } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import * as paths from "../src/utils/paths";
 import * as teams from "../src/utils/teams";
 import * as tasks from "../src/utils/tasks";
 import * as messaging from "../src/utils/messaging";
 import * as runtime from "../src/utils/runtime";
+import { classifyTeamWaitPeer, waitForTeam } from "../src/utils/team-wait";
+import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-file";
 import { resolveAgentRole } from "../src/utils/agent-role";
-import { buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/plan-mode-prompt";
+import { buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
 import { Member } from "../src/utils/models";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
@@ -14,6 +17,7 @@ import * as predefined from "../src/utils/predefined-teams";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import * as os from "node:os";
+import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 
 /**
@@ -195,7 +199,11 @@ function findLeadTeamForSession(): string | null {
       if (fs.existsSync(sessionFile)) {
         try {
           const session = JSON.parse(fs.readFileSync(sessionFile, "utf-8"));
-          if (session.pid === process.pid) {
+          const currentStartToken = runtime.getProcessStartToken(process.pid);
+          const tokenMatches = session.processStartToken === undefined
+            ? fs.existsSync(paths.configPath(teamDir))
+            : session.processStartToken === currentStartToken;
+          if (session.pid === process.pid && tokenMatches) {
             return teamDir;
           }
         } catch {
@@ -216,18 +224,23 @@ function registerLeadSession(teamName: string) {
   const sessionFile = paths.leadSessionPath(teamName);
   const dir = path.dirname(sessionFile);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(sessionFile, JSON.stringify({
+  atomicWriteJsonSync(sessionFile, {
     pid: process.pid,
+    processStartToken: runtime.getProcessStartToken(process.pid),
     startedAt: Date.now(),
-  }));
+  });
 }
 
 /**
  * Check if a process with the given PID is still alive.
  */
-function isPidAlive(pid: number): boolean {
+function isPidAlive(pid: number, processStartToken?: string): boolean {
   try {
     process.kill(pid, 0); // Signal 0 = check if process exists
+    if (processStartToken) {
+      const currentToken = runtime.getProcessStartToken(pid);
+      if (currentToken !== undefined && currentToken !== processStartToken) return false;
+    }
     return true;
   } catch {
     return false;
@@ -251,7 +264,7 @@ function cleanupStaleTeam(teamName: string, terminal: any): boolean {
     const session = JSON.parse(fs.readFileSync(sessionFile, "utf-8"));
     
     // Only cleanup if the lead PID is actually dead
-    if (session.pid && !isPidAlive(session.pid)) {
+    if (session.pid && !isPidAlive(session.pid, session.processStartToken)) {
       // Read config to get member info for cleanup
       try {
         const config = JSON.parse(fs.readFileSync(configFile, "utf-8"));
@@ -264,8 +277,18 @@ function cleanupStaleTeam(teamName: string, terminal: any): boolean {
           const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
           if (fs.existsSync(pidFile)) {
             try {
-              const pid = fs.readFileSync(pidFile, "utf-8").trim();
-              process.kill(parseInt(pid), "SIGKILL");
+              const pid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
+              const runtimeFile = paths.runtimeStatusPath(teamName, member.name);
+              const status = fs.existsSync(runtimeFile)
+                ? JSON.parse(fs.readFileSync(runtimeFile, "utf-8")) as runtime.AgentRuntimeStatus
+                : undefined;
+              if (
+                status?.pid === pid &&
+                status.processStartToken !== undefined &&
+                runtime.isRuntimeProcessAlive(status)
+              ) {
+                process.kill(pid, "SIGKILL");
+              }
               fs.unlinkSync(pidFile);
             } catch {}
           }
@@ -342,6 +365,10 @@ function cleanupAgentSessionFolders(maxAgeMs: number = 24 * 60 * 60 * 1000): num
 
 export default function (pi: ExtensionAPI) {
   const { agentName, isTeammate } = resolveAgentRole(process.env.PI_AGENT_NAME);
+  const runtimeInstanceId = randomUUID();
+  const processStartToken = runtime.getProcessStartToken(process.pid);
+  let incomingLeadHandoffToken = process.env.PI_TEAM_HANDOFF_TOKEN;
+  delete process.env.PI_TEAM_HANDOFF_TOKEN;
   const envTeamName = process.env.PI_TEAM_NAME;
 
   // For leads without PI_TEAM_NAME, check if we're registered as lead for a team
@@ -350,32 +377,98 @@ export default function (pi: ExtensionAPI) {
 
   const terminal = getTerminalAdapter();
 
-  // Track whether lead inbox polling has been started (to avoid duplicates)
-  let leadPollingStarted = false;
+  let inboxPollingStarted = false;
+  let inboxDeliveryInFlight = false;
+  let inboxPollingTimer: ReturnType<typeof setInterval> | undefined;
   let sessionCtx: any = null;
+  let agentLoopActive = false;
+  const pendingInboxAckIds = new Set<string>();
 
-  /**
-   * Start inbox polling for the team lead.
-   * Called when a team is created or when the lead reconnects to an existing team.
-   * Requires sessionCtx to be set (from session_start).
-   */
-  function startLeadInboxPolling() {
-    if (leadPollingStarted || isTeammate || !sessionCtx) return;
-    leadPollingStarted = true;
+  function formatInboxDelivery(messages: Array<{ id: string; from: string; timestamp: string; summary?: string; text: string }>): string {
+    return [
+      "[pi-teams inbox delivery]",
+      ...messages.flatMap(message => [
+        "",
+        `From: ${message.from}`,
+        `Message-ID: ${message.id}`,
+        `Sent: ${message.timestamp}`,
+        ...(message.summary ? [`Summary: ${message.summary}`] : []),
+        "",
+        message.text,
+      ]),
+    ].join("\n");
+  }
 
-    setInterval(async () => {
-      if (!teamName) return;
-      if (sessionCtx.isIdle()) {
-        try {
-          const unread = await messaging.readInbox(teamName, agentName, true, false);
-          if (unread.length > 0) {
-            pi.sendUserMessage(`I have ${unread.length} new message(s) in my inbox. Reading them now...`);
-          }
-        } catch {
-          // Ignore errors for lead polling
-        }
+  async function deliverUnreadInbox(): Promise<void> {
+    if (inboxDeliveryInFlight || agentLoopActive || !teamName || !sessionCtx?.isIdle()) return;
+    inboxDeliveryInFlight = true;
+    try {
+      const leaseBeforeRead = await runtime.readRuntimeStatus(teamName, agentName);
+      if (leaseBeforeRead?.instanceId !== runtimeInstanceId) return;
+      // Only agent_settled transitions work from running to idle. Inbox polling
+      // must not race a newly started agent loop and misclassify it as idle.
+      if (leaseBeforeRead.activity === "running" || leaseBeforeRead.activity === "waiting" || leaseBeforeRead.activity === "stopped") return;
+
+      if (pendingInboxAckIds.size > 0) {
+        await messaging.markMessagesRead(teamName, agentName, [...pendingInboxAckIds]);
+        pendingInboxAckIds.clear();
       }
-    }, 30000);
+
+      const unread = (await messaging.readInbox(teamName, agentName, true, false))
+        .filter(message => !pendingInboxAckIds.has(message.id));
+      if (unread.length === 0 || !sessionCtx.isIdle() || agentLoopActive) {
+        if (leaseBeforeRead.activity === "queued") {
+          await runtime.updateRuntimeStatusForInstance(
+            teamName,
+            agentName,
+            runtimeInstanceId,
+            { activity: "idle", lastHeartbeatAt: Date.now() },
+            "queued",
+          );
+        }
+        return;
+      }
+      if (leaseBeforeRead.activity === "idle") {
+        await runtime.markRuntimeQueuedIfIdle(teamName, agentName);
+      }
+      const leaseBeforeDelivery = await runtime.readRuntimeStatus(teamName, agentName);
+      if (leaseBeforeDelivery?.instanceId !== runtimeInstanceId) return;
+      const deliveryBatch = unread.slice(0, 1);
+
+      // sendUserMessage is synchronous. Acknowledging only after it returns gives
+      // at-least-once delivery without losing messages appended concurrently.
+      pi.sendUserMessage(formatInboxDelivery(deliveryBatch));
+      const leaseAfterDelivery = await runtime.readRuntimeStatus(teamName, agentName);
+      if (leaseAfterDelivery?.instanceId !== runtimeInstanceId) return;
+      await messaging.markMessagesRead(teamName, agentName, deliveryBatch.map(message => message.id));
+      await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+        lastInboxReadAt: Date.now(),
+        lastHeartbeatAt: Date.now(),
+        lastError: undefined,
+      });
+    } catch (error) {
+      if (teamName) {
+        await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+          lastHeartbeatAt: Date.now(),
+          lastError: runtime.createRuntimeError(error),
+        }).catch(() => undefined);
+      }
+    } finally {
+      inboxDeliveryInFlight = false;
+    }
+  }
+
+  function startInboxPolling() {
+    if (inboxPollingStarted || !sessionCtx || !teamName) return;
+    inboxPollingStarted = true;
+    void deliverUnreadInbox();
+    inboxPollingTimer = setInterval(() => void deliverUnreadInbox(), 1000);
+  }
+
+  function stopInboxPolling() {
+    if (inboxPollingTimer) clearInterval(inboxPollingTimer);
+    inboxPollingTimer = undefined;
+    inboxPollingStarted = false;
   }
 
   pi.on("session_start", async (_event, ctx) => {
@@ -385,14 +478,17 @@ export default function (pi: ExtensionAPI) {
     if (isTeammate) {
       if (teamName) {
         const pidFile = path.join(paths.teamDir(teamName), `${agentName}.pid`);
-        fs.writeFileSync(pidFile, process.pid.toString());
-        await runtime.writeRuntimeStatus(teamName, agentName, {
+        atomicWriteFileSync(pidFile, process.pid.toString());
+        await runtime.setRuntimeActivity(teamName, agentName, "starting", {
+          instanceId: runtimeInstanceId,
           pid: process.pid,
+          processStartToken,
           startedAt: Date.now(),
+          activityChangedAt: Date.now(),
           lastHeartbeatAt: Date.now(),
-          ready: false,
           lastError: undefined,
         });
+        startInboxPolling();
       }
       ctx.ui.notify(`Teammate: ${agentName} (Team: ${teamName})`, "info");
       ctx.ui.setStatus("00-pi-teams", `[${agentName.toUpperCase()}]`);
@@ -409,36 +505,60 @@ export default function (pi: ExtensionAPI) {
         setTimeout(setIt, 5000);
       }
 
-      setTimeout(() => {
-        pi.sendUserMessage(`I am starting my work as '${agentName}' on team '${teamName}'. Checking my inbox for instructions...`);
-      }, 1000);
-
-      // Inbox polling for teammates
-      if (teamName) {
-        setInterval(async () => {
-          if (ctx.isIdle()) {
-            try {
-              const unread = await messaging.readInbox(teamName!, agentName, true, false);
-              await runtime.writeRuntimeStatus(teamName!, agentName, {
-                lastHeartbeatAt: Date.now(),
-              });
-              if (unread.length > 0) {
-                pi.sendUserMessage(`I have ${unread.length} new message(s) in my inbox. Reading them now...`);
-              }
-            } catch (e) {
-              await runtime.writeRuntimeStatus(teamName!, agentName, {
-                lastHeartbeatAt: Date.now(),
-                lastError: runtime.createRuntimeError(e),
-              });
-            }
-          }
-        }, 30000);
-      }
     } else if (teamName) {
       // Lead reconnecting to an existing team
       ctx.ui.setStatus("pi-teams", `Lead @ ${teamName}`);
-      startLeadInboxPolling();
+      const startedAt = Date.now();
+      const handoffToken = incomingLeadHandoffToken;
+      incomingLeadHandoffToken = undefined;
+      const leadRuntime = handoffToken
+        ? await runtime.replaceRuntimeInstance(
+          teamName,
+          agentName,
+          handoffToken,
+          runtimeInstanceId,
+          {
+            activity: ctx.isIdle() ? "idle" : "running",
+            pid: process.pid,
+            processStartToken,
+            startedAt,
+            activityChangedAt: startedAt,
+            lastHeartbeatAt: startedAt,
+            lastError: undefined,
+          },
+          "starting",
+        )
+        : await runtime.setRuntimeActivity(teamName, agentName, ctx.isIdle() ? "idle" : "running", {
+          instanceId: runtimeInstanceId,
+          pid: process.pid,
+          processStartToken,
+          startedAt,
+          activityChangedAt: startedAt,
+          lastHeartbeatAt: startedAt,
+          lastError: undefined,
+        });
+      if (!leadRuntime) {
+        ctx.ui.notify(`Lead handoff for team ${teamName} is no longer valid.`, "error");
+        stopInboxPolling();
+        teamName = null;
+        setTimeout(() => ctx.shutdown(), 0);
+        return;
+      }
+      registerLeadSession(teamName);
+      startInboxPolling();
     }
+  });
+
+  pi.on("agent_start", async () => {
+    agentLoopActive = true;
+    if (!teamName) return;
+    await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+      activity: "running",
+      pid: process.pid,
+      processStartToken,
+      lastHeartbeatAt: Date.now(),
+      lastError: undefined,
+    });
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -446,12 +566,65 @@ export default function (pi: ExtensionAPI) {
       const fullTitle = teamName ? `${teamName}: ${agentName}` : agentName;
       if ((ctx.ui as any).setTitle) (ctx.ui as any).setTitle(fullTitle);
       if (terminal) terminal.setTitle(fullTitle);
-      if (teamName) {
-        await runtime.writeRuntimeStatus(teamName, agentName, {
-          lastHeartbeatAt: Date.now(),
-        });
-      }
     }
+    if (teamName) {
+      await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, { lastHeartbeatAt: Date.now() });
+    }
+  });
+
+  pi.on("agent_settled", async () => {
+    agentLoopActive = false;
+    if (!teamName) return;
+    try {
+      const lease = await runtime.readRuntimeStatus(teamName, agentName);
+      if (lease?.instanceId !== runtimeInstanceId) return;
+      if (pendingInboxAckIds.size > 0) {
+        await messaging.markMessagesRead(teamName, agentName, [...pendingInboxAckIds]);
+        pendingInboxAckIds.clear();
+      }
+      const hasUnreadWork = (await messaging.readInbox(teamName, agentName, true, false)).length > 0;
+      const settled = await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+        activity: hasUnreadWork ? "queued" : "idle",
+        pid: process.pid,
+        processStartToken,
+        lastHeartbeatAt: Date.now(),
+        lastError: undefined,
+      });
+
+      if (!settled || hasUnreadWork || !isTeammate) return;
+      const ownedTasks = (await tasks.listTasks(teamName))
+        .filter(task => task.owner === agentName && task.status !== "completed" && task.status !== "deleted")
+        .map(task => ({ id: task.id, subject: task.subject, status: task.status }));
+      const taskLines = ownedTasks.length > 0
+        ? ownedTasks.map(task => `- ${task.id} [${task.status}] ${task.subject}`)
+        : ["- none"];
+      const stillIdle = await runtime.readRuntimeStatus(teamName, agentName);
+      if (stillIdle?.instanceId !== runtimeInstanceId || stillIdle.activity !== "idle") return;
+      await messaging.sendPlainMessage(
+        teamName,
+        agentName,
+        "team-lead",
+        [`Agent ${agentName} is idle.`, "Owned unfinished tasks:", ...taskLines].join("\n"),
+        `${agentName} is idle`,
+      );
+    } catch (error) {
+      await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+        activity: "idle",
+        lastError: runtime.createRuntimeError(error),
+      }).catch(() => undefined);
+    }
+  });
+
+  pi.on("session_shutdown", async () => {
+    agentLoopActive = false;
+    stopInboxPolling();
+    if (!teamName) return;
+    await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+      activity: "stopped",
+      pid: process.pid,
+      processStartToken,
+      lastHeartbeatAt: Date.now(),
+    });
   });
 
   let firstTurn = true;
@@ -461,7 +634,7 @@ export default function (pi: ExtensionAPI) {
 
     if (isTeammate) {
       if (teamName) {
-        await runtime.writeRuntimeStatus(teamName, agentName, {
+        await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
           lastHeartbeatAt: Date.now(),
         });
       }
@@ -497,11 +670,30 @@ export default function (pi: ExtensionAPI) {
   async function killTeammate(teamName: string, member: Member) {
     if (member.name === "team-lead") return;
 
+    const runtimeStatus = await runtime.readRuntimeStatus(teamName, member.name);
+    if (runtimeStatus?.instanceId) {
+      await runtime.replaceRuntimeInstance(teamName, member.name, runtimeStatus.instanceId, undefined, {
+        activity: "stopped",
+        lastHeartbeatAt: Date.now(),
+      }).catch(() => undefined);
+    } else {
+      await runtime.setRuntimeActivity(teamName, member.name, "stopped", {
+        lastHeartbeatAt: Date.now(),
+      }).catch(() => undefined);
+    }
+
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
     if (fs.existsSync(pidFile)) {
       try {
         const pid = fs.readFileSync(pidFile, "utf-8").trim();
-        process.kill(parseInt(pid), "SIGKILL");
+        const parsedPid = parseInt(pid, 10);
+        if (
+          runtimeStatus?.pid === parsedPid &&
+          runtimeStatus.processStartToken !== undefined &&
+          runtime.isRuntimeProcessAlive(runtimeStatus)
+        ) {
+          process.kill(parsedPid, "SIGKILL");
+        }
         fs.unlinkSync(pidFile);
       } catch (e) {
         // ignore
@@ -516,14 +708,58 @@ export default function (pi: ExtensionAPI) {
       terminal.kill(member.tmuxPaneId);
     }
 
-    await runtime.deleteRuntimeStatus(teamName, member.name);
   }
 
-  function isMemberAlive(member: Member): boolean {
-    if (!terminal) return false;
-    if (member.windowId) return terminal.isWindowAlive(member.windowId);
-    if (member.tmuxPaneId) return terminal.isAlive(member.tmuxPaneId);
+  function isMemberAlive(team: string, member: Member, runtimeStatus?: runtime.AgentRuntimeStatus | null): boolean {
+    if (runtimeStatus?.pid !== undefined) {
+      if (!runtime.isRuntimeProcessAlive(runtimeStatus)) return false;
+      if (!runtimeStatus.processStartToken) {
+        if (member.windowId && terminal) return terminal.isWindowAlive(member.windowId);
+        if (member.tmuxPaneId && terminal) return terminal.isAlive(member.tmuxPaneId);
+      }
+      return true;
+    }
+
+    if (member.name === "team-lead") {
+      try {
+        const leadSession = JSON.parse(fs.readFileSync(paths.leadSessionPath(team), "utf-8"));
+        if (typeof leadSession.pid === "number" && isPidAlive(leadSession.pid, leadSession.processStartToken)) {
+          return true;
+        }
+      } catch {
+        if (team === teamName && process.pid > 0) return true;
+      }
+      if (member.windowId && terminal) return terminal.isWindowAlive(member.windowId);
+      if (member.tmuxPaneId && terminal) return terminal.isAlive(member.tmuxPaneId);
+      return false;
+    }
+
+    if (member.windowId && terminal) return terminal.isWindowAlive(member.windowId);
+    if (member.tmuxPaneId && terminal) return terminal.isAlive(member.tmuxPaneId);
     return false;
+  }
+
+  async function memberSnapshot(team: string, member: Member) {
+    const runtimeStatus = await runtime.readRuntimeStatus(team, member.name);
+    const unreadCount = (await messaging.readInbox(team, member.name, true, false)).length;
+    const alive = isMemberAlive(team, member, runtimeStatus);
+    const classified = classifyTeamWaitPeer({
+      name: member.name,
+      agentType: member.agentType,
+      alive,
+      activity: runtimeStatus?.activity,
+      activityChangedAt: runtimeStatus?.activityChangedAt,
+      joinedAt: member.joinedAt,
+      unreadCount,
+    }, Date.now(), runtime.STARTUP_STALL_MS);
+
+    return {
+      ...classified,
+      liveness: alive ? "alive" as const : "dead" as const,
+      model: member.model,
+      thinking: member.thinking,
+      runtime: runtimeStatus,
+    };
   }
 
   function resolveChosenModel(teamConfig: any, model?: string): string | undefined {
@@ -609,94 +845,13 @@ export default function (pi: ExtensionAPI) {
     return { terminalId, isWindow: false };
   }
 
-  function delegatedTaskPrompt(task: any, prompt: string | undefined, planRequired: boolean): string {
+  function delegatedTaskPrompt(task: any, prompt: string | undefined): string {
     return [
       `You have been assigned task ${task.id}: ${task.subject}`,
       "",
       task.description,
-      planRequired
-        ? `\nThis task requires plan approval. Before editing files or executing implementation, call plan_submit with task_id="${task.id}" and wait for approval.`
-        : "",
       prompt ? `\nAdditional instructions:\n${prompt}` : "",
     ].filter(Boolean).join("\n");
-  }
-
-  async function waitForTaskEvent(
-    teamName: string,
-    event: "plan" | "task_completed" | "all_tasks_done",
-    options: {
-      taskId?: string;
-      pollIntervalMs?: number;
-      timeoutSeconds?: number;
-      signal?: AbortSignal;
-      onPoll?: () => void | Promise<void>;
-    } = {}
-  ) {
-    const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 1000);
-    const timeoutMs = options.timeoutSeconds === undefined
-      ? undefined
-      : Math.max(0, options.timeoutSeconds * 1000);
-    const startedAt = Date.now();
-
-    const createAbortError = () => {
-      const error = new Error("team_wait aborted");
-      error.name = "AbortError";
-      return error;
-    };
-
-    const delay = (ms: number) => new Promise<void>((resolve, reject) => {
-      if (options.signal?.aborted) {
-        reject(createAbortError());
-        return;
-      }
-      let timeout: ReturnType<typeof setTimeout>;
-      const cleanup = () => options.signal?.removeEventListener("abort", onAbort);
-      const onAbort = () => {
-        clearTimeout(timeout);
-        cleanup();
-        reject(createAbortError());
-      };
-      timeout = setTimeout(() => {
-        cleanup();
-        resolve();
-      }, ms);
-      options.signal?.addEventListener("abort", onAbort, { once: true });
-    });
-
-    while (true) {
-      if (options.signal?.aborted) {
-        throw createAbortError();
-      }
-
-      const waitedMs = Date.now() - startedAt;
-      const taskList = options.taskId
-        ? [await tasks.readTask(teamName, options.taskId)]
-        : await tasks.listTasks(teamName);
-
-      if (event === "all_tasks_done" && !options.taskId && taskList.length === 0) {
-        throw new Error(`No tasks to wait for in team ${teamName}.`);
-      }
-
-      const matchedTasks = event === "plan"
-        ? taskList.filter(task => task.status === "planning" && task.plan?.trim() && !task.planFeedback?.trim())
-        : event === "task_completed"
-          ? taskList.filter(task => task.status === "completed")
-          : taskList.length > 0 && taskList.every(task => task.status === "completed")
-            ? taskList
-            : [];
-
-      if (matchedTasks.length > 0) {
-        return { event, tasks: matchedTasks, waitedMs, timedOut: false };
-      }
-
-      if (timeoutMs !== undefined && waitedMs >= timeoutMs) {
-        return { event, tasks: [], waitedMs, timedOut: true };
-      }
-
-      await options.onPoll?.();
-      const remainingTimeoutMs = timeoutMs === undefined ? pollIntervalMs : timeoutMs - waitedMs;
-      await delay(Math.min(pollIntervalMs, Math.max(1, remainingTimeoutMs)));
-    }
   }
 
   // Tools
@@ -711,18 +866,33 @@ export default function (pi: ExtensionAPI) {
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      if (teamName) {
+        throw new Error(`This lead session is already bound to team ${teamName}; shut it down before creating another team`);
+      }
       // Auto-cleanup stale team if the previous lead process is dead
       // This handles the case where a session was aborted and restarted
       if (teams.teamExists(params.team_name)) {
-        cleanupStaleTeam(params.team_name, terminal);
+        const cleaned = cleanupStaleTeam(params.team_name, terminal);
+        if (!cleaned && teams.teamExists(params.team_name)) {
+          throw new Error(`Team ${params.team_name} already exists and has an active or recoverable lead session`);
+        }
       }
       
-      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, params.default_model, params.separate_windows);
+      const config = await teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, params.default_model, params.separate_windows);
       // Register this session as the lead so it can receive inbox messages
       registerLeadSession(params.team_name);
       // Update teamName and start inbox polling for the lead
       teamName = params.team_name;
-      startLeadInboxPolling();
+      await runtime.setRuntimeActivity(params.team_name, agentName, "running", {
+        instanceId: runtimeInstanceId,
+        pid: process.pid,
+        processStartToken,
+        startedAt: Date.now(),
+        activityChangedAt: Date.now(),
+        lastHeartbeatAt: Date.now(),
+        lastError: undefined,
+      });
+      startInboxPolling();
       return {
         content: [{ type: "text", text: `Team ${params.team_name} created.` }],
         details: { config },
@@ -743,17 +913,13 @@ export default function (pi: ExtensionAPI) {
       prompt: Type.Optional(Type.String({ description: "Additional teammate instructions for this task." })),
       model: Type.Optional(Type.String()),
       thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
-      plan_required: Type.Optional(Type.Boolean({ default: false })),
       reuse: Type.Optional(StringEnum(["existing", "replace", "error"])),
-      wait: Type.Optional(StringEnum(["none", "plan", "completion"])),
-      timeout_seconds: Type.Optional(Type.Number({ description: "Optional timeout when wait is plan or completion." })),
       separate_window: Type.Optional(Type.Boolean({ default: false })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const safeTeamName = paths.sanitizeName(params.team_name);
       const safeName = paths.sanitizeName(params.teammate_name);
       const reuse = params.reuse ?? "existing";
-      const waitMode = params.wait ?? "none";
 
       if (!teams.teamExists(safeTeamName)) {
         throw new Error(`Team ${params.team_name} does not exist`);
@@ -761,8 +927,8 @@ export default function (pi: ExtensionAPI) {
 
       let teamConfig = await teams.readConfig(safeTeamName);
       let member = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
-      const memberAlive = member ? isMemberAlive(member) : false;
-      const memberDefaultPlanRequired = member?.defaultPlanRequired ?? member?.planModeRequired ?? false;
+      const memberRuntime = member ? await runtime.readRuntimeStatus(safeTeamName, member.name) : null;
+      const memberAlive = member ? isMemberAlive(safeTeamName, member, memberRuntime) : false;
       const willSpawn = !member || reuse === "replace" || !memberAlive;
       const requestedSeparateWindow = params.separate_window ?? teamConfig.separateWindows ?? false;
 
@@ -790,9 +956,7 @@ export default function (pi: ExtensionAPI) {
         teamConfig = await teams.readConfig(safeTeamName);
       }
 
-      const planRequired = params.plan_required ?? memberDefaultPlanRequired;
       const task = await tasks.createTask(safeTeamName, params.task_subject, params.task_description, {
-        planRequired,
         metadata: { createdBy: "delegate_task" },
       });
 
@@ -812,30 +976,47 @@ export default function (pi: ExtensionAPI) {
           tmuxPaneId: "",
           cwd: params.cwd,
           subscriptions: [],
-          prompt: delegatedTaskPrompt(task, params.prompt, planRequired),
+          prompt: delegatedTaskPrompt(task, params.prompt),
           color: "blue",
           thinking: params.thinking,
-          defaultPlanRequired: false,
-          planModeRequired: false,
         };
 
-        await teams.addMember(safeTeamName, newMember);
-        member = newMember;
-        spawnConfig = { chosenModel, useSeparateWindow: requestedSeparateWindow };
+        try {
+          await teams.addMember(safeTeamName, newMember);
+          await runtime.setRuntimeActivity(safeTeamName, safeName, "starting", {
+            instanceId: undefined,
+            pid: undefined,
+            processStartToken: undefined,
+            startedAt: newMember.joinedAt,
+            activityChangedAt: newMember.joinedAt,
+            lastHeartbeatAt: newMember.joinedAt,
+            lastError: undefined,
+          });
+          member = newMember;
+          spawnConfig = { chosenModel, useSeparateWindow: requestedSeparateWindow };
+        } catch (error) {
+          // Another delegate call may have reserved this name after our initial
+          // config snapshot. Reuse that member rather than spawning a duplicate.
+          const latestConfig = await teams.readConfig(safeTeamName);
+          const existing = latestConfig.members.find(candidate =>
+            candidate.name === safeName && candidate.agentType === "teammate");
+          if (!existing) throw error;
+          member = existing;
+          teamConfig = latestConfig;
+        }
       }
 
       const assigned = await tasks.assignTask(safeTeamName, task.id, safeName, {
         assignedBy: agentName,
         notifyOwner: false,
-        status: planRequired ? "pending" : "in_progress",
-        planRequired,
+        status: "in_progress",
       });
 
       await messaging.sendPlainMessage(
         safeTeamName,
         agentName,
         safeName,
-        delegatedTaskPrompt(assigned, params.prompt, planRequired),
+        delegatedTaskPrompt(assigned, params.prompt),
         `Task ${task.id} delegated to you`
       );
 
@@ -869,33 +1050,12 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      let waitResult: any = undefined;
-      if (waitMode === "plan") {
-        waitResult = await waitForTaskEvent(safeTeamName, "plan", {
-          taskId: task.id,
-          timeoutSeconds: params.timeout_seconds,
-          signal,
-        });
-      } else if (waitMode === "completion") {
-        waitResult = await waitForTaskEvent(safeTeamName, "task_completed", {
-          taskId: task.id,
-          timeoutSeconds: params.timeout_seconds,
-          signal,
-        });
-      }
-
-      const waitText = waitResult
-        ? waitResult.timedOut
-          ? ` Wait for ${waitMode} timed out.`
-          : ` Wait for ${waitMode} completed.`
-        : "";
-
       return {
         content: [{
           type: "text",
-          text: `Task ${task.id} delegated to ${safeName}${spawned ? ` in ${isWindow ? "window" : "pane"} ${terminalId}` : ""}.${waitText}`,
+          text: `Task ${task.id} delegated to ${safeName}${spawned ? ` in ${isWindow ? "window" : "pane"} ${terminalId}` : ""}.`,
         }],
-        details: { task: assigned, teammate: member, spawned, terminalId, isWindow, wait: waitResult },
+        details: { task: assigned, teammate: member, spawned, terminalId, isWindow },
       };
     },
   });
@@ -903,13 +1063,16 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "spawn_lead_window",
     label: "Spawn Lead Window",
-    description: "Open the team lead in a separate OS window.",
+    description: "Move the team lead to a separate OS window. The current lead session exits after the handoff so only one lead consumes the inbox.",
     parameters: Type.Object({
       team_name: Type.String(),
       cwd: Type.Optional(Type.String()),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const safeTeamName = paths.sanitizeName(params.team_name);
+      if (isTeammate || agentName !== "team-lead" || teamName !== safeTeamName) {
+        throw new Error("spawn_lead_window must be called by the lead session currently bound to this team");
+      }
       if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
       if (!terminal || !terminal.supportsWindows()) throw new Error("Windows mode not supported.");
 
@@ -922,12 +1085,69 @@ export default function (pi: ExtensionAPI) {
         piCmd = `${piBinary} --model ${teamConfig.defaultModel}`;
       }
 
-      const env = { ...process.env, PI_TEAM_NAME: safeTeamName, PI_AGENT_NAME: "team-lead" };
+      const handoffToken = randomUUID();
+      const handoffStartedAt = Date.now();
+      const placeholder = await runtime.replaceRuntimeInstance(
+        safeTeamName,
+        agentName,
+        runtimeInstanceId,
+        handoffToken,
+        {
+          activity: "starting",
+          pid: undefined,
+          processStartToken: undefined,
+          startedAt: handoffStartedAt,
+          activityChangedAt: handoffStartedAt,
+          lastHeartbeatAt: handoffStartedAt,
+          lastError: undefined,
+        },
+        ["starting", "queued", "running", "idle"],
+      );
+      if (!placeholder) {
+        throw new Error("This lead session no longer owns the active runtime lease");
+      }
+      stopInboxPolling();
+
+      const env = {
+        ...process.env,
+        PI_TEAM_NAME: safeTeamName,
+        PI_AGENT_NAME: "team-lead",
+        PI_TEAM_HANDOFF_TOKEN: handoffToken,
+      };
       try {
         const windowId = terminal.spawnWindow({ name: "team-lead", cwd, command: piCmd, env, teamName: safeTeamName });
         await teams.updateMember(safeTeamName, "team-lead", { windowId });
-        return { content: [{ type: "text", text: `Lead window spawned: ${windowId}` }], details: { windowId } };
+        teamName = null;
+        ctx.ui.setStatus("pi-teams", undefined);
+        setTimeout(() => ctx.shutdown(), 250);
+        return {
+          content: [{ type: "text", text: `Lead moved to window ${windowId}; this lead session is shutting down.` }],
+          details: { windowId, handoff: true },
+        };
       } catch (e) {
+        const restored = await runtime.replaceRuntimeInstance(
+          safeTeamName,
+          agentName,
+          handoffToken,
+          runtimeInstanceId,
+          {
+            activity: "running",
+            pid: process.pid,
+            processStartToken,
+            startedAt: Date.now(),
+            activityChangedAt: Date.now(),
+            lastHeartbeatAt: Date.now(),
+            lastError: runtime.createRuntimeError(e),
+          },
+          "starting",
+        ).catch(() => null);
+        if (restored) {
+          startInboxPolling();
+        } else {
+          teamName = null;
+          ctx.ui.setStatus("pi-teams", undefined);
+          setTimeout(() => ctx.shutdown(), 0);
+        }
         throw new Error(`Failed: ${e}`);
       }
     }
@@ -970,129 +1190,115 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "team_wait",
     label: "Team Wait",
-    description: "Wait for a team event such as a message, submitted plan, task completion, or all tasks being done.",
+    description: "Block until this member receives a team message, no other member can make progress, an optional timeout expires, or the call is aborted. The default is an indefinite wait.",
+    executionMode: "sequential",
     parameters: Type.Object({
       team_name: Type.String(),
-      event: StringEnum(["message", "plan", "task_completed", "all_tasks_done"]),
-      task_id: Type.Optional(Type.String({ description: "Optional task id for plan or task_completed waits." })),
-      poll_interval_ms: Type.Optional(Type.Number({ description: "Polling interval in milliseconds. Defaults to 1000." })),
-      timeout_seconds: Type.Optional(Type.Number({ description: "Optional timeout. Omit to wait indefinitely." })),
+      timeout_seconds: Type.Optional(Type.Number({
+        minimum: 0.001,
+        description: "Optional positive timeout in seconds. Omit to wait indefinitely.",
+      })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      if (params.event === "message") {
-        const result = await messaging.waitForInbox(params.team_name, agentName, {
-          pollIntervalMs: params.poll_interval_ms,
+      const safeTeamName = paths.sanitizeName(params.team_name);
+      if (!teamName || safeTeamName !== teamName) {
+        throw new Error(`This Pi session is bound to team ${teamName ?? "none"}, not ${safeTeamName}`);
+      }
+      if (params.timeout_seconds !== undefined && (
+        !Number.isFinite(params.timeout_seconds) || params.timeout_seconds <= 0
+      )) {
+        throw new Error("timeout_seconds must be a positive finite number when provided");
+      }
+
+      const initialConfig = await teams.readConfig(safeTeamName);
+      if (!initialConfig.members.some(member => member.name === agentName)) {
+        throw new Error(`Agent ${agentName} is not a member of team ${safeTeamName}`);
+      }
+
+      const enteredWait = await runtime.updateRuntimeStatusForInstance(safeTeamName, agentName, runtimeInstanceId, {
+        activity: "waiting",
+        pid: process.pid,
+        processStartToken,
+        lastHeartbeatAt: Date.now(),
+        lastError: undefined,
+      }, "running");
+      if (!enteredWait) {
+        throw new Error(`Agent ${agentName} no longer owns the active runtime lease for team ${safeTeamName}`);
+      }
+
+      try {
+        const result = await waitForTeam({
           timeoutSeconds: params.timeout_seconds,
           signal,
-          onPoll: async () => {
-            if (isTeammate && teamName && params.team_name === teamName) {
-              try {
-                await runtime.writeRuntimeStatus(teamName, agentName, {
-                  lastHeartbeatAt: Date.now(),
-                });
-              } catch {
-                // Heartbeat is best-effort while this tool is blocking.
-              }
+          consumeMessages: async () => {
+            const lease = await runtime.updateRuntimeStatusForInstance(
+              safeTeamName,
+              agentName,
+              runtimeInstanceId,
+              { lastHeartbeatAt: Date.now() },
+              "waiting",
+            );
+            if (!lease) throw new Error(`Agent ${agentName} lost its runtime lease while waiting`);
+
+            const messages = (await messaging.readInbox(safeTeamName, agentName, true, false))
+              .filter(message => !pendingInboxAckIds.has(message.id));
+            if (messages.length > 0) {
+              const leaseAfterRead = await runtime.updateRuntimeStatusForInstance(
+                safeTeamName,
+                agentName,
+                runtimeInstanceId,
+                { lastInboxReadAt: Date.now(), lastHeartbeatAt: Date.now() },
+                "waiting",
+              );
+              if (!leaseAfterRead) throw new Error(`Agent ${agentName} lost its runtime lease before inbox delivery`);
+              for (const message of messages) pendingInboxAckIds.add(message.id);
             }
+            return messages;
+          },
+          getPeers: async () => {
+            const config = await teams.readConfig(safeTeamName);
+            if (!config.members.some(member => member.name === agentName)) {
+              throw new Error(`Agent ${agentName} is no longer a member of team ${safeTeamName}`);
+            }
+            return Promise.all(config.members
+              .filter(member => member.name !== agentName)
+              .map(async member => {
+                const status = await runtime.readRuntimeStatus(safeTeamName, member.name);
+                return {
+                  name: member.name,
+                  agentType: member.agentType,
+                  alive: isMemberAlive(safeTeamName, member, status),
+                  activity: status?.activity,
+                  activityChangedAt: status?.activityChangedAt,
+                  joinedAt: member.joinedAt,
+                  unreadCount: (await messaging.readInbox(safeTeamName, member.name, true, false)).length,
+                };
+              }));
+          },
+          onPoll: async () => {
+            const lease = await runtime.updateRuntimeStatusForInstance(
+              safeTeamName,
+              agentName,
+              runtimeInstanceId,
+              { lastHeartbeatAt: Date.now() },
+              "waiting",
+            );
+            if (!lease) throw new Error(`Agent ${agentName} lost its runtime lease while waiting`);
           },
         });
-        if (isTeammate && teamName && params.team_name === teamName) {
-          const runtimeUpdates: Partial<runtime.AgentRuntimeStatus> = {
-            lastHeartbeatAt: Date.now(),
-            ready: true,
-            lastError: undefined,
-          };
-          if (result.count > 0) runtimeUpdates.lastInboxReadAt = Date.now();
-          await runtime.writeRuntimeStatus(teamName, agentName, runtimeUpdates);
-        }
+
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
           details: result,
         };
+      } finally {
+        await runtime.updateRuntimeStatusForInstance(safeTeamName, agentName, runtimeInstanceId, {
+          activity: "running",
+          pid: process.pid,
+          processStartToken,
+          lastHeartbeatAt: Date.now(),
+        }, "waiting").catch(() => undefined);
       }
-
-      if ((params.event === "plan" || params.event === "task_completed") && !params.task_id) {
-        throw new Error(`team_wait event '${params.event}' requires task_id to avoid matching historical task state.`);
-      }
-
-      const result = await waitForTaskEvent(params.team_name, params.event, {
-        taskId: params.task_id,
-        pollIntervalMs: params.poll_interval_ms,
-        timeoutSeconds: params.timeout_seconds,
-        signal,
-        onPoll: async () => {
-          if (isTeammate && teamName && params.team_name === teamName) {
-            try {
-              await runtime.writeRuntimeStatus(teamName, agentName, {
-                lastHeartbeatAt: Date.now(),
-              });
-            } catch {
-              // Heartbeat is best-effort while this tool is blocking.
-            }
-          }
-        },
-      });
-
-      return {
-        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
-        details: result,
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "plan_submit",
-    label: "Submit Plan",
-    description: "Submit a plan for a task and wait until the lead approves or rejects it.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      task_id: Type.String(),
-      plan: Type.String(),
-    }),
-    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const evaluation = await tasks.submitPlanAndWaitForEvaluation(params.team_name, params.task_id, params.plan, {
-        submittedBy: agentName,
-        signal,
-        onPoll: async () => {
-          if (isTeammate && teamName && params.team_name === teamName) {
-            try {
-              await runtime.writeRuntimeStatus(teamName, agentName, {
-                lastHeartbeatAt: Date.now(),
-              });
-            } catch {
-              // Heartbeat is best-effort while this tool is blocking.
-            }
-          }
-        },
-      });
-      const actionText = evaluation.action === "approve" ? "approved" : "rejected";
-
-      return {
-        content: [{ type: "text", text: `Plan submitted for task ${params.task_id} and ${actionText}.` }],
-        details: { task: evaluation.task, evaluation },
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "plan_review",
-    label: "Review Plan",
-    description: "Approve or reject a submitted task plan.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-      task_id: Type.String(),
-      decision: StringEnum(["approve", "reject"]),
-      feedback: Type.Optional(Type.String({ description: "Required for rejection" })),
-    }),
-    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const updated = await tasks.evaluatePlan(params.team_name, params.task_id, params.decision as any, params.feedback, {
-        evaluatedBy: agentName,
-      });
-      const actionText = params.decision === "approve" ? "approved" : "rejected";
-      return {
-        content: [{ type: "text", text: `Plan for task ${params.task_id} has been ${actionText}.` }],
-        details: { task: updated },
-      };
     },
   });
 
@@ -1160,14 +1366,26 @@ export default function (pi: ExtensionAPI) {
       team_name: Type.String(),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const teamName = params.team_name;
+      if (isTeammate) throw new Error("Only the team lead can shut down an entire team");
+      const shuttingDownTeamName = params.team_name;
       try {
-        const config = await teams.readConfig(teamName);
-        for (const member of config.members) {
-          await killTeammate(teamName, member);
+        const config = await teams.readConfig(shuttingDownTeamName);
+        if (teamName === shuttingDownTeamName) {
+          await runtime.updateRuntimeStatusForInstance(shuttingDownTeamName, agentName, runtimeInstanceId, {
+            activity: "stopped",
+            lastHeartbeatAt: Date.now(),
+          }).catch(() => undefined);
         }
-        const dir = paths.teamDir(teamName);
-        const tasksDir = paths.taskDir(teamName);
+        for (const member of config.members) {
+          await killTeammate(shuttingDownTeamName, member);
+        }
+        if (teamName === shuttingDownTeamName) {
+          stopInboxPolling();
+          teamName = null;
+          ctx.ui.setStatus("pi-teams", undefined);
+        }
+        const dir = paths.teamDir(shuttingDownTeamName);
+        const tasksDir = paths.taskDir(shuttingDownTeamName);
         if (fs.existsSync(tasksDir)) fs.rmSync(tasksDir, { recursive: true });
         if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
 
@@ -1177,7 +1395,7 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `Team ${teamName} shut down.${cleanedSessions > 0 ? ` Cleaned up ${cleanedSessions} orphaned agent session folder(s).` : ""}`
+            text: `Team ${shuttingDownTeamName} shut down.${cleanedSessions > 0 ? ` Cleaned up ${cleanedSessions} orphaned agent session folder(s).` : ""}`
           }],
           details: { cleanedSessions }
         };
@@ -1238,44 +1456,7 @@ export default function (pi: ExtensionAPI) {
       const member = config.members.find(m => m.name === params.agent_name);
       if (!member) throw new Error(`Teammate ${params.agent_name} not found`);
 
-      let alive = false;
-      if (member.windowId && terminal) {
-        alive = terminal.isWindowAlive(member.windowId);
-      } else if (member.tmuxPaneId && terminal) {
-        alive = terminal.isAlive(member.tmuxPaneId);
-      }
-
-      const unreadCount = (await messaging.readInbox(params.team_name, params.agent_name, true, false)).length;
-      const runtimeStatus = await runtime.readRuntimeStatus(params.team_name, params.agent_name);
-      const now = Date.now();
-      const hasRecentHeartbeat = !!runtimeStatus?.lastHeartbeatAt
-        && (now - runtimeStatus.lastHeartbeatAt) <= runtime.HEARTBEAT_STALE_MS;
-      const startupStalled = alive
-        && unreadCount > 0
-        && (now - member.joinedAt) > runtime.STARTUP_STALL_MS
-        && !(runtimeStatus?.ready);
-      const health = !alive
-        ? "dead"
-        : startupStalled
-          ? "stalled"
-          : runtimeStatus?.ready
-            ? (hasRecentHeartbeat ? "healthy" : "idle")
-            : "starting";
-
-      const details = {
-        alive,
-        unreadCount,
-        health,
-        agentLoopReady: !!runtimeStatus?.ready,
-        hasRecentHeartbeat,
-        startupStalled,
-        runtime: runtimeStatus,
-      };
-
-      // Clean up runtime status for dead teammates
-      if (!alive && runtimeStatus) {
-        await runtime.deleteRuntimeStatus(params.team_name, params.agent_name);
-      }
+      const details = await memberSnapshot(params.team_name, member);
 
       return {
         content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
@@ -1294,27 +1475,7 @@ export default function (pi: ExtensionAPI) {
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const config = await teams.readConfig(params.team_name);
       const taskList = await tasks.listTasks(params.team_name);
-      const members = await Promise.all(config.members.map(async (member) => {
-        const runtimeStatus = await runtime.readRuntimeStatus(params.team_name, member.name);
-        const alive = member.name === "team-lead"
-          ? true
-          : member.windowId && terminal
-            ? terminal.isWindowAlive(member.windowId)
-            : member.tmuxPaneId && terminal
-              ? terminal.isAlive(member.tmuxPaneId)
-              : false;
-        const unreadCount = (await messaging.readInbox(params.team_name, member.name, true, false)).length;
-        return {
-          name: member.name,
-          agentType: member.agentType,
-          alive,
-          unreadCount,
-          model: member.model,
-          thinking: member.thinking,
-          planModeRequired: member.planModeRequired,
-          runtime: runtimeStatus,
-        };
-      }));
+      const members = await Promise.all(config.members.map(member => memberSnapshot(params.team_name, member)));
 
       const result = { team: config.name, members, tasks: taskList };
       return {
@@ -1415,6 +1576,9 @@ export default function (pi: ExtensionAPI) {
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      if (teamName) {
+        throw new Error(`This lead session is already bound to team ${teamName}; shut it down before creating another team`);
+      }
       const projectDir = ctx.cwd;
       const predefinedTeam = predefined.getPredefinedTeam(params.predefined_team, projectDir);
       
@@ -1428,11 +1592,20 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Create the team
-      const config = teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, params.default_model, params.separate_windows);
+      const config = await teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, params.default_model, params.separate_windows);
       registerLeadSession(params.team_name);
       // Update teamName and start inbox polling for the lead
       teamName = params.team_name;
-      startLeadInboxPolling();
+      await runtime.setRuntimeActivity(params.team_name, agentName, "running", {
+        instanceId: runtimeInstanceId,
+        pid: process.pid,
+        processStartToken,
+        startedAt: Date.now(),
+        activityChangedAt: Date.now(),
+        lastHeartbeatAt: Date.now(),
+        lastError: undefined,
+      });
+      startInboxPolling();
 
       const agentDefinitions = predefined.getAllAgentDefinitions(projectDir);
       const spawnResults: Array<{ name: string; status: string; error?: string }> = [];
@@ -1482,6 +1655,15 @@ export default function (pi: ExtensionAPI) {
           };
 
           await teams.addMember(safeTeamName, member);
+          await runtime.setRuntimeActivity(safeTeamName, safeName, "starting", {
+            instanceId: undefined,
+            pid: undefined,
+            processStartToken: undefined,
+            startedAt: member.joinedAt,
+            activityChangedAt: member.joinedAt,
+            lastHeartbeatAt: member.joinedAt,
+            lastError: undefined,
+          });
           await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, agentDef.prompt, "Initial prompt from predefined team");
 
           const piBinary = getPiLaunchCommand();

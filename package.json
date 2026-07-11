@@ -23,7 +23,8 @@
     "tmux"
   ],
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
   },
   "main": "extensions/index.ts",
   "files": [
@@ -34,11 +35,11 @@
     "README.md"
   ],
   "dependencies": {
-    "uuid": "^11.1.0"
+    "@earendil-works/pi-ai": "^0.80.6",
+    "typebox": "^1.1.38"
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": ">=0.80.6 <1"
   },
   "pi": {
     "image": "https://raw.githubusercontent.com/burggraf/pi-teams/main/pi-team-in-action.png",
@@ -50,9 +51,13 @@
     ]
   },
   "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.6",
     "@types/node": "^25.3.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3",
     "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }

@@ -10,8 +10,8 @@ Complete documentation of all tools, parameters, and automated behavior.
 - [Teammates](#teammates)
 - [Task Management](#task-management)
 - [Messaging](#messaging)
-- [Task Planning & Approval](#task-planning--approval)
 - [Automated Behavior](#automated-behavior)
+- [Runtime Activity](#runtime-activity)
 - [Task Statuses](#task-statuses)
 - [Configuration & Data](#configuration--data)
 
@@ -40,7 +40,7 @@ team_create({ team_name: "research", default_model: "gpt-4o" })
 
 ### check_teammate
 
-Check if a teammate is still running or has unread messages.
+Check a teammate's process liveness, coordination activity, and unread messages.
 
 **Parameters**:
 - `team_name` (required): Name of the team
@@ -48,12 +48,13 @@ Check if a teammate is still running or has unread messages.
 
 **Returns**: Status information including:
 - `alive`: Whether the teammate process/pane/window is still running
+- `activity`: One of `starting`, `queued`, `running`, `waiting`, `idle`, or `stopped`
+- `progressCapable`: Whether this member can currently make progress for another member's `team_wait`
+- `stalled`: Whether a startup or queued state has exceeded its startup grace period
 - `unreadCount`: Number of unread inbox messages
-- `health`: One of `healthy`, `idle`, `starting`, `stalled`, `dead`
-- `agentLoopReady`: Whether the teammate has executed its inbox-read loop at least once
-- `hasRecentHeartbeat`: Whether heartbeat data has been updated recently
-- `startupStalled`: Detects the "alive but not consuming inbox" startup failure mode
-- `runtime`: Raw runtime telemetry (timestamps, pid, last error)
+- `runtime`: Raw activity telemetry (timestamps, pid, last error)
+
+Liveness and activity are independent: an alive process may be deliberately `waiting` or naturally `idle`, neither of which means it can complete work for another waiting member.
 
 **Example**:
 ```javascript
@@ -82,10 +83,9 @@ process_shutdown_approved({ team_name: "my-team", agent_name: "security-bot" })
 ### Recommended Semantic Workflow
 
 Use these semantic tools for normal coordination:
-- `delegate_task`: create a task, assign it, and spawn or reuse the teammate in one call
+- `delegate_task`: create a task, assign it, and spawn or reuse the teammate in one call, returning immediately
 - `team_message`: send to one teammate, the lead, or everyone
-- `team_wait`: wait for a message, plan, task completion, or all tasks being done
-- `plan_submit` / `plan_review`: submit and review task plans
+- `team_wait`: block until a message arrives, no peer can make progress, or an optional timeout expires
 - `task_claim` / `task_complete`: self-claim work and complete owned tasks
 
 ---
@@ -102,17 +102,15 @@ Create a task, assign it to a teammate, and spawn or reuse that teammate as need
 - `task_description` (required): Task details
 - `prompt` (optional): Extra instructions sent with the task
 - `model` / `thinking` (optional): Teammate runtime settings when spawning
-- `plan_required` (optional): If true, the task prompt tells the teammate to submit a plan before implementation
 - `reuse` (optional): `existing`, `replace`, or `error`. Default: `existing`
-- `wait` (optional): `none`, `plan`, or `completion`. Default: `none`
-- `timeout_seconds` (optional): Timeout when waiting
 - `separate_window` (optional): Spawn in a separate OS window when supported
 
 **Behavior**:
 - Reuses an existing live teammate by default
 - Replaces a dead same-name teammate automatically
 - Only restarts a live same-name teammate when `reuse: "replace"` is explicit
-- Creates a task with optional `planRequired`, assigns it, sends an inbox prompt with the task id, then spawns if needed
+- Creates and assigns an `in_progress` task, sends an inbox message with the task id, then spawns if needed
+- Returns immediately after delegation; call `team_wait` separately when the caller should block
 
 **Example**:
 ```javascript
@@ -121,9 +119,7 @@ delegate_task({
   teammate_name: "security-bot",
   cwd: "/path/to/project",
   task_subject: "Audit auth endpoints",
-  task_description: "Review all authentication endpoints for SQL injection vulnerabilities",
-  plan_required: true,
-  wait: "plan"
+  task_description: "Review all authentication endpoints for SQL injection vulnerabilities"
 })
 ```
 
@@ -156,8 +152,6 @@ Get full details of a specific task.
 **Returns**: Full task object including:
 - Subject and description
 - Status and owner
-- Plan (if in planning mode)
-- Plan feedback (if rejected)
 - Blocked relationships
 
 **Example**:
@@ -178,7 +172,7 @@ Claim an unassigned task for the current agent using a task file lock.
 **Behavior**:
 - Fails if the task is already assigned to another agent
 - Sets the current agent as owner
-- Sets status to `in_progress`, unless the task has `planRequired`, in which case it stays `pending` until a plan is submitted
+- Sets status to `in_progress`
 
 ---
 
@@ -226,109 +220,48 @@ team_message({
 
 ### team_wait
 
-Wait for a semantic team event.
+Block the current member while another member is doing work. This is available to both the lead and teammates.
 
 **Parameters**:
 - `team_name` (required): Name of the team
-- `event` (required): `message`, `plan`, `task_completed`, or `all_tasks_done`
-- `task_id` (required for `plan` and `task_completed`): Limit the wait to one task, avoiding historical task matches
-- `poll_interval_ms` (optional): Polling interval in milliseconds. Default: `1000`
-- `timeout_seconds` (optional): Maximum time to wait. Omit to wait indefinitely
+- `timeout_seconds` (optional): Positive maximum wait time. Omit it to wait indefinitely
 
-`all_tasks_done` requires at least one task on the board; an empty team returns an error instead of waiting forever.
+**Returns**:
+- `outcome`: `message`, `no_active_agents`, or `timeout`
+- `messages`: Messages consumed from the caller's inbox, or an empty array for other outcomes
+- `waitedMs`: Elapsed wait time
+- `timedOut`: Whether the optional timeout expired
+- `members`: A snapshot of relevant member liveness and activity when available
+
+Messages win over activity checks. Otherwise, the wait returns `no_active_agents` after two consecutive checks, about one second apart, find no other progress-capable member. Alive members in fresh `starting`, fresh `queued`, `running`, or a still-unknown startup state are progress-capable, as is a live waiting/idle peer with unread mail. `waiting`, `idle`, `stopped`, and dead members without unread mail are not. Starting, queued, and unknown states have a 60-second grace period; after that they are stalled even if an undeliverable message remains unread, while a live `running` member has no arbitrary work timeout.
 
 **Examples**:
 ```javascript
-team_wait({ team_name: "my-team", event: "plan", task_id: "1" })
-team_wait({ team_name: "my-team", event: "all_tasks_done", timeout_seconds: 600 })
+// Long-lived barrier: waits as long as a running teammate needs.
+team_wait({ team_name: "my-team" })
+
+// Bounded wait when the caller has a real deadline.
+team_wait({ team_name: "my-team", timeout_seconds: 600 })
 ```
 
----
-
-## Task Planning & Approval
-
-### plan_submit
-
-For teammates to submit their implementation plans for approval. This tool blocks until the lead approves or rejects the plan.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `task_id` (required): ID of the task
-- `plan` (required): Implementation plan description
-
-**Behavior**:
-- Updates task status to `planning`
-- Saves the plan to the task
-- A teammate can submit a plan only for their own task; an unowned task is assigned to the submitting teammate
-- Automatically sends a wake-up inbox message to the lead when submitted by a teammate
-- Lead agent can then review and approve/reject
-- Waits until this specific task is approved or rejected
-- Returns the latest task and evaluation result
-- If the plan is approved, the task status is `in_progress` and the teammate may start implementation
-- If the plan is rejected, the task remains `planning` with `planFeedback`; revise and resubmit
-
-**Example**:
-```javascript
-plan_submit({
-  team_name: "my-team",
-  task_id: "task_abc123",
-  plan: "1. Add password strength validator component\n2. Integrate with existing signup form\n3. Add unit tests using zxcvbn library"
-})
-```
-
----
-
-### plan_review
-
-For the lead agent to approve or reject a submitted plan.
-
-**Parameters**:
-- `team_name` (required): Name of the team
-- `task_id` (required): ID of the task
-- `decision` (required): `"approve"` or `"reject"`
-- `feedback` (optional): Feedback message (required when rejecting)
-
-**Behavior**:
-- Only the team lead can review plans
-- **Approve**: Sets task status to `in_progress`, clears any previous feedback
-- **Reject**: Keeps task status as `planning` (for revision), saves feedback
-- Automatically sends a wake-up inbox message to the task owner when evaluated by another agent
-
-**Examples**:
-```javascript
-// Approve plan
-plan_review({
-  team_name: "my-team",
-  task_id: "task_abc123",
-  decision: "approve"
-})
-
-// Reject with feedback
-plan_review({
-  team_name: "my-team",
-  task_id: "task_abc123",
-  decision: "reject",
-  feedback: "Please add more detail about error handling and edge cases"
-})
-```
+Leads should call this after delegation instead of continuing the delegated work. After a return, perform coordination only; if peers remain active, call it again. A teammate should use it only for a real dependency, after sending the dependency request with `team_message`; ordinary idle inbox delivery does not require `team_wait`.
 
 ## Automated Behavior
 
-### Initial Greeting
+### Initial Assignment
 
 When a teammate is spawned, they automatically:
-1. Send a message to the lead announcing they've started
-2. Begin checking their inbox for work
-
-**Example message**: "I've started and am checking my inbox for tasks."
+1. Enter the `starting` activity state
+2. Begin checking their inbox for the assignment already sent by `delegate_task`
+3. Receive the actual unread message as soon as their session is idle
 
 ---
 
 ### Idle Polling
 
-If a teammate is idle (has no active work), they automatically check for new messages every **30 seconds**.
+If a teammate is idle, pi-teams checks for new messages about once per second. It injects the actual message contents into Pi and marks only successfully delivered message IDs as read.
 
-This ensures teammates stay responsive to new tasks, messages, and task reassignments without manual intervention.
+If the teammate is busy, messages stay unread until its next idle delivery. If it is blocked inside `team_wait`, the active wait consumes the message and resumes the agent. This keeps teammates responsive without asking them to call `team_wait` just to idle.
 
 ---
 
@@ -363,15 +296,26 @@ This ensures teammates understand their responsibilities and can work autonomous
 
 ---
 
+## Runtime Activity
+
+Activity describes coordination state separately from process liveness:
+
+- `starting`: The member session is launching
+- `queued`: An idle member has unread work queued for delivery
+- `running`: The Pi agent is actively processing or performing work
+- `waiting`: The member is blocked in `team_wait` on a real dependency
+- `idle`: The Pi agent has settled and is ready for new work
+- `stopped`: The member has shut down
+
+`team_status` and `check_teammate` expose both liveness and activity. This lets `team_wait` distinguish a long-running job from a team in which every remaining member is idle or waiting. A teammate becoming idle also sends a structured notification to the lead with its unfinished owned tasks.
+
+---
+
 ## Task Statuses
 
 ### pending
 
 Task is created but not yet assigned or started.
-
-### planning
-
-Task is being planned. Teammate has submitted a plan and is awaiting lead approval. (Only available when `plan_mode_required` is true for the teammate)
 
 ### in_progress
 
@@ -384,6 +328,8 @@ Task is finished. Status change triggers the `task_completed.sh` hook.
 ### deleted
 
 Task is removed from the active task list. Still preserved in data history.
+
+Legacy task records are returned as stored. Reading tasks or team configuration does not rewrite or remove legacy plan-approval data.
 
 ---
 
@@ -419,14 +365,12 @@ All pi-teams data is stored in your home directory under `~/.pi/`:
     {
       "name": "security-bot",
       "model": "gpt-4o",
-      "thinking": "medium",
-      "planModeRequired": true
+      "thinking": "medium"
     },
     {
       "name": "frontend-dev",
       "model": "haiku",
-      "thinking": "low",
-      "planModeRequired": false
+      "thinking": "low"
     }
   ]
 }
@@ -441,8 +385,6 @@ All pi-teams data is stored in your home directory under `~/.pi/`:
   "description": "Review all authentication endpoints for vulnerabilities",
   "status": "in_progress",
   "owner": "security-bot",
-  "plan": "1. Scan /api/login\n2. Scan /api/register\n3. Scan /api/refresh",
-  "planFeedback": null,
   "blocks": [],
   "blockedBy": [],
   "activeForm": "Auditing auth endpoints",
@@ -541,7 +483,7 @@ rm ~/.pi/teams/my-team/.lock
 
 ### Idle Polling Overhead
 
-Teammates poll their inboxes every 30 seconds when idle. This is minimal overhead (one file read per poll).
+Teammates poll their inboxes about once per second only while idle. Each poll is a local JSON read. Busy sessions leave queued messages unread, while a session in `team_wait` consumes messages through that active wait.
 
 ### Lock Timeout
 
