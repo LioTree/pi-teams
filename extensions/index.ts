@@ -10,6 +10,7 @@ import { classifyTeamWaitPeer, waitForTeam } from "../src/utils/team-wait";
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-file";
 import { resolveAgentRole } from "../src/utils/agent-role";
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
+import { buildPiCommand } from "../src/utils/pi-command";
 import { Member } from "../src/utils/models";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
@@ -767,14 +768,6 @@ export default function (pi: ExtensionAPI) {
     return chosenModel;
   }
 
-  function buildPiCommand(model?: string, thinking?: string): string {
-    const piBinary = getPiLaunchCommand();
-    if (model) {
-      return thinking ? `${piBinary} --model ${model}:${thinking}` : `${piBinary} --model ${model}`;
-    }
-    return thinking ? `${piBinary} --thinking ${thinking}` : piBinary;
-  }
-
   async function spawnTeammateProcess(
     safeTeamName: string,
     safeName: string,
@@ -791,7 +784,7 @@ export default function (pi: ExtensionAPI) {
       throw new Error(`Separate windows mode is not supported in ${terminal.name}.`);
     }
 
-    const piCmd = buildPiCommand(chosenModel, thinking);
+    const piCmd = buildPiCommand(getPiLaunchCommand(), chosenModel, thinking);
     const env: Record<string, string> = {
       ...process.env,
       PI_TEAM_NAME: safeTeamName,
@@ -1067,12 +1060,7 @@ export default function (pi: ExtensionAPI) {
 
       const teamConfig = await teams.readConfig(safeTeamName);
       const cwd = params.cwd || process.cwd();
-      const piBinary = getPiLaunchCommand();
-      let piCmd = piBinary;
-      if (teamConfig.defaultModel) {
-        // Use the combined --model provider/model format
-        piCmd = `${piBinary} --model ${teamConfig.defaultModel}`;
-      }
+      const piCmd = buildPiCommand(getPiLaunchCommand(), teamConfig.defaultModel);
 
       const handoffToken = randomUUID();
       const handoffStartedAt = Date.now();
@@ -1658,18 +1646,7 @@ export default function (pi: ExtensionAPI) {
           });
           await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, agentDef.prompt, "Initial prompt from predefined team");
 
-          const piBinary = getPiLaunchCommand();
-          let piCmd = piBinary;
-
-          if (chosenModel) {
-            if (agentDef.thinking) {
-              piCmd = `${piBinary} --model ${chosenModel}:${agentDef.thinking}`;
-            } else {
-              piCmd = `${piBinary} --model ${chosenModel}`;
-            }
-          } else if (agentDef.thinking) {
-            piCmd = `${piBinary} --thinking ${agentDef.thinking}`;
-          }
+          const piCmd = buildPiCommand(getPiLaunchCommand(), chosenModel, agentDef.thinking);
 
           const env: Record<string, string> = {
             ...process.env,
