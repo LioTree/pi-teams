@@ -382,7 +382,6 @@ export default function (pi: ExtensionAPI) {
   let inboxPollingTimer: ReturnType<typeof setInterval> | undefined;
   let sessionCtx: any = null;
   let agentLoopActive = false;
-  const pendingInboxAckIds = new Set<string>();
 
   function formatInboxDelivery(messages: Array<{ id: string; from: string; timestamp: string; summary?: string; text: string }>): string {
     return [
@@ -409,13 +408,7 @@ export default function (pi: ExtensionAPI) {
       // must not race a newly started agent loop and misclassify it as idle.
       if (leaseBeforeRead.activity === "running" || leaseBeforeRead.activity === "waiting" || leaseBeforeRead.activity === "stopped") return;
 
-      if (pendingInboxAckIds.size > 0) {
-        await messaging.markMessagesRead(teamName, agentName, [...pendingInboxAckIds]);
-        pendingInboxAckIds.clear();
-      }
-
-      const unread = (await messaging.readInbox(teamName, agentName, true, false))
-        .filter(message => !pendingInboxAckIds.has(message.id));
+      const unread = await messaging.readInbox(teamName, agentName, true, false);
       if (unread.length === 0 || !sessionCtx.isIdle() || agentLoopActive) {
         if (leaseBeforeRead.activity === "queued") {
           await runtime.updateRuntimeStatusForInstance(
@@ -578,10 +571,6 @@ export default function (pi: ExtensionAPI) {
     try {
       const lease = await runtime.readRuntimeStatus(teamName, agentName);
       if (lease?.instanceId !== runtimeInstanceId) return;
-      if (pendingInboxAckIds.size > 0) {
-        await messaging.markMessagesRead(teamName, agentName, [...pendingInboxAckIds]);
-        pendingInboxAckIds.clear();
-      }
       const hasUnreadWork = (await messaging.readInbox(teamName, agentName, true, false)).length > 0;
       const settled = await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
         activity: hasUnreadWork ? "queued" : "idle",
@@ -1240,8 +1229,7 @@ export default function (pi: ExtensionAPI) {
             );
             if (!lease) throw new Error(`Agent ${agentName} lost its runtime lease while waiting`);
 
-            const messages = (await messaging.readInbox(safeTeamName, agentName, true, false))
-              .filter(message => !pendingInboxAckIds.has(message.id));
+            const messages = await messaging.readInbox(safeTeamName, agentName, true, false);
             if (messages.length > 0) {
               const leaseAfterRead = await runtime.updateRuntimeStatusForInstance(
                 safeTeamName,
@@ -1251,7 +1239,11 @@ export default function (pi: ExtensionAPI) {
                 "waiting",
               );
               if (!leaseAfterRead) throw new Error(`Agent ${agentName} lost its runtime lease before inbox delivery`);
-              for (const message of messages) pendingInboxAckIds.add(message.id);
+
+              // A team_wait result is the delivery channel. Once this session
+              // owns the lease and returns the messages, acknowledge them now
+              // instead of waiting for an unrelated future settled event.
+              await messaging.markMessagesRead(safeTeamName, agentName, messages.map(message => message.id));
             }
             return messages;
           },

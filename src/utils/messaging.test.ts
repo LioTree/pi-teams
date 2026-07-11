@@ -118,6 +118,12 @@ describe("Messaging Utilities", () => {
       deliveryBatch.map(message => message.id)
     )).toBe(2);
 
+    expect(await markMessagesRead(
+      "test-team",
+      "receiver",
+      deliveryBatch.map(message => message.id)
+    )).toBe(0);
+
     const unread = await readInbox("test-team", "receiver", true, false);
     expect(unread.map(message => message.text)).toEqual(["concurrent"]);
   });
