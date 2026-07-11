@@ -23,6 +23,7 @@ describe("Tasks Utilities", () => {
     if (fs.existsSync(testDir)) fs.rmSync(testDir, { recursive: true });
     fs.mkdirSync(testDir, { recursive: true });
 
+    vi.spyOn(process, "cwd").mockReturnValue(path.join(testDir, "project"));
     vi.spyOn(paths, "taskDir").mockReturnValue(testDir);
     vi.spyOn(paths, "configPath").mockReturnValue(path.join(testDir, "config.json"));
     vi.spyOn(paths, "inboxPath").mockImplementation((_teamName, agentName) =>

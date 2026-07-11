@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -256,57 +256,26 @@ full:
 });
 
 describe("getAllAgentDefinitions and getAllPredefinedTeams", () => {
-  const globalDir = path.join(os.homedir(), ".pi", "agent", "agents");
-  const globalTeamsDir = path.join(os.homedir(), ".pi");
-  const legacyGlobalTeamsDir = path.join(os.homedir(), ".pi", "agent");
+  const testHome = path.join(os.tmpdir(), `pi-teams-home-discovery-${process.pid}`);
+  const globalDir = path.join(testHome, ".pi", "agent", "agents");
+  const globalTeamsDir = path.join(testHome, ".pi");
+  const legacyGlobalTeamsDir = path.join(testHome, ".pi", "agent");
   const projectDir = path.join(os.tmpdir(), "pi-teams-test-project-" + Date.now());
   const projectAgentsDir = path.join(projectDir, ".pi", "agents");
   const projectTeamsDir = path.join(projectDir, ".pi");
 
-  // Store original files to restore later
-  let originalGlobalAgents: string[] = [];
-  let originalGlobalTeams: string | null = null;
-  let originalLegacyGlobalTeams: string | null = null;
-
   beforeEach(() => {
-    // Create project directory
-    if (fs.existsSync(projectDir)) {
-      fs.rmSync(projectDir, { recursive: true });
-    }
+    fs.rmSync(testHome, { recursive: true, force: true });
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    fs.mkdirSync(globalDir, { recursive: true });
     fs.mkdirSync(projectAgentsDir, { recursive: true });
-
-    // Backup global files if they exist
-    if (fs.existsSync(globalDir)) {
-      originalGlobalAgents = fs.readdirSync(globalDir);
-    }
-    if (fs.existsSync(path.join(globalTeamsDir, "teams.yaml"))) {
-      originalGlobalTeams = fs.readFileSync(path.join(globalTeamsDir, "teams.yaml"), "utf-8");
-    }
-    if (fs.existsSync(path.join(legacyGlobalTeamsDir, "teams.yaml"))) {
-      originalLegacyGlobalTeams = fs.readFileSync(path.join(legacyGlobalTeamsDir, "teams.yaml"), "utf-8");
-    }
+    vi.spyOn(os, "homedir").mockReturnValue(testHome);
   });
 
   afterEach(() => {
-    if (fs.existsSync(projectDir)) {
-      fs.rmSync(projectDir, { recursive: true });
-    }
-
-    const globalTeamsPath = path.join(globalTeamsDir, "teams.yaml");
-    if (originalGlobalTeams === null) {
-      if (fs.existsSync(globalTeamsPath)) fs.rmSync(globalTeamsPath);
-    } else {
-      fs.mkdirSync(globalTeamsDir, { recursive: true });
-      fs.writeFileSync(globalTeamsPath, originalGlobalTeams);
-    }
-
-    const legacyGlobalTeamsPath = path.join(legacyGlobalTeamsDir, "teams.yaml");
-    if (originalLegacyGlobalTeams === null) {
-      if (fs.existsSync(legacyGlobalTeamsPath)) fs.rmSync(legacyGlobalTeamsPath);
-    } else {
-      fs.mkdirSync(legacyGlobalTeamsDir, { recursive: true });
-      fs.writeFileSync(legacyGlobalTeamsPath, originalLegacyGlobalTeams);
-    }
+    vi.restoreAllMocks();
+    fs.rmSync(testHome, { recursive: true, force: true });
+    fs.rmSync(projectDir, { recursive: true, force: true });
   });
 
   it("combines global and project-local agents", () => {
@@ -442,46 +411,22 @@ test-team:
 });
 
 describe("saveTeamTemplate", () => {
-  const rootPiDir = path.join(os.homedir(), ".pi");
+  const testHome = path.join(os.tmpdir(), `pi-teams-home-save-${process.pid}`);
+  const rootPiDir = path.join(testHome, ".pi");
   const globalAgentsDir = path.join(rootPiDir, "agent", "agents");
   const globalTeamsPath = path.join(rootPiDir, "teams.yaml");
   const projectDir = path.join(os.tmpdir(), "pi-teams-test-save-" + Date.now());
 
-  let originalGlobalTeams: string | null = null;
-  let originalAgentFiles = new Set<string>();
-
   beforeEach(() => {
-    if (fs.existsSync(projectDir)) {
-      fs.rmSync(projectDir, { recursive: true });
-    }
-
-    if (fs.existsSync(globalTeamsPath)) {
-      originalGlobalTeams = fs.readFileSync(globalTeamsPath, "utf-8");
-    }
-    if (fs.existsSync(globalAgentsDir)) {
-      originalAgentFiles = new Set(fs.readdirSync(globalAgentsDir));
-    }
+    fs.rmSync(testHome, { recursive: true, force: true });
+    fs.rmSync(projectDir, { recursive: true, force: true });
+    vi.spyOn(os, "homedir").mockReturnValue(testHome);
   });
 
   afterEach(() => {
-    if (fs.existsSync(projectDir)) {
-      fs.rmSync(projectDir, { recursive: true });
-    }
-
-    if (originalGlobalTeams === null) {
-      if (fs.existsSync(globalTeamsPath)) fs.rmSync(globalTeamsPath);
-    } else {
-      fs.mkdirSync(path.dirname(globalTeamsPath), { recursive: true });
-      fs.writeFileSync(globalTeamsPath, originalGlobalTeams);
-    }
-
-    if (fs.existsSync(globalAgentsDir)) {
-      for (const file of fs.readdirSync(globalAgentsDir)) {
-        if (!originalAgentFiles.has(file)) {
-          fs.rmSync(path.join(globalAgentsDir, file));
-        }
-      }
-    }
+    vi.restoreAllMocks();
+    fs.rmSync(testHome, { recursive: true, force: true });
+    fs.rmSync(projectDir, { recursive: true, force: true });
   });
 
   it("writes user-scoped teams to ~/.pi/teams.yaml and agents to ~/.pi/agent/agents", () => {

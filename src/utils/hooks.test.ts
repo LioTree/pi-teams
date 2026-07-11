@@ -1,24 +1,22 @@
 import fs from "node:fs";
 import path from "node:path";
 import { runHook } from "./hooks";
-import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
+import os from "node:os";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 describe("runHook", () => {
-  const hooksDir = path.join(process.cwd(), ".pi", "team-hooks");
+  const testCwd = path.join(os.tmpdir(), `pi-teams-hooks-test-${process.pid}`);
+  const hooksDir = path.join(testCwd, ".pi", "team-hooks");
 
-  beforeAll(() => {
-    if (!fs.existsSync(hooksDir)) {
-      fs.mkdirSync(hooksDir, { recursive: true });
-    }
+  beforeEach(() => {
+    fs.rmSync(testCwd, { recursive: true, force: true });
+    fs.mkdirSync(hooksDir, { recursive: true });
+    vi.spyOn(process, "cwd").mockReturnValue(testCwd);
   });
 
-  afterAll(() => {
-    // Optional: Clean up created scripts
-    const files = ["success_hook.sh", "fail_hook.sh"];
-    files.forEach(f => {
-      const p = path.join(hooksDir, f);
-      if (fs.existsSync(p)) fs.unlinkSync(p);
-    });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    fs.rmSync(testCwd, { recursive: true, force: true });
   });
 
   it("should return true if hook script does not exist", async () => {
@@ -67,9 +65,5 @@ describe("runHook", () => {
     expect(result).toBe(true);
     const output = fs.readFileSync(outputFile, "utf-8").trim();
     expect(JSON.parse(output)).toEqual(payload);
-
-    // Clean up
-    fs.unlinkSync(scriptPath);
-    if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile);
   });
 });
