@@ -208,20 +208,21 @@ fi
 - **`low`** - Standard work: typical feature implementation, tests
 - **`medium`** - Complex work: architecture decisions, tricky bugs
 - **`high`** - Critical work: security reviews, major refactors, design specs
-- **`xhigh`** - Deepest available reasoning: architecture audits, thorny debugging, high-stakes review work
+- **`xhigh`** - Deep reasoning: architecture audits, thorny debugging, high-stakes review work
+- **`max`** - Maximum reasoning depth supported by pi: hardest design/debug problems only
 
 ### 2. Team Composition
 
 Balanced teams typically include:
 - **1-2 high-thinking, high-model** agents for architecture and reviews
-- **Use `xhigh` sparingly** for the one teammate doing the hardest reasoning-heavy work
+- **Use `xhigh`/`max` sparingly** for the one teammate doing the hardest reasoning-heavy work
 - **2-3 low-thinking, fast-model** agents for implementation
 - **1 medium-thinking** agent for coordination
 
 Example:
 ```bash
 # Design/Review duo (expensive but thorough)
-spawn "architect" using "gpt-4o" with "xhigh" thinking
+spawn "architect" using "gpt-4o" with "max" thinking
 spawn "reviewer" using "gpt-4o" with "medium" thinking
 
 # Implementation trio (fast and cheap)

@@ -19,4 +19,11 @@ describe("Pi teammate command", () => {
     expect(buildPiCommand("pi", undefined, "medium", undefined))
       .toBe("pi --thinking medium");
   });
+
+  it("passes max thinking level through to pi", () => {
+    expect(buildPiCommand("pi", "provider/model", "max"))
+      .toBe("pi --model provider/model:max");
+    expect(buildPiCommand("pi", undefined, "max", undefined))
+      .toBe("pi --thinking max");
+  });
 });

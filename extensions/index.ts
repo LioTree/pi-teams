@@ -11,7 +11,7 @@ import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-fi
 import { resolveAgentRole } from "../src/utils/agent-role";
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
 import { buildPiCommand } from "../src/utils/pi-command";
-import { Member } from "../src/utils/models";
+import { Member, THINKING_LEVELS } from "../src/utils/models";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
 import * as predefined from "../src/utils/predefined-teams";
@@ -894,7 +894,7 @@ export default function (pi: ExtensionAPI) {
       task_description: Type.String(),
       prompt: Type.Optional(Type.String({ description: "Additional teammate instructions for this task." })),
       model: Type.Optional(Type.String()),
-      thinking: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"])),
+      thinking: Type.Optional(StringEnum([...THINKING_LEVELS])),
       reuse: Type.Optional(StringEnum(["existing", "replace", "error"])),
       separate_window: Type.Optional(Type.Boolean({ default: false })),
     }),

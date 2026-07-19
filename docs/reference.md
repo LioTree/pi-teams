@@ -419,7 +419,7 @@ pi-teams respects the following environment variables:
 
 - `ZELLIJ`: Automatically detected when running inside Zellij. Enables Zellij pane management.
 - `TMUX`: Automatically detected when running inside tmux. Enables tmux pane management.
-- `PI_DEFAULT_THINKING_LEVEL`: Default thinking level for spawned teammates if not specified (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`).
+- `PI_DEFAULT_THINKING_LEVEL`: Default thinking level for spawned teammates if not specified (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`).
 
 ---
 

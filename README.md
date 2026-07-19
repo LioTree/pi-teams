@@ -51,7 +51,7 @@ pi install npm:pi-teams
 - **Persistent Window Titles**: Windows are automatically titled `[team-name]: [agent-name]` for easy identification in your window manager.
 - **Broadcast Messaging**: Send a message to the entire team at once for global coordination and announcements.
 - **Quality Gate Hooks**: Automated shell scripts run when tasks are completed (e.g., to run tests or linting).
-- **Thinking Level Control**: Set per-teammate thinking levels (`off`, `minimal`, `low`, `medium`, `high`) to balance speed vs. reasoning depth.
+- **Thinking Level Control**: Set per-teammate thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) to balance speed vs. reasoning depth.
 
 ## 💬 Key Examples
 
@@ -197,7 +197,7 @@ You are a builder agent. Implement code following the plan provided. Write clean
 - `description` (required): What the agent does
 - `tools` (optional): Comma or space-separated list of allowed tools
 - `model` (optional): Model to use (e.g., `claude-sonnet-4`, `gpt-4o`)
-- `thinking` (optional): Thinking level (`off`, `minimal`, `low`, `medium`, `high`)
+- `thinking` (optional): Thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`)
 
 ### Use Predefined Teams
 

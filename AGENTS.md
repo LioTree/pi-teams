@@ -29,7 +29,7 @@ Agents spawned in separate panes. They are designed for:
 You can delegate work to teammates with custom identities, models, and reasoning depths:
 - **Custom Roles**: "Delegate a layout task to a 'CSS Expert'."
 - **Model Selection**: Use `gpt-4o` for complex architecture and `haiku` for fast, repetitive tasks.
-- **Thinking Levels**: Set thinking to `high` for deep reasoning or `off` for maximum speed.
+- **Thinking Levels**: Set thinking to `high`/`xhigh`/`max` for deep reasoning or `off` for maximum speed.
 
 ### 📋 Shared Task Board
 A centralized source of truth for the entire team:
