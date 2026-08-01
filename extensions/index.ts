@@ -12,6 +12,12 @@ import { resolveAgentRole } from "../src/utils/agent-role";
 import { buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
 import { buildPiCommand } from "../src/utils/pi-command";
 import { Member, THINKING_LEVELS } from "../src/utils/models";
+import {
+  type AgentSettings,
+  loadAgentSettings,
+  resolveTeammateModel,
+  resolveTeammateThinking,
+} from "../src/utils/agent-settings";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
 import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
 import * as predefined from "../src/utils/predefined-teams";
@@ -752,15 +758,28 @@ export default function (pi: ExtensionAPI) {
     };
   }
 
-  function resolveChosenModel(teamConfig: any, model?: string): string | undefined {
-    let chosenModel = model || teamConfig.defaultModel;
+  /**
+   * Resolve teammate model:
+   * tool `model` → team.defaultModel → settings.json teammateDefaultModel → undefined
+   * (undefined → bare `pi`, which falls back to leader Pi settings defaults)
+   */
+  function resolveChosenModel(
+    teamConfig: any,
+    model: string | undefined,
+    settings: AgentSettings,
+  ): string | undefined {
+    let chosenModel = resolveTeammateModel({
+      explicitModel: model,
+      teamDefaultModel: teamConfig.defaultModel,
+      settings,
+    });
 
-    if (chosenModel && !chosenModel.includes('/')) {
+    if (chosenModel && !chosenModel.includes("/")) {
       const resolved = resolveModelWithProvider(chosenModel);
       if (resolved) {
         chosenModel = resolved;
-      } else if (teamConfig.defaultModel && teamConfig.defaultModel.includes('/')) {
-        const [provider] = teamConfig.defaultModel.split('/');
+      } else if (teamConfig.defaultModel && teamConfig.defaultModel.includes("/")) {
+        const [provider] = teamConfig.defaultModel.split("/");
         chosenModel = `${provider}/${chosenModel}`;
       }
     }
@@ -768,12 +787,26 @@ export default function (pi: ExtensionAPI) {
     return chosenModel;
   }
 
+  /**
+   * Resolve teammate thinking:
+   * tool `thinking` → settings.json teammateDefaultThinkingLevel → undefined
+   */
+  function resolveChosenThinking(
+    thinking: string | undefined,
+    settings: AgentSettings,
+  ): Member["thinking"] {
+    return resolveTeammateThinking({
+      explicitThinking: thinking,
+      settings,
+    });
+  }
+
   async function spawnTeammateProcess(
     safeTeamName: string,
     safeName: string,
     cwd: string,
     chosenModel: string | undefined,
-    thinking: any,
+    thinking: Member["thinking"],
     useSeparateWindow: boolean,
     teamConfig: any
   ): Promise<{ terminalId: string; isWindow: boolean }> {
@@ -945,10 +978,16 @@ export default function (pi: ExtensionAPI) {
       let terminalId = member?.windowId || member?.tmuxPaneId || "";
       let isWindow = !!member?.windowId;
       let spawned = false;
-      let spawnConfig: { chosenModel?: string; useSeparateWindow: boolean } | undefined;
+      let spawnConfig: {
+        chosenModel?: string;
+        chosenThinking?: Member["thinking"];
+        useSeparateWindow: boolean;
+      } | undefined;
 
       if (!member) {
-        const chosenModel = resolveChosenModel(teamConfig, params.model);
+        const settings = loadAgentSettings();
+        const chosenModel = resolveChosenModel(teamConfig, params.model, settings);
+        const chosenThinking = resolveChosenThinking(params.thinking, settings);
         const newMember: Member = {
           agentId: `${safeName}@${safeTeamName}`,
           name: safeName,
@@ -960,7 +999,7 @@ export default function (pi: ExtensionAPI) {
           subscriptions: [],
           prompt: delegatedTaskPrompt(task, params.prompt),
           color: "blue",
-          thinking: params.thinking,
+          thinking: chosenThinking,
         };
 
         try {
@@ -975,7 +1014,11 @@ export default function (pi: ExtensionAPI) {
             lastError: undefined,
           });
           member = newMember;
-          spawnConfig = { chosenModel, useSeparateWindow: requestedSeparateWindow };
+          spawnConfig = {
+            chosenModel,
+            chosenThinking,
+            useSeparateWindow: requestedSeparateWindow,
+          };
         } catch (error) {
           // Another delegate call may have reserved this name after our initial
           // config snapshot. Reuse that member rather than spawning a duplicate.
@@ -1009,7 +1052,7 @@ export default function (pi: ExtensionAPI) {
             safeName,
             params.cwd,
             spawnConfig.chosenModel,
-            params.thinking,
+            spawnConfig.chosenThinking,
             spawnConfig.useSeparateWindow,
             teamConfig
           );
@@ -1589,6 +1632,7 @@ export default function (pi: ExtensionAPI) {
 
       const agentDefinitions = predefined.getAllAgentDefinitions(projectDir);
       const spawnResults: Array<{ name: string; status: string; error?: string }> = [];
+      const settings = loadAgentSettings();
 
       // Spawn each agent in the predefined team
       for (const agentName of predefinedTeam.agents) {
@@ -1603,17 +1647,26 @@ export default function (pi: ExtensionAPI) {
           const safeName = paths.sanitizeName(agentName);
           const safeTeamName = paths.sanitizeName(params.team_name);
           
-          let chosenModel = agentDef.model || params.default_model || config.defaultModel;
-          
-          if (chosenModel && !chosenModel.includes('/')) {
+          let chosenModel = resolveTeammateModel({
+            explicitModel: agentDef.model || params.default_model,
+            teamDefaultModel: config.defaultModel,
+            settings,
+          });
+
+          if (chosenModel && !chosenModel.includes("/")) {
             const resolved = resolveModelWithProvider(chosenModel);
             if (resolved) {
               chosenModel = resolved;
-            } else if (config.defaultModel && config.defaultModel.includes('/')) {
-              const [provider] = config.defaultModel.split('/');
+            } else if (config.defaultModel && config.defaultModel.includes("/")) {
+              const [provider] = config.defaultModel.split("/");
               chosenModel = `${provider}/${chosenModel}`;
             }
           }
+
+          const chosenThinking = resolveTeammateThinking({
+            explicitThinking: agentDef.thinking,
+            settings,
+          });
 
           const useSeparateWindow = params.separate_windows ?? config.separateWindows ?? false;
           if (useSeparateWindow && !terminal.supportsWindows()) {
@@ -1631,7 +1684,7 @@ export default function (pi: ExtensionAPI) {
             subscriptions: [],
             prompt: agentDef.prompt,
             color: "blue",
-            thinking: agentDef.thinking,
+            thinking: chosenThinking,
           };
 
           await teams.addMember(safeTeamName, member);
@@ -1646,7 +1699,7 @@ export default function (pi: ExtensionAPI) {
           });
           await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, agentDef.prompt, "Initial prompt from predefined team");
 
-          const piCmd = buildPiCommand(getPiLaunchCommand(), chosenModel, agentDef.thinking);
+          const piCmd = buildPiCommand(getPiLaunchCommand(), chosenModel, chosenThinking);
 
           const env: Record<string, string> = {
             ...process.env,

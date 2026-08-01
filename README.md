@@ -61,6 +61,25 @@ pi install npm:pi-teams
 **Set a default model for the whole team:**
 > **You:** "Create a team named 'Research' and use 'gpt-4o' for everyone."
 
+**Configure teammate defaults in the Pi agent settings file (no TASK/prompt needed):**
+
+By default this is `~/.pi/agent/settings.json`. When `PI_CODING_AGENT_DIR` is set, pi-teams reads `settings.json` from that directory instead.
+
+```json
+{
+  "defaultProvider": "grok-oauth",
+  "defaultModel": "grok-4.5",
+  "defaultThinkingLevel": "high",
+  "teammateDefaultProvider": "opencode-go",
+  "teammateDefaultModel": "deepseek-v4-flash",
+  "teammateDefaultThinkingLevel": "max"
+}
+```
+- Leader still uses `defaultProvider` / `defaultModel` / `defaultThinkingLevel`.
+- Teammate model priority is: explicit tool/agent model → team `default_model` → `teammateDefaultModel` → Pi's leader defaults (by launching bare `pi`).
+- Teammate thinking priority is independent of the team model: explicit tool/agent thinking → `teammateDefaultThinkingLevel` → Pi's leader defaults.
+- `teammateDefaultModel` may be a full `provider/model` string; `teammateDefaultProvider` is only used when the model id has no `/`.
+
 **Start a team in "Separate Windows" mode:**
 > **You:** "Create a team named 'Dev' and open everyone in separate windows."
 *(Supported in iTerm2 and WezTerm only)*

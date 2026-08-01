@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Teammate defaults from Pi agent settings**: pi-teams reads `~/.pi/agent/settings.json`, or `$PI_CODING_AGENT_DIR/settings.json` when that environment variable is set:
+  - `teammateDefaultModel` (optional `teammateDefaultProvider` if the model is bare)
+  - `teammateDefaultThinkingLevel`
+  - Model priority: tool/agent model → team `defaultModel` → settings teammate model → bare `pi` (leader Pi defaults)
+  - Thinking priority: tool/agent thinking → settings teammate thinking → bare `pi` (leader Pi defaults); this is independent of `defaultModel`
 - **`max` thinking level for teammates**: Extended allowed thinking levels to include `max`, matching pi's current thinking tiers (`off` → `max`).
 
 ## [0.9.14] - 2025-04-03
