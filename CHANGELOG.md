@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Role guidance on every run**: Team lead and teammate instructions are refreshed for each new prompt instead of disappearing after the first run. Teammate model/thinking metadata is re-read on each refresh.
+- **Structured prompt composition**: Use a dedicated `pi_teams` section on current Pi versions instead of forcing a complete system prompt. This preserves magic-context's guidance in either extension load order. Keep the legacy prompt-return fallback for older supported Pi versions.
+
+### Changed
+- **Pi 1.x support**: Extend the host peer range to `>=0.80.6 <2` and develop/typecheck against Pi `1.1.0`.
+- **Host-provided dependencies**: Declare Pi AI and TypeBox as peer dependencies with development copies for tests, avoiding duplicate runtime installations.
+- Document the user-level magic-context subprocess extension isolation setting.
+
 ### Added
 - **Teammate defaults from Pi agent settings**: pi-teams reads `~/.pi/agent/settings.json`, or `$PI_CODING_AGENT_DIR/settings.json` when that environment variable is set:
   - `teammateDefaultModel` (optional `teammateDefaultProvider` if the model is bare)

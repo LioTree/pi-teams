@@ -9,7 +9,7 @@ import * as runtime from "../src/utils/runtime";
 import { classifyTeamWaitPeer, waitForTeam } from "../src/utils/team-wait";
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-file";
 import { resolveAgentRole } from "../src/utils/agent-role";
-import { buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
+import { applyTeamSystemPrompt, buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
 import { buildPiCommand } from "../src/utils/pi-command";
 import { Member, THINKING_LEVELS } from "../src/utils/models";
 import {
@@ -623,11 +623,9 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  let firstTurn = true;
-  pi.on("before_agent_start", async (event, ctx) => {
-    if (!firstTurn) return;
-    firstTurn = false;
-
+  // Pi rebuilds prompt options for each new run. Refresh our own section rather
+  // than returning a full prompt that would mask other extensions' sections.
+  pi.on("before_agent_start", async (event) => {
     if (isTeammate) {
       if (teamName) {
         await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
@@ -641,26 +639,22 @@ export default function (pi: ExtensionAPI) {
           const teamConfig = await teams.readConfig(teamName);
           member = teamConfig.members.find(m => m.name === agentName);
         } catch (e) {
-          // Ignore
+          // Role guidance is still needed if the team config is unavailable.
         }
       }
 
-      return {
-        systemPrompt: buildTeammateSystemPrompt({
-          baseSystemPrompt: event.systemPrompt,
-          agentName,
-          teamName,
-          member,
-        }),
-      };
+      return applyTeamSystemPrompt(event, buildTeammateSystemPrompt({
+        baseSystemPrompt: "",
+        agentName,
+        teamName,
+        member,
+      }));
     }
 
-    return {
-      systemPrompt: buildLeadSystemPrompt({
-        baseSystemPrompt: event.systemPrompt,
-        teamName,
-      }),
-    };
+    return applyTeamSystemPrompt(event, buildLeadSystemPrompt({
+      baseSystemPrompt: "",
+      teamName,
+    }));
   });
 
   async function killTeammate(teamName: string, member: Member) {
