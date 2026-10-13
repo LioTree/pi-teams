@@ -10,7 +10,7 @@ import { classifyTeamWaitPeer, waitForTeam } from "../src/utils/team-wait";
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-file";
 import { resolveAgentRole } from "../src/utils/agent-role";
 import { applyTeamSystemPrompt, buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
-import { buildPiCommand } from "../src/utils/pi-command";
+import { buildPiCommand, getPiLaunchCommand } from "../src/utils/pi-command";
 import { Member, THINKING_LEVELS } from "../src/utils/models";
 import {
   type AgentSettings,
@@ -26,42 +26,6 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-
-/**
- * Build the command used to relaunch pi for teammate processes.
- *
- * There are three common cases:
- * - npm/node install: pi runs as `node .../dist/cli.js`
- * - standalone compiled binary: process.execPath is the actual `pi` executable
- * - shim-based installs (e.g. Volta): process.execPath is `node` and argv[1]
- *   may be a shim path, so the safest relaunch command is plain `pi`
- */
-function getPiLaunchCommand(): string {
-  const argv1 = process.argv[1];
-  const execPath = process.execPath;
-
-  // Regular Node install: relaunch the actual CLI script with node.
-  if (argv1) {
-    const ext = path.extname(argv1).toLowerCase();
-    const looksLikeScript = [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"].includes(ext)
-      || /(?:^|[/\\])dist[/\\]cli\.js$/i.test(argv1);
-
-    if (looksLikeScript) {
-      return `node ${JSON.stringify(argv1)}`;
-    }
-  }
-
-  // Standalone binary install: execPath is the pi executable itself.
-  if (execPath) {
-    const base = path.basename(execPath).toLowerCase();
-    if (base !== "node" && base !== "node.exe" && base !== "bun" && base !== "bun.exe") {
-      return JSON.stringify(execPath);
-    }
-  }
-
-  // Shim-based installs (like Volta) are safest to relaunch through PATH.
-  return "pi";
-}
 
 // Cache for available models
 let availableModelsCache: Array<{ provider: string; model: string }> | null = null;
@@ -661,6 +625,10 @@ export default function (pi: ExtensionAPI) {
     if (member.name === "team-lead") return;
 
     const runtimeStatus = await runtime.readRuntimeStatus(teamName, member.name);
+    // Notify launch bridges before SIGKILL; otherwise they may exit as a crash
+    // and Windows Terminal's graceful close-on-exit will retain the pane.
+    if (member.windowId) terminal?.prepareShutdown?.(member.windowId);
+    if (member.tmuxPaneId) terminal?.prepareShutdown?.(member.tmuxPaneId);
     if (runtimeStatus?.instanceId) {
       await runtime.replaceRuntimeInstance(teamName, member.name, runtimeStatus.instanceId, undefined, {
         activity: "stopped",

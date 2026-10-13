@@ -60,6 +60,12 @@ export interface TerminalAdapter {
   kill(paneId: string): void;
 
   /**
+   * Mark an intentional stop before the extension terminates the runtime PID.
+   * Launch bridges can then distinguish requested shutdowns from crashes.
+   */
+  prepareShutdown?(paneOrWindowId: string): void;
+
+  /**
    * Check if a terminal pane is still alive/active.
    * 
    * @param paneId - The pane ID returned from spawn()
@@ -126,7 +132,7 @@ export function execCommand(command: string, args: string[]): { stdout: string; 
   const result = spawnSync(command, args, { encoding: "utf-8" });
   return {
     stdout: result.stdout?.toString() ?? "",
-    stderr: result.stderr?.toString() ?? "",
+    stderr: result.stderr?.toString() || result.error?.message || "",
     status: result.status,
   };
 }

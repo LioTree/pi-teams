@@ -1,309 +1,226 @@
 /**
- * Windows Terminal/PowerShell Adapter
+ * Windows Terminal adapter for native Windows and WSL.
  *
- * Implements the TerminalAdapter interface for Windows with PowerShell.
- * Uses wt (Windows Terminal) CLI for pane management and PowerShell for command execution.
+ * wt manages the UI; WSL teammates remain Linux processes, so the extension's
+ * existing runtime leases, PID checks and shutdown logic continue to apply.
  */
 
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { TerminalAdapter, SpawnOptions, execCommand } from "../utils/terminal-adapter";
 
 export class WindowsAdapter implements TerminalAdapter {
   readonly name = "Windows";
 
-  // Common paths where wt CLI might be found on Windows
-  private possiblePaths = [
-    "wt",  // In PATH
-    "C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_8wekyb3d8bbwe\\wt.exe",  // WindowsApps
-    "C:\\Users\\${process.env.USERNAME}\\AppData\\Local\\Microsoft\\WindowsApps\\wt.exe",  // User Local
-  ];
-
   private wtPath: string | null = null;
   private psPath: string | null = null;
+  private spawnedPanes = 0;
 
-  private findWtBinary(): string | null {
-    if (this.wtPath !== null) {
-      return this.wtPath;
-    }
+  private isWsl(): boolean {
+    return process.platform === "linux" && !!process.env.WSL_DISTRO_NAME && !!process.env.WT_SESSION;
+  }
 
-    // On Windows, wt.exe is usually available via WindowsApps
-    // Try different methods to detect it
-    try {
-      // Method 1: Try running wt directly (works in Windows Terminal)
-      const result = execCommand("wt", ["--version"]);
-      // wt doesn't have a proper --version, but if it exists, it will fail with a specific error
-      // If it doesn't exist, spawnSync will throw
-      this.wtPath = "wt";
-      return "wt";
-    } catch {
-      // Method 2: Check common paths
-      const fs = require("fs");
-      const possiblePaths = [
-        `C:\\Users\\${process.env.USERNAME}\\AppData\\Local\\Microsoft\\WindowsApps\\wt.exe`,
-        "C:\\Program Files\\WindowsApps\\Microsoft.WindowsTerminal_8wekyb3d8bbwe\\wt.exe",
-      ];
-      
-      for (const p of possiblePaths) {
-        try {
-          if (fs.existsSync(p)) {
-            this.wtPath = p;
-            return p;
-          }
-        } catch {}
+  private findLinuxBinary(binary: string): string | null {
+    for (const directory of (process.env.PATH ?? "").split(path.posix.delimiter)) {
+      if (!directory) continue;
+      const candidate = path.posix.join(directory, binary);
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        if (fs.statSync(candidate).isFile()) return candidate;
+      } catch {
+        // Not present/executable in this PATH entry.
       }
     }
-
-    // Method 3: Just assume wt is available on Windows and let spawn fail if not
-    // This is a reasonable fallback for most Windows 10/11 systems
-    if (process.platform === "win32") {
-      this.wtPath = "wt";
-      return "wt";
-    }
-
-    this.wtPath = null;
     return null;
   }
 
-  /**
-   * Find the PowerShell binary to use.
-   * Prefers PowerShell Core (pwsh) if available, falls back to Windows PowerShell (powershell).
-   */
+  private findWtBinary(): string | null {
+    if (this.wtPath) return this.wtPath;
+    if (this.isWsl()) {
+      // Do not start a shell just to search PATH. Shell initialization can
+      // change PATH or block, and detect() runs inside the extension factory.
+      this.wtPath = this.findLinuxBinary("wt.exe");
+      return this.wtPath;
+    }
+    if (process.platform !== "win32") return null;
+
+    // Resolve without launching wt: unsupported probes can open a window,
+    // and spawnSync reports ENOENT via status rather than throwing.
+    const result = execCommand("where.exe", ["wt.exe"]);
+    if (result.status !== 0) return null;
+    this.wtPath = result.stdout.split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? null;
+    return this.wtPath;
+  }
+
   private findPsBinary(): string {
-    if (this.psPath !== null) {
-      return this.psPath;
-    }
+    if (this.psPath) return this.psPath;
 
-    // Try pwsh (PowerShell Core / PowerShell 7+) first
-    try {
-      const result = execCommand("pwsh", ["-NoProfile", "-Command", "echo 'found'"]);
+    for (const binary of ["pwsh", "powershell"]) {
+      const result = execCommand(binary, ["-NoProfile", "-Command", "Write-Output 'found'"]);
       if (result.status === 0 && result.stdout.trim() === "found") {
-        this.psPath = "pwsh";
-        return "pwsh";
+        this.psPath = binary;
+        return binary;
       }
-    } catch {
-      // pwsh not found, try powershell
     }
-
-    // Fall back to powershell (Windows PowerShell 5.1)
-    try {
-      const result = execCommand("powershell", ["-NoProfile", "-Command", "echo 'found'"]);
-      if (result.status === 0 && result.stdout.trim() === "found") {
-        this.psPath = "powershell";
-        return "powershell";
-      }
-    } catch {
-      // powershell not found either
-    }
-
-    // Default to powershell as it's built into Windows
-    this.psPath = "powershell";
-    return "powershell";
+    throw new Error("Windows Terminal requires PowerShell (pwsh or powershell) on native Windows.");
   }
 
   detect(): boolean {
-    // Windows only - check platform
-    if (process.platform !== "win32") {
+    if (process.env.TMUX || process.env.ZELLIJ || process.env.WEZTERM_PANE ||
+        process.env.CMUX_SOCKET_PATH || process.env.CMUX_WORKSPACE_ID) {
       return false;
     }
-
-    // Don't use if inside tmux, Zellij, or WezTerm
-    // Note: we DO detect in mintty/Git Bash because we can still use Windows Terminal
-    if (process.env.TMUX || process.env.ZELLIJ || process.env.WEZTERM_PANE) {
-      return false;
-    }
-
-    // On Windows, always try to use Windows Terminal
-    // findWtBinary() will return "wt" as fallback
-    return true;
+    return this.findWtBinary() !== null;
   }
 
-  /**
-   * Get all panes in the current window to determine layout state.
-   * wt cli list returns JSON with pane information.
-   */
-  private getPanes(): any[] {
-    const wtBin = this.findWtBinary();
-    if (!wtBin) return [];
+  private piEnvironment(options: SpawnOptions): Record<string, string> {
+    return Object.fromEntries(Object.entries(options.env)
+      .filter(([key, value]) => /^PI_[A-Za-z0-9_]+$/.test(key) && typeof value === "string"));
+  }
 
+  private shutdownMarker(paneId: string): string | null {
+    const match = /^windows_(?:win_)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.exec(paneId);
+    return match ? path.join(os.tmpdir(), `pi-teams-wt-${match[1]}.shutdown`) : null;
+  }
+
+  prepareShutdown(paneOrWindowId: string): void {
+    const marker = this.shutdownMarker(paneOrWindowId);
+    if (!marker) return; // Native Windows and handles from older launchers.
     try {
-      const result = execCommand(wtBin, ["list", "--format", "json"]);
-      if (result.status !== 0) return [];
-
-      const allPanes = JSON.parse(result.stdout);
-      
-      // Filter to get panes from current window only
-      // We can't easily get the current pane ID on Windows, so we assume
-      // the first window in the list is the current one
-      if (allPanes.length === 0) return [];
-      
-      const currentWindowId = allPanes[0].window;
-      return allPanes.filter((p: any) => p.window === currentWindowId);
-    } catch {
-      return [];
+      fs.writeFileSync(marker, "", { flag: "wx", mode: 0o600 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
+  }
+
+  private buildWslCommand(options: SpawnOptions, shutdownMarker: string): string[] {
+    // Reuse the lead's exact Node executable, including Nix store paths. For a
+    // standalone Pi binary, resolve Node from the lead's PATH instead.
+    let nodeBinary = process.execPath;
+    if (path.basename(nodeBinary) !== "node") {
+      nodeBinary = this.findLinuxBinary("node") ?? "";
+      if (!nodeBinary) throw new Error("Windows Terminal WSL spawning requires Node.js in PATH.");
+    }
+
+    const env = this.piEnvironment(options);
+    if (options.env.PATH !== undefined) env.PATH = options.env.PATH;
+    const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+    // Some distro shells initialize/alter PATH even for sh -c. Restore the
+    // lead's values after that initialization, not just before shell startup.
+    const shellCommand = [
+      ...Object.entries(env).map(([key, value]) => `export ${key}=${quote(value)}`),
+      options.command,
+    ].join("\n");
+
+    // wt treats semicolons as action separators, even inside a child command.
+    // Encode the bootstrap so command text, quotes and environment values never
+    // reach that parser. Only PI_* and PATH are overlaid: the new terminal keeps
+    // its own WT_SESSION/WSL_INTEROP and other host-generated environment.
+    const bootstrap = [
+      `const {spawnSync} = require("node:child_process");`,
+      `const result = spawnSync("/bin/sh", ["-c", ${JSON.stringify(shellCommand)}], {`,
+      `cwd: ${JSON.stringify(options.cwd)},`,
+      `env: {...process.env, ...${JSON.stringify(env)}}, stdio: "inherit"`,
+      `});`,
+      `const fs = require("node:fs");`,
+      `const marker = ${JSON.stringify(shutdownMarker)};`,
+      `const intentionalShutdown = fs.existsSync(marker);`,
+      `if (intentionalShutdown) fs.rmSync(marker, {force: true});`,
+      `if (result.error && !intentionalShutdown) console.error(result.error.message);`,
+      `process.exit(intentionalShutdown ? 0 : (result.status ?? 1));`,
+    ].join("\n");
+
+    return [
+      "wsl.exe", "--distribution", process.env.WSL_DISTRO_NAME!,
+      "--user", os.userInfo().username,
+      "--exec", nodeBinary, "-e",
+      "eval(Buffer.from(process.argv[1],process.argv[2]).toString())",
+      Buffer.from(bootstrap, "utf8").toString("base64"), "base64",
+    ];
+  }
+
+  private buildCommand(options: SpawnOptions, paneId: string): string[] {
+    if (this.isWsl()) return this.buildWslCommand(options, this.shutdownMarker(paneId)!);
+
+    const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
+    const script = [
+      "$ErrorActionPreference = 'Stop'",
+      `Set-Location -LiteralPath ${quote(options.cwd)}`,
+      ...Object.entries(this.piEnvironment(options)).map(([key, value]) => `$env:${key}=${quote(value)}`),
+      options.command,
+      "exit $LASTEXITCODE",
+    ].join("; ");
+    // -EncodedCommand also avoids wt's semicolon parsing and works in PS 5.1.
+    return [this.findPsBinary(), "-NoProfile", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")];
+  }
+
+  private launch(options: SpawnOptions, separateWindow: boolean): string {
+    const wtBinary = this.findWtBinary();
+    if (!wtBinary) throw new Error("Windows Terminal (wt.exe) CLI binary not found or unavailable in this environment.");
+
+    // The UUID also identifies a per-launch shutdown marker outside the team
+    // directory, which team_shutdown may remove before the bridge exits.
+    const paneId = this.isWsl()
+      ? `windows_${separateWindow ? "win_" : ""}${randomUUID()}`
+      : `windows_${separateWindow ? "win_" : ""}${Date.now()}_${options.name}`;
+    const title = options.teamName ? `${options.teamName}: ${options.name}` : options.name;
+    const action = separateWindow
+      ? ["-w", "-1", "new-tab"]
+      : ["-w", "0", "split-pane", this.spawnedPanes === 0 ? "--vertical" : "--horizontal", "--size", "0.5"];
+    const result = execCommand(wtBinary, [
+      ...action, "--title", title, "--suppressApplicationTitle", "--", ...this.buildCommand(options, paneId),
+    ]);
+    if (result.status !== 0) {
+      throw new Error(`Windows Terminal ${separateWindow ? "spawn-window" : "spawn"} failed (status ${result.status}): ${result.stderr}`);
+    }
+    if (!separateWindow) this.spawnedPanes++;
+
+    // wt does not return pane IDs. These are UI handles, not liveness evidence;
+    // the extension prefers the teammate's runtime PID once it has registered.
+    return paneId;
   }
 
   spawn(options: SpawnOptions): string {
-    const wtBin = this.findWtBinary();
-    if (!wtBin) {
-      throw new Error("Windows Terminal (wt) CLI binary not found.");
-    }
-
-    const psBin = this.findPsBinary();
-    const panes = this.getPanes();
-
-    // Build environment variables for PowerShell
-    const envVars = Object.entries(options.env)
-      .filter(([k]) => k.startsWith("PI_"))
-      .map(([k, v]) => `$env:${k}='${v}'`)
-      .join(" ");
-
-    // Build the PowerShell command
-    // Use icm (Invoke-Command) to run in a specific directory with env vars
-    const psCommand = `cd '${options.cwd}'; ${envVars}; ${options.command}`;
-
-    // Use wt split-pane command
-    // First pane splits vertically (right), subsequent panes stack
-    const isFirstPane = panes.length <= 1;
-
-    let wtArgs: string[];
-
-    if (isFirstPane) {
-      wtArgs = [
-        "split-pane",
-        "--vertical",
-        "--size", "50%",
-        "--", psBin, "-NoExit", "-Command", psCommand
-      ];
-    } else {
-      // Create a new tab for subsequent panes (Windows Terminal limitation)
-      // Alternatively split horizontally at the bottom
-      wtArgs = [
-        "split-pane",
-        "--horizontal",
-        "--size", "50%",
-        "--", psBin, "-NoExit", "-Command", psCommand
-      ];
-    }
-
-    const result = execCommand(wtBin, wtArgs);
-    if (result.status !== 0) {
-      throw new Error(`Windows Terminal spawn failed: ${result.stderr}`);
-    }
-
-    // wt doesn't return a pane ID, so we create a synthetic one
-    // We'll use a timestamp + name to make it unique
-    const syntheticId = `windows_${Date.now()}_${options.name}`;
-    return syntheticId;
+    return this.launch(options, false);
   }
 
-  kill(paneId: string): void {
-    if (!paneId?.startsWith("windows_")) return;
-
-    // Windows Terminal doesn't have a direct kill-pane command via CLI
-    // The pane will close when the PowerShell process exits
-    // We could potentially kill the process if we tracked PIDs, but for now
-    // we'll just let the user close it manually or the process ends naturally
+  spawnWindow(options: SpawnOptions): string {
+    return this.launch(options, true);
   }
 
-  isAlive(paneId: string): boolean {
-    if (!paneId?.startsWith("windows_")) return false;
-
-    // Windows Terminal doesn't provide an easy way to check pane status via CLI
-    // We assume the pane is alive for simplicity
-    // In production, you might want to track PIDs and check process status
-    return true;
-  }
-
-  setTitle(title: string): void {
-    const wtBin = this.findWtBinary();
-    if (!wtBin) return;
-
-    try {
-      // Set tab title (Windows Terminal uses tab titles, not pane titles)
-      execCommand(wtBin, ["set-tab-title", title]);
-    } catch {
-      // Silently fail
-    }
-  }
-
-  /**
-   * Windows Terminal supports spawning separate OS windows via New Tab or New Window
-   */
   supportsWindows(): boolean {
     return this.findWtBinary() !== null;
   }
 
-  /**
-   * Spawn a new separate OS window with the given options.
-   * Uses `wt new-window` or starts a new wt instance.
-   */
-  spawnWindow(options: SpawnOptions): string {
-    const wtBin = this.findWtBinary();
-    if (!wtBin) {
-      throw new Error("Windows Terminal (wt) CLI binary not found.");
-    }
-
-    const psBin = this.findPsBinary();
-
-    // Build environment variables for PowerShell
-    const envVars = Object.entries(options.env)
-      .filter(([k]) => k.startsWith("PI_"))
-      .map(([k, v]) => `$env:${k}='${v}'`)
-      .join(" ");
-
-    // Build the PowerShell command
-    const psCommand = `cd '${options.cwd}'; ${envVars}; ${options.command}`;
-
-    // Format window title as "teamName: agentName" if teamName is provided
-    const windowTitle = options.teamName
-      ? `${options.teamName}: ${options.name}`
-      : options.name;
-
-    // Use wt new-window
-    const spawnArgs = [
-      "new-window",
-      "--title", windowTitle,
-      "--", psBin, "-NoExit", "-Command", psCommand
-    ];
-
-    const result = execCommand(wtBin, spawnArgs);
-    if (result.status !== 0) {
-      throw new Error(`Windows Terminal spawn-window failed: ${result.stderr}`);
-    }
-
-    // Create a synthetic window ID
-    const syntheticId = `windows_win_${Date.now()}_${options.name}`;
-    return syntheticId;
+  kill(_paneId: string): void {
+    // No kill-pane action exists in wt. The extension terminates WSL teammates
+    // via their registered Linux PID; terminal close-on-exit controls the UI.
   }
 
-  /**
-   * Set the title of a specific window.
-   */
-  setWindowTitle(windowId: string, title: string): void {
-    // Windows Terminal CLI doesn't support setting window titles post-creation
-    // Titles are set at spawn time via --title flag
-    // This is a limitation of the wt CLI
+  killWindow(_windowId: string): void {
+    // As above: process shutdown, not a fabricated wt kill-window command.
   }
 
-  /**
-   * Kill/terminate a window.
-   */
-  killWindow(windowId: string): void {
-    if (!windowId?.startsWith("windows_win_")) return;
-
-    // Windows Terminal doesn't provide a direct way to kill windows via CLI
-    // This is a limitation of the wt CLI
-    // Users would need to close the window manually
+  isAlive(paneId: string): boolean {
+    // Startup fallback only. Runtime PID/start-token checks take precedence in
+    // the extension; wt cannot query arbitrary panes (there is no wt list).
+    return !!paneId?.startsWith("windows_");
   }
 
-  /**
-   * Check if a window is still alive/active.
-   */
   isWindowAlive(windowId: string): boolean {
-    if (!windowId?.startsWith("windows_win_")) return false;
+    return !!windowId?.startsWith("windows_win_");
+  }
 
-    // Windows Terminal doesn't provide an easy way to check window status via CLI
-    // We assume the window is alive for simplicity
-    return true;
+  setTitle(title: string): void {
+    // Set the current terminal title via OSC, without launching another wt.
+    if (process.stdout.isTTY) {
+      process.stdout.write(`\x1b]0;${title.replace(/[\x00-\x1f\x7f-\x9f]/g, "")}\x07`);
+    }
+  }
+
+  setWindowTitle(_windowId: string, _title: string): void {
+    // Titles of other windows can only be set at creation via --title.
   }
 }

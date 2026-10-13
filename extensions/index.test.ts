@@ -14,7 +14,13 @@ const mocks = vi.hoisted(() => ({
   getProcessStartToken: vi.fn(),
   readConfig: vi.fn(),
   updateRuntimeStatusForInstance: vi.fn(),
+  readRuntimeStatus: vi.fn(),
+  replaceRuntimeInstance: vi.fn(),
+  isRuntimeProcessAlive: vi.fn(),
+  removeMember: vi.fn(),
   existsSync: vi.fn(),
+  readFileSync: vi.fn(),
+  unlinkSync: vi.fn(),
 }));
 
 vi.mock("../src/adapters/terminal-registry", () => ({
@@ -24,22 +30,28 @@ vi.mock("../src/adapters/terminal-registry", () => ({
 vi.mock("../src/utils/teams", async (importOriginal) => ({
   ...await importOriginal<typeof import("../src/utils/teams")>(),
   readConfig: mocks.readConfig,
+  removeMember: mocks.removeMember,
 }));
 
 vi.mock("../src/utils/runtime", async (importOriginal) => ({
   ...await importOriginal<typeof import("../src/utils/runtime")>(),
   getProcessStartToken: mocks.getProcessStartToken,
   updateRuntimeStatusForInstance: mocks.updateRuntimeStatusForInstance,
+  readRuntimeStatus: mocks.readRuntimeStatus,
+  replaceRuntimeInstance: mocks.replaceRuntimeInstance,
+  isRuntimeProcessAlive: mocks.isRuntimeProcessAlive,
 }));
 
 // No-team lead discovery must never scan the user's real ~/.pi/teams directory.
-// Mock both import styles; no lifecycle handlers or tool executors run here.
+// Mock both import styles, including shutdown PID-file access in tool tests.
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return {
     ...actual,
     existsSync: mocks.existsSync,
-    default: { ...actual, existsSync: mocks.existsSync },
+    readFileSync: mocks.readFileSync,
+    unlinkSync: mocks.unlinkSync,
+    default: { ...actual, existsSync: mocks.existsSync, readFileSync: mocks.readFileSync, unlinkSync: mocks.unlinkSync },
   };
 });
 
@@ -152,6 +164,35 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+});
+
+describe("registered teammate shutdown tool", () => {
+  it.each([true, false])("prepares a bridge before killing the PID and supports older adapters (hook: %s)", async hasHook => {
+    const prepareShutdown = vi.fn();
+    const terminal = { kill: vi.fn(), ...(hasHook ? { prepareShutdown } : {}) };
+    mocks.getTerminalAdapter.mockReturnValue(terminal);
+    mocks.readConfig.mockResolvedValue(teamConfig({ ...baseMember, tmuxPaneId: "windows_test_handle" }));
+    mocks.readRuntimeStatus.mockResolvedValue({ instanceId: "test-instance", pid: 424242, processStartToken: "test-token" });
+    mocks.replaceRuntimeInstance.mockResolvedValue(null);
+    mocks.isRuntimeProcessAlive.mockReturnValue(true);
+    mocks.existsSync.mockReturnValue(true);
+    mocks.readFileSync.mockReturnValue("424242");
+    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+    const registerTool = vi.fn();
+    extension({ on: vi.fn(), registerTool } as unknown as ExtensionAPI);
+    const tool = registerTool.mock.calls.find(([tool]) => tool.name === "process_shutdown_approved")![0];
+    await tool.execute("shutdown-test", { team_name: teamName, agent_name: teammateName }, undefined, undefined, {});
+
+    expect(kill).toHaveBeenCalledWith(424242, "SIGKILL");
+    if (hasHook) {
+      expect(prepareShutdown).toHaveBeenCalledWith("windows_test_handle");
+      expect(prepareShutdown.mock.invocationCallOrder[0]).toBeLessThan(kill.mock.invocationCallOrder[0]);
+    } else {
+      expect(prepareShutdown).not.toHaveBeenCalled();
+    }
+    expect(terminal.kill).toHaveBeenCalledWith("windows_test_handle");
+    expect(mocks.removeMember).toHaveBeenCalledWith(teamName, teammateName);
+  });
 });
 
 describe("before_agent_start registered by the extension factory", () => {

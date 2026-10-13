@@ -22,7 +22,7 @@ import { WindowsAdapter } from "./windows-adapter";
  * 3. cmux - if CMUX_SOCKET_PATH or CMUX_WORKSPACE_ID env is set
  * 4. iTerm2 - if TERM_PROGRAM=iTerm.app and not in tmux/zellij/cmux
  * 5. WezTerm - if WEZTERM_PANE env is set and not in tmux/zellij/cmux
- * 6. Windows - if platform is win32 and not in tmux/zellij/cmux/iTerm2/WezTerm
+ * 6. Windows - native win32, or WSL inside Windows Terminal with wt.exe available
  */
 const adapters: TerminalAdapter[] = [
   new TmuxAdapter(),
@@ -47,7 +47,7 @@ let cachedAdapter: TerminalAdapter | null = null;
  * 3. cmux - if CMUX_SOCKET_PATH or CMUX_WORKSPACE_ID env is set
  * 4. iTerm2 - if TERM_PROGRAM=iTerm.app and not in tmux/zellij/cmux
  * 5. WezTerm - if WEZTERM_PANE env is set and not in tmux/zellij/cmux
- * 6. Windows - if platform is win32 and not in tmux/zellij/cmux/iTerm2/WezTerm
+ * 6. Windows - native win32, or WSL inside Windows Terminal with wt.exe available
  *
  * @returns The detected terminal adapter, or null if none detected
  */
