@@ -12,13 +12,35 @@
 
 ## 🛠 Installation
 
-Requires Pi `0.80.6` or newer and Node.js `22.19.0` or newer. Pi `0.80.6` provides the settled-agent lifecycle event and sequential custom-tool execution used by the coordination barrier.
+Requires Pi `>=0.80.6 <2` and Node.js `22.19.0` or newer. Supports Pi `1.1.0`, with a legacy prompt fallback for Pi `0.x`. Pi `0.80.6` provides the settled-agent lifecycle event and sequential custom-tool execution used by the coordination barrier.
 
 Open your Pi terminal and type:
 
 ```bash
 pi install npm:pi-teams
 ```
+
+## Extension Compatibility
+
+On Pi versions with structured system prompts, pi-teams refreshes its own `pi_teams` section on every new run. It does not replace the complete system prompt, so other extensions' sections, including magic-context guidance, remain intact regardless of whether Teams or magic-context loads first. Older supported Pi versions use the legacy prompt-return API, also on every run.
+
+Pi-provided libraries are peer dependencies rather than bundled runtime dependencies, so extensions use the host's library instances.
+
+### Using magic-context
+
+Teammates are independent Pi processes and can load magic-context normally. However, magic-context's internal historian/dreamer processes can inherit the teammate's environment. Keep those internal processes from discovering the Teams extension by merging this into the **user-level** `~/.config/cortexkit/magic-context.jsonc` configuration:
+
+```json
+{
+  "pi": {
+    "subagent_extensions": []
+  }
+}
+```
+
+Preserve your other magic-context settings. This setting limits extension discovery in magic-context's own internal subprocesses; it does not disable magic-context in working teammates. Restart affected Pi processes after changing it.
+
+Prompt composition and tool registration are tested with Pi `1.1.0` and magic-context `0.48.0`. This is not a certification of long-running concurrent historian/dreamer workloads.
 
 ## 🚀 Quick Start
 

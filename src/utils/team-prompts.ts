@@ -12,6 +12,26 @@ export interface LeadSystemPromptOptions {
   teamName?: string | null;
 }
 
+interface TeamSystemPromptEvent {
+  readonly systemPrompt: string;
+  // Older supported Pi versions expose only the rendered systemPrompt.
+  systemPromptOptions?: { sections: Record<string, string> };
+}
+
+/** Add role guidance without forcing an opaque prompt on structured-prompt hosts. */
+export function applyTeamSystemPrompt(
+  event: TeamSystemPromptEvent,
+  rolePrompt: string,
+): { systemPrompt: string } | undefined {
+  const guidance = rolePrompt.trim();
+  if (event.systemPromptOptions?.sections) {
+    event.systemPromptOptions.sections.pi_teams = guidance;
+    return undefined;
+  }
+
+  return { systemPrompt: `${event.systemPrompt}\n\n${guidance}` };
+}
+
 export function buildLeadSystemPrompt(options: LeadSystemPromptOptions): string {
   const roleLine = options.teamName
     ? `You are the team lead for team '${options.teamName}'.`

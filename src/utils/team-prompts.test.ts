@@ -1,6 +1,63 @@
 import { describe, expect, it } from "vitest";
 import { Member } from "./models";
-import { buildLeadSystemPrompt, buildTeammateSystemPrompt } from "./team-prompts";
+import { applyTeamSystemPrompt, buildLeadSystemPrompt, buildTeammateSystemPrompt } from "./team-prompts";
+
+describe("applyTeamSystemPrompt", () => {
+  it("adds a dedicated section without replacing the rendered prompt or other sections", () => {
+    const options = {
+      sections: { magic_context: "Memory guidance.", other_extension: "Other guidance." },
+      appendSystemPrompt: "User guidance.",
+      selectedTools: ["read", "ctx_search"],
+    };
+    const event = { systemPrompt: "Base system prompt.", systemPromptOptions: options };
+
+    expect(applyTeamSystemPrompt(event, "\n\nTeam guidance.")).toBeUndefined();
+    expect(event.systemPrompt).toBe("Base system prompt.");
+    expect(options).toEqual({
+      sections: {
+        magic_context: "Memory guidance.",
+        other_extension: "Other guidance.",
+        pi_teams: "Team guidance.",
+      },
+      appendSystemPrompt: "User guidance.",
+      selectedTools: ["read", "ctx_search"],
+    });
+    expect(options).not.toHaveProperty("forceSystemPrompt");
+  });
+
+  it.each(["before", "after"])("composes with an MC-style section added %s Teams", (order) => {
+    const sections: Record<string, string> = {};
+    const event = { systemPrompt: "Base system prompt.", systemPromptOptions: { sections } };
+    if (order === "before") sections.magic_context = "Memory guidance.";
+
+    expect(applyTeamSystemPrompt(event, "Team guidance.")).toBeUndefined();
+    if (order === "after") sections.magic_context = "Memory guidance.";
+
+    expect(sections).toEqual({ magic_context: "Memory guidance.", pi_teams: "Team guidance." });
+  });
+
+  it("replaces its own section on refresh instead of accumulating duplicate guidance", () => {
+    const event = { systemPrompt: "Base system prompt.", systemPromptOptions: { sections: { pi_teams: "Old role." } } };
+    applyTeamSystemPrompt(event, "New role.");
+    applyTeamSystemPrompt(event, "New role.");
+    expect(event.systemPromptOptions.sections.pi_teams).toBe("New role.");
+  });
+
+  it("does not render the full prompt on structured-prompt hosts", () => {
+    const event = {
+      get systemPrompt(): string { throw new Error("Full prompt must not be read"); },
+      systemPromptOptions: { sections: {} as Record<string, string> },
+    };
+    expect(applyTeamSystemPrompt(event, "Team guidance.")).toBeUndefined();
+    expect(event.systemPromptOptions.sections.pi_teams).toBe("Team guidance.");
+  });
+
+  it("uses the legacy return contract when structured prompt options are absent", () => {
+    expect(applyTeamSystemPrompt({ systemPrompt: "Base and other extensions." }, "\n\nTeam guidance.")).toEqual({
+      systemPrompt: "Base and other extensions.\n\nTeam guidance.",
+    });
+  });
+});
 
 describe("buildLeadSystemPrompt", () => {
   it("adds long-running coordination instructions while preserving the base prompt", () => {
