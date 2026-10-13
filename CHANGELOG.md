@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **WSL teammate panes after shutdown**: Mark intentional stops before terminating the runtime PID, allowing the launch bridge to exit successfully and Windows Terminal's graceful close-on-exit to close the pane. Genuine failures and unrequested signals retain error exit codes.
+- **Windows Terminal CLI compatibility**: Use `-w -1 new-tab` for separate windows, decimal split sizes, and encoded PowerShell commands with correctly separated/escaped environment assignments. Remove unsupported CLI probes, pane listing and title-setting commands; do not assume missing executables are available.
+- **Pi relaunch paths**: Reuse the lead's exact runtime executable and correctly quote POSIX/PowerShell paths, including Nix store paths and paths containing spaces or apostrophes.
 - **Role guidance on every run**: Team lead and teammate instructions are refreshed for each new prompt instead of disappearing after the first run. Teammate model/thinking metadata is re-read on each refresh.
 - **Structured prompt composition**: Use a dedicated `pi_teams` section on current Pi versions instead of forcing a complete system prompt. This preserves magic-context's guidance in either extension load order. Keep the legacy prompt-return fallback for older supported Pi versions.
 
@@ -14,6 +17,7 @@ All notable changes to this project will be documented in this file.
 - Document the user-level magic-context subprocess extension isolation setting.
 
 ### Added
+- **Windows Terminal in WSL without tmux**: Detect WSL sessions in Windows Terminal and spawn panes or separate windows in the same Linux distribution/user, preserving the working directory, `PI_*` variables and PATH. Encode the launch payload so quotes and semicolons cannot be interpreted as Terminal actions. Teammate lifecycle continues to use Linux runtime PID/start-token checks.
 - **Teammate defaults from Pi agent settings**: pi-teams reads `~/.pi/agent/settings.json`, or `$PI_CODING_AGENT_DIR/settings.json` when that environment variable is set:
   - `teammateDefaultModel` (optional `teammateDefaultProvider` if the model is bare)
   - `teammateDefaultThinkingLevel`
