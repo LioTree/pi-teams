@@ -12,7 +12,7 @@
 
 ## 🛠 Installation
 
-Requires Pi `>=0.80.6 <2` and Node.js `22.19.0` or newer. Supports Pi `1.1.0`, with a legacy prompt fallback for Pi `0.x`. Pi `0.80.6` provides the settled-agent lifecycle event and sequential custom-tool execution used by the coordination barrier.
+Requires Pi `>=1.1.0 <2` and Node.js `22.19.0` or newer. Pi `1.1.0` provides the aborted-settlement signal used to keep interrupted teammates paused without waking the lead, as well as the settled-agent lifecycle event and sequential custom-tool execution used by the coordination barrier.
 
 Open your Pi terminal and type:
 
@@ -22,7 +22,7 @@ pi install npm:pi-teams
 
 ## Extension Compatibility
 
-On Pi versions with structured system prompts, pi-teams refreshes its own `pi_teams` section on every new run. It does not replace the complete system prompt, so other extensions' sections, including magic-context guidance, remain intact regardless of whether Teams or magic-context loads first. Older supported Pi versions use the legacy prompt-return API, also on every run.
+On Pi versions with structured system prompts, pi-teams refreshes its own `pi_teams` section on every new run. It does not replace the complete system prompt, so other extensions' sections, including magic-context guidance, remain intact regardless of whether Teams or magic-context loads first. The legacy prompt-return fallback remains for API compatibility, also on every run, but Pi versions older than `1.1.0` are not supported.
 
 Pi-provided libraries are peer dependencies rather than bundled runtime dependencies, so extensions use the host's library instances.
 
@@ -62,7 +62,7 @@ Prompt composition and tool registration are tested with Pi `1.1.0` and magic-co
 - **Spawn Specialists**: Create agents like "Security Expert" or "Frontend Pro" to handle sub-tasks in parallel.
 - **Shared Task Board**: Keep everyone on the same page with a persistent list of tasks and their status.
 - **Agent Messaging**: Agents can send direct messages to each other and to you (the Team Lead) to report progress.
-- **Autonomous Work**: Teammates automatically receive the actual contents of unread inbox messages whenever their Pi session is idle.
+- **Autonomous Work**: Teammates automatically receive the actual contents of unread inbox messages whenever their Pi session is idle. An interrupted session does not auto-resume; recovery from interruption is a direct user prompt in that session. An attempt whose acceptance is still unknown is not resent in that process.
 - **Delegate and Wait**: Any team member can block with `team_wait` while another member is making progress. With no timeout, the wait is indefinite.
 - **Beautiful UI**: Optimized vertical splits in `tmux` with clear labels so you always know who is doing what.
 
@@ -142,7 +142,7 @@ When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-
 team_wait({ team_name: "my-team" })
 ```
 
-Without `timeout_seconds`, this blocks indefinitely until an inbox message arrives or no other member can make progress. It returns an `outcome` of `message`, `no_active_agents`, or `timeout`. After it returns, coordinate based on the result instead of performing the teammate's delegated work; if teammates are still active, wait again.
+Without `timeout_seconds`, this blocks indefinitely until an inbox message arrives or no other member can make progress. It returns an `outcome` of `message`, `no_active_agents`, or `timeout`. A live interrupted teammate cannot make progress and will not pick up mail on its own, but it keeps this indefinite wait open; do not treat that pause as `no_active_agents`. An explicit timeout still includes the paused time. After it returns, coordinate based on the result instead of performing the teammate's delegated work; if teammates are still active, wait again. Resume a paused teammate with a direct user prompt in that session. Changing its model does not resume it, and there is no remote resume API.
 
 Teammates can use the same barrier for a real dependency. First send the request, then wait:
 

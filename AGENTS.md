@@ -41,9 +41,9 @@ A centralized source of truth for the entire team:
 Communication flows naturally between team members:
 - **Direct Messaging**: Send specific instructions to one teammate.
 - **Broadcasts**: Announce global changes (like API updates) to everyone at once.
-- **Inbox Delivery**: About once per second, an idle teammate receives the actual contents of unread inbox messages. Busy agents leave messages unread; an agent in `team_wait` consumes them through the active wait.
-- **Blocking Waits**: Any member can call `team_wait({ team_name, timeout_seconds? })`. Omit the timeout for a long-lived barrier; it returns on a message, timeout, or when no other member can make progress.
-- **Activity Tracking**: Members report `starting`, `queued`, `running`, `waiting`, `idle`, or `stopped`, independently from process liveness.
+- **Inbox Delivery**: About once per second, an idle teammate receives the actual contents of unread inbox messages. Busy agents leave messages unread; an agent in `team_wait` consumes them through the active wait. An `interrupted` session is not polled and does not auto-resume. Unknown host acceptance stays single-flight and unread in that process; it is not automatically resent and is not a confirmed failure.
+- **Blocking Waits**: Any member can call `team_wait({ team_name, timeout_seconds? })`. Omit the timeout for a long-lived barrier; it returns on a message, timeout, or when no other member can make progress. A live `interrupted` peer is not progress-capable, but it keeps an indefinite wait open until it resumes, stops, or dies.
+- **Activity Tracking**: Members report `starting`, `queued`, `running`, `waiting`, `idle`, `interrupted`, or `stopped`, independently from process liveness. `interrupted` means the user aborted that session. Recovery is a direct user prompt there, not a model change or remote resume.
 
 ---
 

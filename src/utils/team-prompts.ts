@@ -14,7 +14,7 @@ export interface LeadSystemPromptOptions {
 
 interface TeamSystemPromptEvent {
   readonly systemPrompt: string;
-  // Older supported Pi versions expose only the rendered systemPrompt.
+  // Retain a fallback for hosts exposing only the rendered systemPrompt.
   systemPromptOptions?: { sections: Record<string, string> };
 }
 
@@ -44,7 +44,8 @@ export function buildLeadSystemPrompt(options: LeadSystemPromptOptions): string 
     `\n- Give each teammate a clear role, task, input context, expected output, boundaries, and completion condition.` +
     `\n- After delegating work, call team_wait instead of continuing or duplicating the delegated work.` +
     `\n- When team_wait returns, do coordination work only; if teammates are still active, call team_wait again.` +
-    `\n- Use team_status, task_read, and team_message to monitor progress, review evidence, and send corrections.`;
+    `\n- Use team_status, task_read, and team_message to monitor progress, review evidence, and send corrections.` +
+    `\n- An interrupted teammate was aborted in its own session. It is not progress-capable and will not auto-resume from inbox mail, but a live interrupted peer keeps an indefinite team_wait open. Recovery is a direct user prompt in that session, not a model change or remote resume.`;
 }
 
 export function buildTeammateSystemPrompt(options: TeammateSystemPromptOptions): string {
@@ -55,7 +56,9 @@ export function buildTeammateSystemPrompt(options: TeammateSystemPromptOptions):
     `\nYour lead is 'team-lead'.${modelInfo}` +
     `\nYour initial assignment and later messages are delivered from your inbox automatically; begin working when they arrive.` +
     `\nUse team_message to report results, blockers, and dependency requests.` +
-    `\nCall team_wait only after sending a dependency request with team_message and only while another active team member must respond; do not call it merely to become idle.`;
+    `\nCall team_wait only after sending a dependency request with team_message and only while another active team member must respond; do not call it merely to become idle.` +
+    `\nIf this session is interrupted, inbox delivery stays paused until a direct user prompt starts a new run.` +
+    `\nAn inbox attempt whose host acceptance is unknown stays unread and is not resent in this process. A new process is deliberate recovery, not exactly-once delivery.`;
 }
 
 function buildModelInfo(member?: Member): string {

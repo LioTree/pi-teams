@@ -18,7 +18,14 @@ export interface TeamWaitMemberSnapshot extends Omit<TeamWaitPeer, "activity"> {
   activity: AgentActivity | "unknown";
   progressCapable: boolean;
   stalled: boolean;
-  reason: "dead" | "unread_message" | "active" | "waiting" | "idle" | "stopped" | "startup_stalled";
+  reason: "dead" | "unread_message" | "active" | "waiting" | "idle" | "interrupted" | "stopped" | "startup_stalled";
+}
+
+/** A live interrupted peer is not progress-capable, but it keeps an indefinite wait open. */
+export function interruptedPeerHoldsWait(
+  member: Pick<TeamWaitMemberSnapshot, "alive" | "activity">,
+): boolean {
+  return member.alive && member.activity === "interrupted";
 }
 
 export type TeamWaitOutcome = "message" | "no_active_agents" | "timeout";
@@ -59,6 +66,12 @@ export function classifyTeamWaitPeer(
     return { ...base, progressCapable: false, stalled: false, reason: "stopped" };
   }
 
+  // Unread mail must not make a paused session progress-capable, and startup
+  // grace / staleness deadlines do not apply while it remains alive.
+  if (activity === "interrupted") {
+    return { ...base, progressCapable: false, stalled: false, reason: "interrupted" };
+  }
+
   if (activity === "starting" || activity === "queued" || activity === "unknown") {
     const changedAt = peer.activityChangedAt ?? peer.joinedAt ?? now;
     if (now - changedAt > startupGraceMs) {
@@ -66,10 +79,10 @@ export function classifyTeamWaitPeer(
     }
   }
 
-  // A live waiter with unread mail can consume it and resume, regardless of
-  // whether its last recorded state was waiting or idle. A startup/queue that
-  // has already stalled is handled above so a permanently undeliverable
-  // message cannot keep every other waiter blocked forever.
+  // A live waiting or idle peer with unread mail can consume it and resume.
+  // Interrupted peers are excluded above. A startup/queue that has already
+  // stalled is handled above so a permanently undeliverable message cannot
+  // keep every other waiter blocked forever.
   if (peer.unreadCount > 0) {
     return { ...base, progressCapable: true, stalled: false, reason: "unread_message" };
   }
@@ -132,13 +145,15 @@ export async function waitForTeam(options: WaitForTeamOptions): Promise<TeamWait
   let lastMembers: TeamWaitMemberSnapshot[] = [];
 
   const finish = async (outcome: Exclude<TeamWaitOutcome, "message">): Promise<TeamWaitResult> => {
-    // Close the common race where a message arrives after the poll's first
-    // inbox read but before an inactivity/timeout decision is returned.
+    // The final recheck is still a consumption attempt. Cancellation that
+    // wins before its acknowledgement commit must reject from consumeMessages.
+    if (options.signal?.aborted) throw abortError();
     const messages = await options.consumeMessages();
     const waitedMs = now() - startedAt;
     if (messages.length > 0) {
       return { outcome: "message", messages, waitedMs, timedOut: false, members: lastMembers };
     }
+    if (options.signal?.aborted) throw abortError();
     return {
       outcome,
       messages: [],
@@ -151,11 +166,11 @@ export async function waitForTeam(options: WaitForTeamOptions): Promise<TeamWait
   while (true) {
     if (options.signal?.aborted) throw abortError();
 
-    // Messages always win over inactivity and timeout checks.
+    // Messages always win over inactivity and timeout checks. Returning
+    // messages means consumeMessages already committed acknowledgement;
+    // do not throw afterwards and hide that mail.
     const messages = await options.consumeMessages();
     if (messages.length > 0) {
-      // Never perform another fallible filesystem operation after consuming
-      // messages: the inbox read has already acknowledged them.
       return {
         outcome: "message",
         messages,
@@ -164,6 +179,7 @@ export async function waitForTeam(options: WaitForTeamOptions): Promise<TeamWait
         members: lastMembers,
       };
     }
+    if (options.signal?.aborted) throw abortError();
 
     const peers = await options.getPeers();
     const currentTime = now();
@@ -171,7 +187,10 @@ export async function waitForTeam(options: WaitForTeamOptions): Promise<TeamWait
     lastMembers = members;
     const waitedMs = currentTime - startedAt;
 
-    if (members.some(member => member.progressCapable)) {
+    // Interrupted peers are not progress-capable, but they are not inactive
+    // either. Reset the streak so a later idle poll cannot combine with a
+    // pre-interruption poll and return no_active_agents while the pause holds.
+    if (members.some(member => member.progressCapable) || members.some(interruptedPeerHoldsWait)) {
       consecutiveInactivePolls = 0;
     } else {
       consecutiveInactivePolls += 1;

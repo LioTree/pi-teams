@@ -3,8 +3,8 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { InboxMessage } from "./models";
 import { withLock } from "./lock";
-import { inboxPath } from "./paths";
-import { markRuntimeQueuedIfIdle } from "./runtime";
+import { inboxPath, runtimeStatusPath } from "./paths";
+import { markRuntimeQueuedIfIdle, readRuntimeStatusSync, type AgentRuntimeStatus } from "./runtime";
 import { readConfig } from "./teams";
 import { atomicWriteJsonSync } from "./atomic-file";
 
@@ -131,6 +131,45 @@ export async function markMessagesRead(
   });
 }
 
+/**
+ * Acknowledge ids only if `allow` still holds after both locks are acquired.
+ * Lock order is inbox, then runtime. Do not hold the runtime lock while
+ * waiting for the inbox lock, or a replacement can deadlock against this commit.
+ * `allow` runs inside that critical section and must not await or lock again.
+ */
+export async function commitInboxAcknowledgement(
+  teamName: string,
+  agentName: string,
+  ids: readonly string[],
+  allow: (status: AgentRuntimeStatus | null) => boolean,
+): Promise<number> {
+  if (ids.length === 0) return 0;
+  const inbox = inboxPath(teamName, agentName);
+  if (!fs.existsSync(inbox)) return 0;
+  const runtimeFile = runtimeStatusPath(teamName, agentName);
+
+  return await withLock(inbox, async () => {
+    if (!fs.existsSync(inbox)) return 0;
+    return await withLock(runtimeFile, async () => {
+      if (!allow(readRuntimeStatusSync(teamName, agentName))) return 0;
+
+      const allMsgs: InboxMessage[] = JSON.parse(fs.readFileSync(inbox, "utf-8"));
+      let changed = ensureMessageIds(allMsgs);
+      let marked = 0;
+      const requestedIds = new Set(ids);
+      for (const message of allMsgs) {
+        if (requestedIds.has(message.id) && !message.read) {
+          message.read = true;
+          marked++;
+          changed = true;
+        }
+      }
+      if (changed) atomicWriteJsonSync(inbox, allMsgs);
+      return marked;
+    });
+  });
+}
+
 export async function sendPlainMessage(
   teamName: string,
   fromName: string,
@@ -152,7 +191,8 @@ export async function sendPlainMessage(
 
   // Runtime signalling is intentionally best-effort: the inbox append above is
   // the durable delivery and must not be reported as failed if runtime metadata
-  // is temporarily unavailable.
+  // is temporarily unavailable. markRuntimeQueuedIfIdle preserves interrupted
+  // and every other non-idle activity, so this send cannot auto-resume a pause.
   try {
     await markRuntimeQueuedIfIdle(teamName, toName);
   } catch (error) {

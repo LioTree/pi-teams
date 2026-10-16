@@ -4,12 +4,13 @@ import path from "node:path";
 import os from "node:os";
 import {
   appendMessage,
+  commitInboxAcknowledgement,
   readInbox,
   sendPlainMessage,
   broadcastMessage,
   markMessagesRead,
 } from "./messaging";
-import { readRuntimeStatus, setRuntimeActivity } from "./runtime";
+import { readRuntimeStatus, replaceRuntimeInstance, setRuntimeActivity } from "./runtime";
 import * as paths from "./paths";
 
 // Mock the paths to use a temporary directory
@@ -145,6 +146,19 @@ describe("Messaging Utilities", () => {
     expect((await readRuntimeStatus("test-team", "receiver"))?.activity).toBe("queued");
   });
 
+  it("does not queue or acknowledge an interrupted recipient", async () => {
+    await setRuntimeActivity("test-team", "receiver", "interrupted", {
+      activityChangedAt: 1000,
+    });
+
+    await sendPlainMessage("test-team", "sender", "receiver", "stay paused", "stay paused");
+
+    expect((await readRuntimeStatus("test-team", "receiver"))?.activity).toBe("interrupted");
+    const unread = await readInbox("test-team", "receiver", true, false);
+    expect(unread.map(message => message.text)).toEqual(["stay paused"]);
+    expect(unread[0].read).toBe(false);
+  });
+
   it("should broadcast message to all members except the sender", async () => {
     // Setup team config
     const config = {
@@ -175,6 +189,45 @@ describe("Messaging Utilities", () => {
     // Check sender's inbox (should be empty)
     const inboxSender = await readInbox("test-team", "sender", false, false);
     expect(inboxSender.length).toBe(0);
+  });
+
+  it("rechecks the acknowledgement guard after waiting for the inbox lock", async () => {
+    vi.useFakeTimers();
+    try {
+      await setRuntimeActivity("test-team", "receiver", "idle");
+      const stored = await appendMessage("test-team", "receiver", {
+        from: "sender",
+        text: "guard me",
+        timestamp: new Date(0).toISOString(),
+        read: false,
+      });
+      const lock = paths.inboxPath("test-team", "receiver") + ".lock";
+      fs.mkdirSync(path.dirname(lock), { recursive: true });
+      fs.writeFileSync(lock, "held", { flag: "wx" });
+      let allow = true;
+      const committing = commitInboxAcknowledgement(
+        "test-team",
+        "receiver",
+        [stored.id],
+        () => allow,
+      );
+      const current = await readRuntimeStatus("test-team", "receiver");
+      const replaced = await replaceRuntimeInstance(
+        "test-team",
+        "receiver",
+        current!.instanceId!,
+        "new-instance",
+        { activity: "running", pid: process.pid },
+      );
+      expect(replaced?.instanceId).toBe("new-instance");
+      allow = false;
+      fs.unlinkSync(lock);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(await committing).toBe(0);
+      expect(await readInbox("test-team", "receiver", true, false)).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
 });

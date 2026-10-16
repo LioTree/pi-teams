@@ -48,13 +48,13 @@ Check a teammate's process liveness, coordination activity, and unread messages.
 
 **Returns**: Status information including:
 - `alive`: Whether the teammate process/pane/window is still running
-- `activity`: One of `starting`, `queued`, `running`, `waiting`, `idle`, or `stopped`
-- `progressCapable`: Whether this member can currently make progress for another member's `team_wait`
-- `stalled`: Whether a startup or queued state has exceeded its startup grace period
+- `activity`: One of `starting`, `queued`, `running`, `waiting`, `idle`, `interrupted`, or `stopped`
+- `progressCapable`: Whether this member can currently make progress for another member's `team_wait`. A live `interrupted` member is never progress-capable, even with unread mail
+- `stalled`: Whether a startup or queued state has exceeded its startup grace period. Live `interrupted` state does not become stalled with age
 - `unreadCount`: Number of unread inbox messages
 - `runtime`: Raw activity telemetry (timestamps, pid, last error)
 
-Liveness and activity are independent: an alive process may be deliberately `waiting` or naturally `idle`, neither of which means it can complete work for another waiting member.
+Liveness and activity are independent: an alive process may be deliberately `waiting`, naturally `idle`, or `interrupted` after the user aborted that session. None of those means it can complete work for another waiting member. `interrupted` also does not auto-resume.
 
 **Example**:
 ```javascript
@@ -233,7 +233,7 @@ Block the current member while another member is doing work. This is available t
 - `timedOut`: Whether the optional timeout expired
 - `members`: A snapshot of relevant member liveness and activity when available
 
-Messages win over activity checks. Otherwise, the wait returns `no_active_agents` after two consecutive checks, about one second apart, find no other progress-capable member. Alive members in fresh `starting`, fresh `queued`, `running`, or a still-unknown startup state are progress-capable, as is a live waiting/idle peer with unread mail. `waiting`, `idle`, `stopped`, and dead members without unread mail are not. Starting, queued, and unknown states have a 60-second grace period; after that they are stalled even if an undeliverable message remains unread, while a live `running` member has no arbitrary work timeout.
+Messages win over activity checks. Otherwise, the wait returns `no_active_agents` after two consecutive checks, about one second apart, find no other progress-capable member and no live `interrupted` peer. Alive members in fresh `starting`, fresh `queued`, `running`, or a still-unknown startup state are progress-capable, as is a live waiting/idle peer with unread mail. `waiting`, `idle`, `stopped`, and dead members without unread mail are not. A live `interrupted` member is not progress-capable even with unread mail, and that mail does not auto-resume the session, but the member keeps an indefinite wait open. Dead or `stopped` members do not. Starting, queued, and unknown states have a 60-second grace period; after that they are stalled even if an undeliverable message remains unread. That grace and the runtime staleness deadline do not apply to a live `interrupted` member, and a live `running` member has no arbitrary work timeout. An explicit timeout still expires while a peer is interrupted; the clock includes the paused time. Aborting the local wait still rejects promptly. Outcomes remain `message`, `no_active_agents`, and `timeout`.
 
 **Examples**:
 ```javascript
@@ -259,9 +259,17 @@ When a teammate is spawned, they automatically:
 
 ### Idle Polling
 
-If a teammate is idle, pi-teams checks for new messages about once per second. It injects the actual message contents into Pi and marks only successfully delivered message IDs as read.
+If a teammate is idle, pi-teams checks for new messages about once per second and injects at most one unread message. `sendUserMessage` returns before Pi accepts the prompt. That void return, a timer, a missing error, model selection, or an unrelated run is not acceptance.
 
-If the teammate is busy, messages stay unread until its next idle delivery. If it is blocked inside `team_wait`, the active wait consumes the message and resumes the agent. This keeps teammates responsive without asking them to call `team_wait` just to idle.
+An attempt whose acceptance is unknown stays single-flight in that live process. The message stays unread, and later idle polls do not inject that copy or a later batch. pi-teams does not automatically resend it. After a short delay the session shows a local waiting state and records `inboxAwaitingConfirmation` on its runtime lease, including the message IDs. That note means acceptance is unknown. It is not a confirmed failure and it is not a remote retry control.
+
+The batch is marked read only after Pi emits `message_end` for the user message containing `[pi-teams inbox delivery]` and that batch's `Message-ID`, and only if the acknowledgement commit still owns a live unpaused lease. That confirmation clears the unknown-acceptance diagnostic immediately, even if the mailbox acknowledgement then fails. A failed acknowledgement stays a separate metadata retry. It does not inject the prompt again, and interruption pauses that retry without acknowledging. A later direct run resumes the metadata acknowledgement only. Stop, shutdown, or lease loss before the commit leaves the mail unread.
+
+A preflight rejection or handled input is not a distinct signal on this void host API, so those attempts also stay unknown and unread. A direct prompt in the same process does not reset an unknown attempt. Starting a new process is deliberate human recovery and can submit the still-unread message again. That is not exactly-once delivery, and it is not a guarantee that every future Pi 1.x host or restart confirms acceptance the same way.
+
+If the teammate is busy, messages stay unread until its next idle delivery. While an unknown attempt is outstanding, idle polls do not inject that attempt again or start a later batch. If it is blocked inside `team_wait`, the active wait consumes the message and resumes the agent. This keeps teammates responsive without asking them to call `team_wait` just to idle.
+
+An `interrupted` session is not polled. Ordinary `team_message` and broadcast delivery leave it interrupted, and the unread messages are not injected or acknowledged. A direct user prompt starts a new run and clears `interrupted`. It does not resend an attempt whose acceptance is still unknown. Selecting a model does not start execution. There is no remote resume API or takeover UI.
 
 ---
 
@@ -305,9 +313,10 @@ Activity describes coordination state separately from process liveness:
 - `running`: The Pi agent is actively processing or performing work
 - `waiting`: The member is blocked in `team_wait` on a real dependency
 - `idle`: The Pi agent has settled and is ready for new work
+- `interrupted`: The user aborted the session. Task ownership and status are unchanged, unread inbox messages stay unread, and the ordinary idle notification is suppressed. The session is not idle and will not auto-resume
 - `stopped`: The member has shut down
 
-`team_status` and `check_teammate` expose both liveness and activity. This lets `team_wait` distinguish a long-running job from a team in which every remaining member is idle or waiting. A teammate becoming idle also sends a structured notification to the lead with its unfinished owned tasks.
+`team_status` and `check_teammate` expose both liveness and activity. This lets `team_wait` distinguish a long-running job from a team in which every remaining member is idle or waiting, and from a live interrupted peer that must keep an indefinite wait open. A teammate becoming idle also sends a structured notification to the lead with its unfinished owned tasks. An interrupted settlement does not send that notification.
 
 ---
 
@@ -483,7 +492,7 @@ rm ~/.pi/teams/my-team/.lock
 
 ### Idle Polling Overhead
 
-Teammates poll their inboxes about once per second only while idle. Each poll is a local JSON read. Busy sessions leave queued messages unread, while a session in `team_wait` consumes messages through that active wait.
+Teammates poll their inboxes about once per second only while idle or already queued for delivery. Each poll is a local JSON read. Busy, stopped, and interrupted sessions are not polled for injection. A session in `team_wait` consumes messages through that active wait.
 
 ### Lock Timeout
 

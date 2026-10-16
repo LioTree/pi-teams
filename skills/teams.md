@@ -31,7 +31,7 @@ When you are spawned as a teammate:
 - Complete assigned tasks using `task_complete`.
 - Always send a message to "team-lead" when you complete work, get blocked, or need review.
 - If you encounter a real dependency on another member, send that member a `team_message` first, then call `team_wait({ team_name })` while the dependency is outstanding.
-- Idle inbox delivery runs about once per second. Messages remain unread while you are busy; an active `team_wait` consumes them and resumes you.
+- Idle inbox delivery runs about once per second. Messages remain unread while you are busy; an active `team_wait` consumes them and resumes you. Interrupted sessions are not auto-resumed. An inbox attempt with unknown host acceptance stays single-flight and unread; it is not a confirmed failure and is not automatically resent.
 
 ## Best Practices for Teammates
 
@@ -56,7 +56,7 @@ When you are spawned as a teammate:
 `team_wait({ team_name, timeout_seconds? })` is available to every member. It returns:
 
 - `outcome: "message"` when the caller receives inbox messages
-- `outcome: "no_active_agents"` after repeated checks find no other progress-capable member
-- `outcome: "timeout"` only when an explicit positive timeout expires
+- `outcome: "no_active_agents"` after repeated checks find no other progress-capable member and no live interrupted peer
+- `outcome: "timeout"` only when an explicit positive timeout expires, including time spent paused
 
-The result also includes `messages`, `waitedMs`, `timedOut`, and a member activity snapshot when available. Activity is separate from process liveness and uses `starting`, `queued`, `running`, `waiting`, `idle`, or `stopped`.
+The result also includes `messages`, `waitedMs`, `timedOut`, and a member activity snapshot when available. Activity is separate from process liveness and uses `starting`, `queued`, `running`, `waiting`, `idle`, `interrupted`, or `stopped`. A live `interrupted` peer is not progress-capable, even with unread mail, but it keeps an indefinite wait open. Dead or stopped peers do not. Recovery from `interrupted` is a direct user prompt in that session, not a model change or remote resume.

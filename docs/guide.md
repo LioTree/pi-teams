@@ -269,7 +269,7 @@ Bad task:
 
 > **You:** "Wait for my inbox until a teammate reports back."
 
-With no `timeout_seconds`, `team_wait` is an indefinite barrier: long security reviews are not cut off by a default deadline. It returns with `outcome: "message"`, `"no_active_agents"`, or `"timeout"`. Use the result for review, coordination, and follow-up decisions; if teammates remain active, wait again.
+With no `timeout_seconds`, `team_wait` is an indefinite barrier: long security reviews are not cut off by a default deadline. It returns with `outcome: "message"`, `"no_active_agents"`, or `"timeout"`. A live interrupted teammate is not making progress, but that pause does not end the wait. Use the result for review, coordination, and follow-up decisions; if teammates remain active or interrupted, wait again.
 
 ### 7. Check Progress Regularly
 
@@ -294,6 +294,10 @@ This helps you catch blockers early and provide feedback.
    > **You:** "Read security-bot's inbox"
 3. Force kill and respawn if needed:
    > **You:** "Force kill security-bot and respawn them"
+
+**Problem**: A teammate shows activity `interrupted`.
+
+The user aborted that session. Its tasks stay owned, its inbox stays unread, and pi-teams will not inject those messages or resume the run. A lead's indefinite `team_wait` also stays open while that process is alive. Resume it by typing a new prompt in that session. Selecting a model does not start execution, and there is no remote resume command. If the process has actually stopped or died, it no longer holds the wait. A direct prompt does not resend an inbox attempt whose host acceptance is still unknown; that attempt stays unread until Pi confirms it or a person starts a new process.
 
 ### tmux Pane Issues
 
@@ -377,7 +381,7 @@ team_message({
 team_wait({ team_name: "my-team" })
 ```
 
-Ordinary idle teammates do not call `team_wait`; pi-teams delivers their unread messages automatically when their session is idle.
+Ordinary idle teammates do not call `team_wait`; pi-teams delivers their unread messages automatically when their session is idle. Interrupted teammates are paused until a direct user prompt in that session; mail does not resume them.
 
 ---
 

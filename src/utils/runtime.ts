@@ -17,6 +17,9 @@ export const AGENT_ACTIVITIES = [
   "running",
   "waiting",
   "idle",
+  // Live user-aborted pause. Not idle, not stopped, and not subject to
+  // startup-grace or staleness deadlines while the process remains alive.
+  "interrupted",
   "stopped",
 ] as const;
 
@@ -28,6 +31,13 @@ export type AgentActivity = (typeof AGENT_ACTIVITIES)[number];
 export interface RuntimeError {
   message: string;
   timestamp: number;
+}
+
+/** Unknown host acceptance. This is a diagnostic, not a confirmed delivery failure. */
+export interface InboxAwaitingConfirmation {
+  messageIds: string[];
+  since: number;
+  note: string;
 }
 
 export interface AgentRuntimeStatus {
@@ -42,6 +52,7 @@ export interface AgentRuntimeStatus {
   lastHeartbeatAt?: number;
   lastInboxReadAt?: number;
   lastError?: RuntimeError;
+  inboxAwaitingConfirmation?: InboxAwaitingConfirmation;
 }
 
 type LegacyRuntimeStatus = Partial<AgentRuntimeStatus> & { ready?: boolean };
@@ -88,6 +99,16 @@ function normalizeRuntimeStatus(
       value.activityChangedAt !== activityChangedAt ||
       "ready" in value,
   };
+}
+
+/** Read a runtime file the caller already holds the lock for. Do not lock again. */
+export function readRuntimeStatusSync(
+  teamName: string,
+  agentName: string,
+): AgentRuntimeStatus | null {
+  const p = runtimeStatusPath(teamName, agentName);
+  if (!fs.existsSync(p)) return null;
+  return readRuntimeFile(p, teamName, agentName)?.status ?? null;
 }
 
 function readRuntimeFile(
@@ -169,6 +190,9 @@ export async function updateRuntimeStatusForInstance(
   instanceId: string,
   updates: Partial<AgentRuntimeStatus>,
   expectedActivity?: AgentActivity | readonly AgentActivity[],
+  // Re-checked after this call has acquired the runtime lock, including when
+  // it had to wait. Must not await or take the runtime lock again.
+  commitGuard?: (current: AgentRuntimeStatus) => boolean,
 ): Promise<AgentRuntimeStatus | null> {
   const p = runtimeStatusPath(teamName, agentName);
   if (!fs.existsSync(p)) return null;
@@ -182,6 +206,7 @@ export async function updateRuntimeStatusForInstance(
       ? undefined
       : Array.isArray(expectedActivity) ? expectedActivity : [expectedActivity];
     if (expected && !expected.includes(loaded.status.activity)) return null;
+    if (commitGuard && !commitGuard(loaded.status)) return null;
 
     const next = mergeRuntimeStatus(loaded.status, {
       ...updates,
@@ -276,6 +301,9 @@ export async function markRuntimeQueuedIfIdle(
     const loaded = readRuntimeFile(p, teamName, agentName);
     if (!loaded) return false;
 
+    // Only an idle recipient becomes queued. Interrupted, running, waiting,
+    // stopped, and starting sessions keep their activity so ordinary mail
+    // cannot auto-resume a user-aborted run.
     if (loaded.status.activity !== "idle") {
       if (loaded.changed) {
         atomicWriteJsonSync(p, loaded.status);
