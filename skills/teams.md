@@ -26,12 +26,22 @@ Coordinate multiple agents working on a project using shared task lists and mess
 
 When you are spawned as a teammate:
 - Your status bar will show "Teammate: name @ team".
-- Your initial assignment and later unread messages are delivered automatically when your Pi session is idle; do not call `team_wait` just to receive routine work.
+- In default `team` mode, your initial assignment and later unread messages are delivered automatically when your Pi session is idle; do not call `team_wait` just to receive routine work.
 - Use `team_message` to "team-lead" to report progress or ask questions.
 - Complete assigned tasks using `task_complete`.
 - Always send a message to "team-lead" when you complete work, get blocked, or need review.
 - If you encounter a real dependency on another member, send that member a `team_message` first, then call `team_wait({ team_name })` while the dependency is outstanding.
-- Idle inbox delivery runs about once per second. Messages remain unread while you are busy; an active `team_wait` consumes them and resumes you.
+- Idle inbox delivery runs about once per second. Messages remain unread while you are busy; an active `team_wait` consumes them and resumes you. Interrupted sessions are not auto-resumed. An inbox attempt with unknown host acceptance stays single-flight and unread; it is not a confirmed failure and is not automatically resent.
+
+## Local Human Takeover
+
+Only the human in a teammate pane can switch control with `/team-mode user`, `/team-mode team`, or `/team-mode flush`; `/team-mode` shows current mode and pending counts. These are local harness commands, not team tools or a remote resume API. They also work during a busy run without aborting or starting a model call.
+
+`user` is real multi-turn work in the original session, not a fork or an interrupted disguise. Continue human prompts, edits, tools, and model changes. The harness holds ordinary idle notices, leader-directed `team_message`, task-completion notices, and only the leader recipient of broadcasts. Do not claim held messages were delivered. Peer dependencies still deliver. Idle inbox auto-start pauses; an already-active explicit dependency `team_wait` can still consume mail. Accepted metadata-only ACK is not blocked merely by user control, and unknown attempts are never reset or resent by a mode switch.
+
+`flush` explicitly releases held content while keeping user mode; `team` releases and hands back. Neither means task complete or resumes an interrupted turn. Release includes latest known task/activity state and original reports, with redundant idle snapshots coalesced. An empty release says no completion report was provided. Errors retain pending intent; an append may already have committed, so retry the local release, not the completed task.
+
+The UI and `team_status`/`check_teammate` show ownership separately. A live user-controlled idle peer suspends `no_active_agents` but is not progress-capable just because it is human-owned; messages, explicit timeout, abort, death, and stop still win. Do not silently delegate/reuse/replace it. Ordinary Pi restart preserves ownership and reports. Intentional removal ends ownership but retains pending reports for an explicitly flushed replacement; team deletion removes them. Dedupe requires retained control records/inbox history, not exactly-once model execution. See `docs/reference.md` for details.
 
 ## Best Practices for Teammates
 
@@ -56,7 +66,7 @@ When you are spawned as a teammate:
 `team_wait({ team_name, timeout_seconds? })` is available to every member. It returns:
 
 - `outcome: "message"` when the caller receives inbox messages
-- `outcome: "no_active_agents"` after repeated checks find no other progress-capable member
-- `outcome: "timeout"` only when an explicit positive timeout expires
+- `outcome: "no_active_agents"` after repeated checks find no other progress-capable member and no live interrupted or user-controlled peer
+- `outcome: "timeout"` only when an explicit positive timeout expires, including time spent paused
 
-The result also includes `messages`, `waitedMs`, `timedOut`, and a member activity snapshot when available. Activity is separate from process liveness and uses `starting`, `queued`, `running`, `waiting`, `idle`, or `stopped`.
+The result also includes `messages`, `waitedMs`, `timedOut`, and a member activity snapshot when available. Activity is separate from process liveness and uses `starting`, `queued`, `running`, `waiting`, `idle`, `interrupted`, or `stopped`. A live `interrupted` peer is not progress-capable, even with unread mail, but it keeps an indefinite wait open. Dead or stopped peers do not. Recovery from `interrupted` is a direct user prompt in that session, not a model change or remote resume.

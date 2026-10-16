@@ -1,6 +1,7 @@
 // Project: pi-teams
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { TaskFile } from "./models";
 import { taskDir, sanitizeName } from "./paths";
 import * as messaging from "./messaging";
@@ -35,6 +36,7 @@ export interface ClaimTaskOptions {
 export interface CompleteTaskOptions {
   completedBy: string;
   summary?: string;
+  instanceId?: string;
   retries?: number;
 }
 
@@ -215,6 +217,7 @@ export async function completeTask(
   options: CompleteTaskOptions
 ): Promise<TaskFile> {
   await assertTeamMember(teamName, options.completedBy);
+  const leadName = await getLeadName(teamName);
   const p = getTaskPath(teamName, taskId);
 
   const { original, candidate } = await withLock(p, async () => {
@@ -241,6 +244,14 @@ export async function completeTask(
       metadata: options.summary
         ? { ...(task.metadata ?? {}), completionSummary: options.summary }
         : task.metadata,
+      completionNotice: leadName && options.completedBy !== leadName ? {
+        id: randomUUID(),
+        from: options.completedBy,
+        timestamp: messaging.nowIso(),
+        read: false,
+        text: `Task ${taskId} (${task.subject}) was marked completed by ${task.owner ?? options.completedBy}.${options.summary ? `\nCompletion summary: ${options.summary}` : ""}`,
+        summary: `Task ${taskId} completed`,
+      } : undefined,
     };
 
     return { original: task, candidate: updated };
@@ -264,7 +275,7 @@ export async function completeTask(
 
   await sendTaskUpdateNotifications(teamName, taskId, original, updated, {
     status: "completed",
-  }, options.completedBy);
+  }, options.completedBy, true, { instanceId: options.instanceId });
   return updated;
 }
 
@@ -275,7 +286,8 @@ async function sendTaskUpdateNotifications(
   updated: TaskFile,
   updates: Partial<TaskFile>,
   updatedBy?: string,
-  notifyOwner = true
+  notifyOwner = true,
+  reportOptions: messaging.ReportOptions = {},
 ) {
   const ownerChanged = updates.owner !== undefined && updates.owner !== original.owner;
   if (notifyOwner && ownerChanged && updated.owner && updated.owner !== updatedBy) {
@@ -296,8 +308,10 @@ async function sendTaskUpdateNotifications(
         teamName,
         updatedBy ?? updated.owner ?? "system",
         leadName,
-        `Task ${taskId} (${updated.subject}) was marked completed${updated.owner ? ` by ${updated.owner}` : ""}.`,
-        `Task ${taskId} completed`
+        updated.completionNotice?.text ?? `Task ${taskId} (${updated.subject}) was marked completed${updated.owner ? ` by ${updated.owner}` : ""}.`,
+        `Task ${taskId} completed`,
+        undefined,
+        { ...reportOptions, messageId: updated.completionNotice?.id },
       );
     }
   }

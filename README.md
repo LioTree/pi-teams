@@ -12,7 +12,7 @@
 
 ## 🛠 Installation
 
-Requires Pi `>=0.80.6 <2` and Node.js `22.19.0` or newer. Supports Pi `1.1.0`, with a legacy prompt fallback for Pi `0.x`. Pi `0.80.6` provides the settled-agent lifecycle event and sequential custom-tool execution used by the coordination barrier.
+Requires Pi `>=1.1.0 <2` and Node.js `22.19.0` or newer. Pi `1.1.0` provides the aborted-settlement signal used to keep interrupted teammates paused without waking the lead, as well as the settled-agent lifecycle event and sequential custom-tool execution used by the coordination barrier.
 
 Open your Pi terminal and type:
 
@@ -22,7 +22,7 @@ pi install npm:pi-teams
 
 ## Extension Compatibility
 
-On Pi versions with structured system prompts, pi-teams refreshes its own `pi_teams` section on every new run. It does not replace the complete system prompt, so other extensions' sections, including magic-context guidance, remain intact regardless of whether Teams or magic-context loads first. Older supported Pi versions use the legacy prompt-return API, also on every run.
+On Pi versions with structured system prompts, pi-teams refreshes its own `pi_teams` section on every new run. It does not replace the complete system prompt, so other extensions' sections, including magic-context guidance, remain intact regardless of whether Teams or magic-context loads first. The legacy prompt-return fallback remains for API compatibility, also on every run, but Pi versions older than `1.1.0` are not supported.
 
 Pi-provided libraries are peer dependencies rather than bundled runtime dependencies, so extensions use the host's library instances.
 
@@ -62,7 +62,7 @@ Prompt composition and tool registration are tested with Pi `1.1.0` and magic-co
 - **Spawn Specialists**: Create agents like "Security Expert" or "Frontend Pro" to handle sub-tasks in parallel.
 - **Shared Task Board**: Keep everyone on the same page with a persistent list of tasks and their status.
 - **Agent Messaging**: Agents can send direct messages to each other and to you (the Team Lead) to report progress.
-- **Autonomous Work**: Teammates automatically receive the actual contents of unread inbox messages whenever their Pi session is idle.
+- **Autonomous Work**: In default `team` control mode, teammates automatically receive the actual contents of unread inbox messages whenever their Pi session is idle. An interrupted session does not auto-resume; recovery from interruption is a direct user prompt in that session. An attempt whose acceptance is still unknown is not resent in that process.
 - **Delegate and Wait**: Any team member can block with `team_wait` while another member is making progress. With no timeout, the wait is indefinite.
 - **Beautiful UI**: Optimized vertical splits in `tmux` with clear labels so you always know who is doing what.
 
@@ -74,6 +74,7 @@ Prompt composition and tool registration are tested with Pi `1.1.0` and magic-co
 - **Broadcast Messaging**: Send a message to the entire team at once for global coordination and announcements.
 - **Quality Gate Hooks**: Automated shell scripts run when tasks are completed (e.g., to run tests or linting).
 - **Thinking Level Control**: Set per-teammate thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) to balance speed vs. reasoning depth.
+- **Human Takeover**: Use local `/team-mode user` for real multi-turn work in the original teammate session, then `/team-mode team` to hand control back without claiming the task is complete.
 
 ## 💬 Key Examples
 
@@ -142,7 +143,7 @@ When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-
 team_wait({ team_name: "my-team" })
 ```
 
-Without `timeout_seconds`, this blocks indefinitely until an inbox message arrives or no other member can make progress. It returns an `outcome` of `message`, `no_active_agents`, or `timeout`. After it returns, coordinate based on the result instead of performing the teammate's delegated work; if teammates are still active, wait again.
+Without `timeout_seconds`, this blocks indefinitely until an inbox message arrives or no other member can make progress. It returns an `outcome` of `message`, `no_active_agents`, or `timeout`. A live interrupted teammate cannot make progress and will not pick up mail on its own, but it keeps this indefinite wait open; do not treat that pause as `no_active_agents`. An explicit timeout still includes the paused time. After it returns, coordinate based on the result instead of performing the teammate's delegated work; if teammates are still active, wait again. Resume a paused teammate with a direct user prompt in that session. Changing its model does not resume it, and there is no remote resume API.
 
 Teammates can use the same barrier for a real dependency. First send the request, then wait:
 
@@ -155,7 +156,26 @@ team_message({
 team_wait({ team_name: "my-team" })
 ```
 
-Teammates do not call `team_wait` merely because they are idle; idle inbox delivery is automatic.
+Teammates do not call `team_wait` merely because they are idle; idle inbox delivery is automatic in `team` mode. A live user-controlled peer also keeps an indefinite wait open, but ownership alone is not progress; messages, explicit timeout, caller cancellation, death, and stop still take precedence.
+
+### Work directly with a teammate
+
+In that **teammate's pane**, use:
+
+```text
+/team-mode            Show current ownership, pending reports, and help
+/team-mode user       Take over this original work session
+/team-mode flush      Release held leader reports now; stay in user mode
+/team-mode team       Release reports and return control to the team
+```
+
+Enter once, then give ordinary work prompts, use tools, and change models across multiple turns. This is not a paused or forked conversation. Commands are harness-only and work during a busy run; they do not abort it or call a model. The UI shows `Control: USER` or `Control: TEAM` separately from execution activity and delivery warnings.
+
+In `user` mode, ordinary idle notices, explicit `team_message` reports to the lead, task-completion notifications, and a broadcast's leader recipient are held durably. Other recipients still receive messages. Idle inbox auto-start is paused; mail stays unread, while direct human prompts and an already-active explicit dependency `team_wait` still work. Already handed-to-host requests cannot be recalled. Accepted inbox acknowledgements remain metadata-only; unknown attempts are not reset or resent.
+
+Handback/flush releases the original held content with latest known activity/task states and one coalesced idle snapshot, without an extra summary model call. No report means **no completion report**, not success. Repeated unchanged calls do not duplicate a batch; failure leaves pending intent for explicit retry, and the UI warns if an append may already have committed. Handback is **not task completion** and does not resume an interrupted run. If work is still running, its later completion is a separate real event.
+
+Ownership and reports survive ordinary Pi restart for the same team/member name. Intentional removal ends ownership but retains unflushed reports until a replacement explicitly releases them; deleting the team deletes that state. A user-controlled member cannot be silently delegated/replaced, even after a crash: restart it and hand back locally, or intentionally stop/remove it first. Other teammates' real reports can still wake the lead. See [control persistence and delivery limits](docs/reference.md#control-persistence-and-delivery-limits).
 
 ### 4. Broadcast to Team
 > **You:** "Broadcast to the entire team: 'The API endpoint has changed to /v2. Please update your work accordingly.'"

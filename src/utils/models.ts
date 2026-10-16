@@ -45,6 +45,8 @@ export interface TaskFile {
   blockedBy: string[];
   owner?: string;
   metadata?: Record<string, any>;
+  /** Durable notification intent; explicit report release can recover a failed send. */
+  completionNotice?: InboxMessage;
 }
 
 export interface InboxMessage {
@@ -55,4 +57,6 @@ export interface InboxMessage {
   read: boolean;
   summary?: string;
   color?: string;
+  /** IDs of the original reports included in a deterministic control release. */
+  releaseReportIds?: string[];
 }

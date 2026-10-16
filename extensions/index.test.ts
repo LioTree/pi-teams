@@ -80,6 +80,7 @@ function registerExtension() {
       return vi.fn();
     }),
     registerTool,
+    registerCommand: vi.fn(),
   };
 
   // The real factory registers everything; the stub only records registrations.

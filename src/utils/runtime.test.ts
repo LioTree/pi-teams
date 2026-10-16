@@ -262,6 +262,20 @@ describe("runtime status", () => {
       expect(runtime).not.toBeNull();
     });
 
+    it("does not apply staleness cleanup to a live interrupted runtime", async () => {
+      const staleTime = Date.now() - RUNTIME_STALE_MS - 1000;
+      await writeRuntimeStatus(teamName, "paused-agent", {
+        pid: process.pid,
+        startedAt: staleTime,
+        lastHeartbeatAt: staleTime,
+        activityChangedAt: staleTime,
+        activity: "interrupted",
+      });
+
+      expect(await cleanupStaleRuntimeFiles(teamName)).toBe(0);
+      expect((await readRuntimeStatus(teamName, "paused-agent"))?.activity).toBe("interrupted");
+    });
+
     it("preserves a live process even when its heartbeat is old", async () => {
       const staleTime = Date.now() - RUNTIME_STALE_MS - 1000;
       await writeRuntimeStatus(teamName, "long-running-agent", {

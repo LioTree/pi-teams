@@ -8,6 +8,7 @@ Complete documentation of all tools, parameters, and automated behavior.
 
 - [Team Management](#team-management)
 - [Teammates](#teammates)
+- [Local Control Command](#local-control-command)
 - [Task Management](#task-management)
 - [Messaging](#messaging)
 - [Automated Behavior](#automated-behavior)
@@ -48,13 +49,15 @@ Check a teammate's process liveness, coordination activity, and unread messages.
 
 **Returns**: Status information including:
 - `alive`: Whether the teammate process/pane/window is still running
-- `activity`: One of `starting`, `queued`, `running`, `waiting`, `idle`, or `stopped`
-- `progressCapable`: Whether this member can currently make progress for another member's `team_wait`
-- `stalled`: Whether a startup or queued state has exceeded its startup grace period
+- `activity`: One of `starting`, `queued`, `running`, `waiting`, `idle`, `interrupted`, or `stopped`
+- `progressCapable`: Whether this member can currently make progress for another member's `team_wait`. A live `interrupted` member is never progress-capable, even with unread mail
+- `stalled`: Whether a startup or queued state has exceeded its startup grace period. Live `interrupted` state does not become stalled with age
+- `controlMode`: `team` (default collaboration) or `user` (human takeover), independent of execution activity
+- `control`: `{ mode, heldReports, heldIdle, releasePending }`, a durable report-outbox snapshot; it is not inbox acceptance telemetry
 - `unreadCount`: Number of unread inbox messages
 - `runtime`: Raw activity telemetry (timestamps, pid, last error)
 
-Liveness and activity are independent: an alive process may be deliberately `waiting` or naturally `idle`, neither of which means it can complete work for another waiting member.
+Liveness and activity are independent: an alive process may be deliberately `waiting`, naturally `idle`, or `interrupted` after the user aborted that session. None of those means it can complete work for another waiting member. `interrupted` also does not auto-resume.
 
 **Example**:
 ```javascript
@@ -75,6 +78,35 @@ Initiate orderly shutdown for a finished teammate.
 ```javascript
 process_shutdown_approved({ team_name: "my-team", agent_name: "security-bot" })
 ```
+
+---
+
+## Local Control Command
+
+### /team-mode [team|user|flush]
+
+Only available locally in a live teammate pane, not as a tool, remote control, leader command, or unbound session command. Argument completion and `/team-mode` help are available. It runs during busy work without waiting for idle, aborting, resuming, changing model, or starting a model call.
+
+| Command | Effect |
+| --- | --- |
+| `/team-mode` | Show current mode, held-report counts, release-pending state, and usage |
+| `/team-mode user` | Human takes continuous control of the same working session, across multiple ordinary prompts/tools/model changes |
+| `/team-mode team` | Explicitly release held reports and hand back; **not task completion**, and no automatic resume of an interrupted run |
+| `/team-mode flush` | Explicitly release reports but keep the current mode (normally `user`) |
+
+A persistent UI status shows `Control: USER`/`Control: TEAM` separately from delivery diagnostics. Activity remains truthful: normal human work is still `running`/`idle`, not `interrupted`.
+
+In `user` mode, the harness holds that member's ordinary idle notice, explicit leader reports, task-completion notification, and broadcast's leader recipient. Other peer recipients still deliver. Idle inbox auto-injection does not start the member; unread mail stays pending. Direct human prompts work, and an **already-active explicit dependency `team_wait`** can still consume mail. Switching mode cannot unsend a report or revoke an already-handed-to-host inbox request. Unknown attempts stay single-flight/unread; accepted ACK retry remains metadata-only and is not paused merely by user control.
+
+### Control persistence and delivery limits
+
+The local record is `~/.pi/teams/<team>/control/<member>.json`. Ownership and pending reports survive ordinary Pi restart and a new runtime lease for the same team/member name; stale-instance callbacks cannot release them. Intentional stop/removal ends ownership but retains pending reports for an explicitly flushed replacement; team deletion removes them. Dead/stopped members do not hold `team_wait`, but a persisted user-owned name still rejects delegation until local handback or intentional removal. No policy silently turns a crash into permission to overwrite human work.
+
+Handback/flush prepares a durable batch ID before mailbox append, includes latest known activity/task states plus actual held content, and coalesces redundant idle snapshots only. Progress is not a result, and an empty release explicitly says no completion report was provided. Repeated unchanged operations do not duplicate the handoff; an old settled handler cannot add a second idle for the covered run. A still-running run's later completion is a distinct event.
+
+Release errors retain pending intent, show an honest UI error, and require explicit retry. A retry dedupes the same persisted ID even if the leader already read it. A previously prepared batch is immutable: retry may finish it and release newer reports in a separate batch, rather than erase new content or alter already-consumed mail. Delivery dedupe assumes that control records and inbox history are retained; it is not exactly-once model execution, crash-proof filesystem durability, or recovery after manual history deletion. Inbox host acceptance still follows its existing separate protocol.
+
+`task_complete` stores a notification intent in the task's optional `completionNotice` before sending. Hooks and task status commit normally. If notification storage fails after completion, the task is still completed; the next explicit local flush/handback recovers that notice, deduping raw and batched deliveries. The original send can still be waiting on control when recovery happens; it checks those same retained receipts rather than delivering or holding the recovered notice again. Do not re-complete the task to retry notification.
 
 ---
 
@@ -106,8 +138,9 @@ Create a task, assign it to a teammate, and spawn or reuse that teammate as need
 - `separate_window` (optional): Spawn in a separate OS window when supported
 
 **Behavior**:
+- Rejects a user-controlled member before creating tasks, spawning, replacing, or changing its model; local handback or intentional removal is required
 - Reuses an existing live teammate by default
-- Replaces a dead same-name teammate automatically
+- Replaces a dead same-name teammate automatically unless its persisted ownership is `user`
 - Only restarts a live same-name teammate when `reuse: "replace"` is explicit
 - Creates and assigns an `in_progress` task, sends an inbox message with the task id, then spawns if needed
 - Returns immediately after delegation; call `team_wait` separately when the caller should block
@@ -190,7 +223,8 @@ Mark the current agent's task complete.
 - Task status must be `in_progress`
 - Runs `.pi/team-hooks/task_completed.sh` before writing `completed`
 - If the hook fails, the task remains unchanged
-- Sends the lead a wake-up inbox message when completed by a teammate
+- Sends the lead a wake-up inbox message when completed by a teammate in `team` mode; in `user` mode the notification is held, while hooks/status still commit
+- Persists `completionNotice` with the task so an initial notification failure can be recovered by explicit local flush/handback
 
 ---
 
@@ -206,6 +240,8 @@ Send a message to one teammate, the lead, or everyone.
 - `content` (required): Full message content
 - `summary` (optional): Summary. Defaults to the first line of content
 - `color` (optional): Message color
+
+In `user` mode, a report to `team-lead` is held, not delivered; the tool reports that disposition. A broadcast still delivers to other peers while holding only the leader recipient. Explicit local flush/handback is the exception.
 
 **Example**:
 ```javascript
@@ -233,7 +269,7 @@ Block the current member while another member is doing work. This is available t
 - `timedOut`: Whether the optional timeout expired
 - `members`: A snapshot of relevant member liveness and activity when available
 
-Messages win over activity checks. Otherwise, the wait returns `no_active_agents` after two consecutive checks, about one second apart, find no other progress-capable member. Alive members in fresh `starting`, fresh `queued`, `running`, or a still-unknown startup state are progress-capable, as is a live waiting/idle peer with unread mail. `waiting`, `idle`, `stopped`, and dead members without unread mail are not. Starting, queued, and unknown states have a 60-second grace period; after that they are stalled even if an undeliverable message remains unread, while a live `running` member has no arbitrary work timeout.
+Messages win over activity checks. Otherwise, the wait returns `no_active_agents` after two consecutive checks, about one second apart, find no other progress-capable member and no live `interrupted` or user-controlled peer. Alive members in fresh `starting`, fresh `queued`, `running`, or a still-unknown startup state are progress-capable, as is a live waiting/idle peer with unread mail. `waiting`, `idle`, `stopped`, and dead members without unread mail are not. A live `interrupted` member is not progress-capable even with unread mail, and that mail does not auto-resume the session, but the member keeps an indefinite wait open. Dead or `stopped` members do not. Starting, queued, and unknown states have a 60-second grace period; after that they are stalled even if an undeliverable message remains unread. That grace and the runtime staleness deadline do not apply to a live `interrupted` member, and a live `running` member has no arbitrary work timeout. An explicit timeout still expires while a peer is interrupted; the clock includes the paused time. Aborting the local wait still rejects promptly. Outcomes remain `message`, `no_active_agents`, and `timeout`. A live user-controlled peer suspends inactivity without making queued idle mail progress-capable. Actual `running` work still progresses; an already-active `waiting` member with mail can consume it. Dead/stopped/replaced instances do not hold the wait. Messages, explicit timeout, and caller abort retain priority.
 
 **Examples**:
 ```javascript
@@ -259,9 +295,17 @@ When a teammate is spawned, they automatically:
 
 ### Idle Polling
 
-If a teammate is idle, pi-teams checks for new messages about once per second. It injects the actual message contents into Pi and marks only successfully delivered message IDs as read.
+If a teammate is idle in `team` control mode, pi-teams checks for new messages about once per second and injects at most one unread message. `sendUserMessage` returns before Pi accepts the prompt. That void return, a timer, a missing error, model selection, or an unrelated run is not acceptance.
 
-If the teammate is busy, messages stay unread until its next idle delivery. If it is blocked inside `team_wait`, the active wait consumes the message and resumes the agent. This keeps teammates responsive without asking them to call `team_wait` just to idle.
+An attempt whose acceptance is unknown stays single-flight in that live process. The message stays unread, and later idle polls do not inject that copy or a later batch. pi-teams does not automatically resend it. After a short delay the session shows a local waiting state and records `inboxAwaitingConfirmation` on its runtime lease, including the message IDs. That note means acceptance is unknown. It is not a confirmed failure and it is not a remote retry control.
+
+The batch is marked read only after Pi emits `message_end` for the user message containing `[pi-teams inbox delivery]` and that batch's `Message-ID`, and only if the acknowledgement commit still owns a live unpaused lease. That confirmation clears the unknown-acceptance diagnostic immediately, even if the mailbox acknowledgement then fails. A failed acknowledgement stays a separate metadata retry. It does not inject the prompt again, and interruption pauses that retry without acknowledging. A later direct run resumes the metadata acknowledgement only. Stop, shutdown, or lease loss before the commit leaves the mail unread.
+
+A preflight rejection or handled input is not a distinct signal on this void host API, so those attempts also stay unknown and unread. A direct prompt in the same process does not reset an unknown attempt. Starting a new process is deliberate human recovery and can submit the still-unread message again. That is not exactly-once delivery, and it is not a guarantee that every future Pi 1.x host or restart confirms acceptance the same way.
+
+If the teammate is busy, messages stay unread until its next idle delivery. While an unknown attempt is outstanding, idle polls do not inject that attempt again or start a later batch. If it is blocked inside `team_wait`, the active wait consumes the message and resumes the agent. This keeps teammates responsive without asking them to call `team_wait` just to idle.
+
+An `interrupted` session is not polled. Ordinary `team_message` and broadcast delivery leave it interrupted, and the unread messages are not injected or acknowledged. A direct user prompt starts a new run and clears `interrupted`. It does not resend an attempt whose acceptance is still unknown. Selecting a model does not start execution. There is no remote resume API. Local `/team-mode` ownership is separate from interruption: neither handback nor flush resumes an interrupted run.
 
 ---
 
@@ -301,13 +345,14 @@ This ensures teammates understand their responsibilities and can work autonomous
 Activity describes coordination state separately from process liveness:
 
 - `starting`: The member session is launching
-- `queued`: An idle member has unread work queued for delivery
+- `queued`: A member has unread work queued for delivery; user ownership can hold that delivery
 - `running`: The Pi agent is actively processing or performing work
 - `waiting`: The member is blocked in `team_wait` on a real dependency
 - `idle`: The Pi agent has settled and is ready for new work
+- `interrupted`: The user aborted the session. Task ownership and status are unchanged, unread inbox messages stay unread, and the ordinary idle notification is suppressed. The session is not idle and will not auto-resume
 - `stopped`: The member has shut down
 
-`team_status` and `check_teammate` expose both liveness and activity. This lets `team_wait` distinguish a long-running job from a team in which every remaining member is idle or waiting. A teammate becoming idle also sends a structured notification to the lead with its unfinished owned tasks.
+`team_status` and `check_teammate` expose both liveness and activity. This lets `team_wait` distinguish a long-running job from a team in which every remaining member is idle or waiting, and from a live interrupted peer that must keep an indefinite wait open. A teammate becoming idle in `team` mode also sends a structured notification to the lead with its unfinished owned tasks. In `user` mode that snapshot is held and coalesced. An interrupted settlement does not generate an idle notification. Read tools expose `controlMode` and the `control` outbox snapshot separately; a user-controlled idle peer is not falsely reported as interrupted or progress-capable.
 
 ---
 
@@ -343,15 +388,13 @@ All pi-teams data is stored in your home directory under `~/.pi/`:
 ~/.pi/
 ├── teams/
 │   └── <team-name>/
-│       └── config.json      # Team configuration and member list
-├── tasks/
-│   └── <team-name>/
-│       ├── task_*.json      # Individual task files
-│       └── tasks.json       # Task index
-└── messages/
+│       ├── config.json       # Team configuration and member list
+│       ├── inboxes/<agent-name>.json # Retained per-agent message arrays
+│       ├── runtime/<agent-name>.json # Instance-owned execution telemetry
+│       └── control/<agent-name>.json # Durable ownership and held leader reports
+└── tasks/
     └── <team-name>/
-        ├── <agent-name>.json  # Per-agent message history
-        └── index.json         # Message index
+        └── <task-id>.json    # Individual task files, including saved notice intent
 ```
 
 ### Team Configuration (config.json)
@@ -393,23 +436,22 @@ All pi-teams data is stored in your home directory under `~/.pi/`:
 }
 ```
 
-### Message File (<agent-name>.json)
+### Inbox File (inboxes/<agent-name>.json)
 
 ```json
-{
-  "messages": [
-    {
-      "id": "msg_def456",
-      "from": "team-lead",
-      "to": "security-bot",
-      "content": "Please focus on the auth module first",
-      "summary": "Focus on auth module",
-      "timestamp": "2024-02-22T10:15:00Z",
-      "read": false
-    }
-  ]
-}
+[
+  {
+    "id": "msg_def456",
+    "from": "team-lead",
+    "text": "Please focus on the auth module first",
+    "summary": "Focus on auth module",
+    "timestamp": "2024-02-22T10:15:00Z",
+    "read": false
+  }
+]
 ```
+
+Control-release messages may also contain `releaseReportIds`, the original held-report IDs. Keep read inbox history and control state if you need release retries to dedupe; deleting either is not a supported exactly-once recovery procedure.
 
 ---
 
@@ -454,15 +496,16 @@ If neither tmux nor Zellij is detected, and you're on macOS with iTerm2, pi-team
 
 ### Lock Files
 
-pi-teams uses lock files to prevent concurrent modifications:
+pi-teams locks individual JSON paths with a `.lock` suffix, for example:
 
-```
-~/.pi/teams/<team-name>/.lock
-~/.pi/tasks/<team-name>/.lock
-~/.pi/messages/<team-name>/.lock
+```text
+~/.pi/teams/<team>/control/<member>.json.lock
+~/.pi/teams/<team>/inboxes/<member>.json.lock
+~/.pi/teams/<team>/runtime/<member>.json.lock
+~/.pi/tasks/<team>/<task-id>.json.lock
 ```
 
-If a lock file is stale (process no longer running), it's automatically removed after 60 seconds.
+Ordinary lock acquisition retries about 5 seconds; the existing generic lock may reclaim a file older than 30 seconds based on mtime, not proof of process death. Control locks instead retain a PID/start token and nonce: a live owner is not stolen just because its operation lasts 30 seconds. Dead-owner or partial crash locks become reclaimable after that age. Control acquisition/reclamation uses a synchronous, nonblocking try under the runtime mutex; it never waits for control while holding runtime. The normal nested order remains control → recipient inbox → source runtime. On platforms without process-start tokens, PID-reuse recovery is conservative.
 
 ### Race Conditions
 
@@ -470,12 +513,7 @@ The locking system prevents race conditions when multiple teammates try to updat
 
 ### Recovery
 
-If a lock file persists beyond 60 seconds, it's automatically cleaned up. For manual recovery:
-
-```bash
-# Remove stale lock
-rm ~/.pi/teams/my-team/.lock
-```
+Do not delete a live lock to force handback. Inspect the owning process, mode, and retained reports first; stop or restart the affected session deliberately before operator repair. Filesystem faults that leave an owner lock behind may require that recovery rather than repeated immediate retries. Never discard control/inbox records as a notification retry: they carry the dedupe evidence.
 
 ---
 
@@ -483,17 +521,17 @@ rm ~/.pi/teams/my-team/.lock
 
 ### Idle Polling Overhead
 
-Teammates poll their inboxes about once per second only while idle. Each poll is a local JSON read. Busy sessions leave queued messages unread, while a session in `team_wait` consumes messages through that active wait.
+Teammates poll their inboxes about once per second only while idle or already queued for delivery. Each poll is a local JSON read. Busy, stopped, interrupted, and user-controlled sessions are not polled for injection. A session in `team_wait` consumes messages through that active wait.
 
 ### Lock Timeout
 
-Lock files timeout after 60 seconds. Adjust if you have very slow operations.
+A contending acquisition normally fails after about 5 seconds; control ownership is not a work timeout and a live control lock is not reclaimed by age. Retry explicitly after the current operation or storage fault is resolved.
 
 ### Message Storage
 
-Messages are stored as JSON. For teams with extensive message history, consider periodic cleanup:
+Messages are retained JSON arrays in the team's `inboxes/` directory. Archive by copying rather than deleting live history needed for control-release dedupe:
 
 ```bash
 # Archive old messages
-mv ~/.pi/messages/my-team/ ~/.pi/messages-archive/my-team-2024-02-22/
+cp -R ~/.pi/teams/my-team/inboxes/ /safe/archive/my-team-2024-02-22-inboxes/
 ```

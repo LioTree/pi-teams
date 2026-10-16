@@ -6,6 +6,7 @@ import * as teams from "../src/utils/teams";
 import * as tasks from "../src/utils/tasks";
 import * as messaging from "../src/utils/messaging";
 import * as runtime from "../src/utils/runtime";
+import * as control from "../src/utils/control";
 import { classifyTeamWaitPeer, waitForTeam } from "../src/utils/team-wait";
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-file";
 import { resolveAgentRole } from "../src/utils/agent-role";
@@ -389,6 +390,411 @@ export default function (pi: ExtensionAPI) {
   let inboxPollingTimer: ReturnType<typeof setInterval> | undefined;
   let sessionCtx: any = null;
   let agentLoopActive = false;
+  // Set synchronously on an aborted settlement so an in-flight poll cannot
+  // inject mail before the runtime file publish finishes. Cleared by a new
+  // agent run, shutdown, or discovering this process no longer owns a live lease.
+  let locallyInterrupted = false;
+  let sessionStopping = false;
+  // Bumped synchronously when a new run or shutdown supersedes an in-flight
+  // interrupted publication, including one still waiting for the runtime lock.
+  let runtimeGeneration = 0;
+  let pendingInterrupt: { generation: number; attempts: number; timer?: ReturnType<typeof setTimeout> } | null = null;
+  interface PendingResume {
+    generation: number;
+    settled: boolean;
+    attempts: number;
+    inFlight: boolean;
+    timer?: ReturnType<typeof setTimeout>;
+  }
+  // A direct run owns this obligation until its latest activity commits. A
+  // failed running write must not strand the persisted interrupted lease.
+  let pendingResume: PendingResume | null = null;
+  interface PendingInboxDelivery {
+    ids: string[];
+    token: number;
+    confirmed: boolean;
+    ackAttempts: number;
+    ackInFlight: boolean;
+    ackLeaseLost: boolean;
+    diagnosticAttempts: number;
+    diagnosticShown: boolean;
+    startedAt: number;
+    ackTimer?: ReturnType<typeof setTimeout>;
+    diagnosticTimer?: ReturnType<typeof setTimeout>;
+  }
+  let deliveryToken = 0;
+  // Unknown acceptance stays on this object for the life of the process.
+  // Timeouts, settlements, unrelated runs, and model selection must not replace it.
+  let pendingInboxDelivery: PendingInboxDelivery | null = null;
+  const INTERRUPT_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600, 3200, 5000];
+  const ACK_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600, 3200, 5000];
+  const INBOX_UNKNOWN_DIAGNOSTIC_MS = 1500;
+  const INTERRUPTIBLE_ACTIVITIES = ["starting", "queued", "running", "waiting", "idle", "interrupted"] as const;
+  const ROUTINE_SETTLE_ACTIVITIES = ["starting", "queued", "running", "waiting", "idle"] as const;
+  const UNDELIVERABLE_ACTIVITIES = ["running", "waiting", "stopped", "interrupted"] as const;
+
+  function clearPendingInterrupt() {
+    if (pendingInterrupt?.timer) clearTimeout(pendingInterrupt.timer);
+    pendingInterrupt = null;
+  }
+
+  function clearPendingResume() {
+    if (pendingResume?.timer) clearTimeout(pendingResume.timer);
+    pendingResume = null;
+  }
+
+  function resumeIsCurrent(pending: PendingResume): boolean {
+    return pendingResume === pending
+      && runtimeGeneration === pending.generation
+      && !locallyInterrupted
+      && !sessionStopping;
+  }
+
+  function scheduleResumeRetry(pending: PendingResume) {
+    if (!resumeIsCurrent(pending) || pending.inFlight || pending.timer) return;
+    // Cap the interval, not the lifetime of the recovery obligation.
+    const delay = INTERRUPT_RETRY_DELAYS_MS[Math.min(pending.attempts++, INTERRUPT_RETRY_DELAYS_MS.length - 1)];
+    pending.timer = setTimeout(() => {
+      pending.timer = undefined;
+      void publishResumedActivity(pending).catch(() => undefined);
+    }, delay);
+  }
+
+  async function publishResumedActivity(pending: PendingResume): Promise<runtime.AgentRuntimeStatus | null> {
+    if (!teamName || !resumeIsCurrent(pending) || pending.inFlight) return null;
+    pending.inFlight = true;
+    if (pending.timer) clearTimeout(pending.timer);
+    pending.timer = undefined;
+    const settled = pending.settled;
+    const commitAllowed = () => resumeIsCurrent(pending) && pending.settled === settled;
+    try {
+      const hasUnread = settled && (await messaging.readInbox(teamName, agentName, true, false)).length > 0;
+      const activity = settled ? (hasUnread ? "queued" : "idle") : "running";
+      if (!commitAllowed()) return null;
+      const updated = await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+        activity,
+        pid: process.pid,
+        processStartToken,
+        lastHeartbeatAt: Date.now(),
+        lastError: undefined,
+      }, INTERRUPTIBLE_ACTIVITIES, commitAllowed, settled ? () => ({
+        activity: control.readControlStateSync(teamName!, agentName).mode === "user" ? "idle" : activity,
+      }) : undefined);
+      // Both the object and its target can change while waiting for the lock.
+      // In particular a settled run must never be repaired back to running.
+      if (!commitAllowed()) return null;
+      if (updated) {
+        clearPendingResume();
+        if (pendingInboxDelivery) scheduleAckRetry(pendingInboxDelivery, 0);
+        return updated;
+      }
+      const current = await runtime.readRuntimeStatus(teamName, agentName);
+      if (resumeIsCurrent(pending) && (!current || current.instanceId !== runtimeInstanceId || current.activity === "stopped")) {
+        clearPendingResume();
+      }
+      return null;
+    } finally {
+      pending.inFlight = false;
+      // Includes exceptional writes/reads and a target changed during a lock
+      // wait. Initial handler errors remain visible to Pi's ExtensionRunner.
+      scheduleResumeRetry(pending);
+    }
+  }
+
+  function clearPendingInboxDelivery() {
+    const pending = pendingInboxDelivery;
+    if (!pending) return;
+    if (pending.ackTimer) clearTimeout(pending.ackTimer);
+    if (pending.diagnosticTimer) clearTimeout(pending.diagnosticTimer);
+    pendingInboxDelivery = null;
+  }
+
+  function sameMessageIds(left: string[] | undefined, right: string[]): boolean {
+    return !!left && left.length === right.length && left.every((id, index) => id === right[index]);
+  }
+
+  function ownsDeliveryLease(status: runtime.AgentRuntimeStatus | null | undefined): status is runtime.AgentRuntimeStatus {
+    return !!status && status.instanceId === runtimeInstanceId && !sessionStopping;
+  }
+
+  function waitAbort(): Error {
+    const error = new Error("team_wait aborted");
+    error.name = "AbortError";
+    return error;
+  }
+
+  function userMessageText(message: { role?: string; content?: unknown }): string {
+    if (message.role !== "user") return "";
+    const content = message.content;
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return "";
+    return content.flatMap(part => {
+      if (
+        part &&
+        typeof part === "object" &&
+        (part as { type?: string }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string"
+      ) {
+        return [(part as { text: string }).text];
+      }
+      return [];
+    }).join("\n");
+  }
+
+  function clearPendingInterruptIfCurrent(started: NonNullable<typeof pendingInterrupt>) {
+    if (pendingInterrupt === started) clearPendingInterrupt();
+  }
+
+  async function publishInterrupted(): Promise<void> {
+    const started = pendingInterrupt;
+    if (!teamName || !started) return;
+    const generation = started.generation;
+    if (!interruptCommitAllowed(generation)) {
+      clearPendingInterruptIfCurrent(started);
+      return;
+    }
+    try {
+      const updated = await runtime.updateRuntimeStatusForInstance(
+        teamName,
+        agentName,
+        runtimeInstanceId,
+        {
+          activity: "interrupted",
+          pid: process.pid,
+          processStartToken,
+          lastHeartbeatAt: Date.now(),
+        },
+        INTERRUPTIBLE_ACTIVITIES,
+        () => interruptCommitAllowed(generation),
+      );
+      // A newer publication may have replaced this one while the runtime lock
+      // was held. Never clear its timer, pending object, or local pause.
+      if (pendingInterrupt !== started) return;
+      if (!updated || !interruptCommitAllowed(generation)) {
+        clearPendingInterruptIfCurrent(started);
+        if (!updated) {
+          const current = await runtime.readRuntimeStatus(teamName, agentName);
+          if (pendingInterrupt && pendingInterrupt !== started) return;
+          if (!current || current.instanceId !== runtimeInstanceId || current.activity === "stopped") {
+            locallyInterrupted = false;
+          }
+        }
+        return;
+      }
+      clearPendingInterruptIfCurrent(started);
+    } catch {
+      if (pendingInterrupt !== started || !locallyInterrupted || sessionStopping) return;
+      started.attempts += 1;
+      if (started.timer) clearTimeout(started.timer);
+      const delay = INTERRUPT_RETRY_DELAYS_MS[
+        Math.min(started.attempts, INTERRUPT_RETRY_DELAYS_MS.length) - 1
+      ];
+      started.timer = setTimeout(() => {
+        if (pendingInterrupt !== started) return;
+        void publishInterrupted();
+      }, delay);
+    }
+  }
+
+  function ackStillAppropriate(pending: PendingInboxDelivery): boolean {
+    return pendingInboxDelivery === pending
+      && pending.confirmed
+      && !pending.ackLeaseLost
+      && !pendingResume
+      && !locallyInterrupted
+      && !sessionStopping;
+  }
+
+  function pauseAckRetry(pending: PendingInboxDelivery) {
+    if (pending.ackTimer) clearTimeout(pending.ackTimer);
+    pending.ackTimer = undefined;
+  }
+
+  function scheduleAckRetry(pending: PendingInboxDelivery, delay = ACK_RETRY_DELAYS_MS[
+    Math.min(Math.max(pending.ackAttempts, 1), ACK_RETRY_DELAYS_MS.length) - 1
+  ]) {
+    if (!ackStillAppropriate(pending) || pending.ackInFlight || pending.ackTimer) return;
+    pending.ackAttempts += 1;
+    pending.ackTimer = setTimeout(() => {
+      pending.ackTimer = undefined;
+      if (pendingInboxDelivery !== pending) return;
+      // The recovery helper contains storage failures; keep a rejection handler
+      // at the detached boundary as well (for example, a throwing host UI).
+      void acknowledgeConfirmedDelivery(pending).catch(() => scheduleAckRetry(pending));
+    }, delay);
+  }
+
+  function clearDeliveryStatusIfCurrent(pending: PendingInboxDelivery) {
+    if (pendingInboxDelivery && pendingInboxDelivery.token !== pending.token) return;
+    sessionCtx?.ui?.setStatus?.("pi-teams-delivery", undefined);
+  }
+
+  async function clearPublishedDiagnostic(pending: PendingInboxDelivery): Promise<void> {
+    if (!teamName || sessionStopping) return;
+    const updates: Partial<runtime.AgentRuntimeStatus> = { inboxAwaitingConfirmation: undefined };
+    try {
+      await runtime.updateRuntimeStatusForInstance(
+        teamName,
+        agentName,
+        runtimeInstanceId,
+        updates,
+        undefined,
+        (status) => ownsDeliveryLease(status) && (
+          !status.inboxAwaitingConfirmation ||
+          sameMessageIds(status.inboxAwaitingConfirmation.messageIds, pending.ids)
+        ),
+      );
+    } catch {
+      // The attempt may already have been retired. Retry only this clear, and
+      // the runtime commit guard still refuses a newer attempt's diagnostic.
+      if (sessionStopping || pending.diagnosticTimer) return;
+      if (pendingInboxDelivery && pendingInboxDelivery.token !== pending.token) return;
+      pending.diagnosticAttempts += 1;
+      if (pending.diagnosticAttempts > ACK_RETRY_DELAYS_MS.length) return;
+      const delay = ACK_RETRY_DELAYS_MS[pending.diagnosticAttempts - 1];
+      pending.diagnosticTimer = setTimeout(() => {
+        pending.diagnosticTimer = undefined;
+        void clearPublishedDiagnostic(pending).catch(() => undefined);
+      }, delay);
+    }
+  }
+
+  async function finishAcceptedDelivery(pending: PendingInboxDelivery): Promise<void> {
+    if (pendingInboxDelivery !== pending) return;
+    clearPendingInboxDelivery();
+    if (!teamName) {
+      clearDeliveryStatusIfCurrent(pending);
+      return;
+    }
+    // Timestamp update and diagnostic clear are separate commits. The clear
+    // guard sees the runtime field under the lock, so an older finish cannot
+    // erase a diagnostic published by a later attempt while this wait was blocked.
+    await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+      lastInboxReadAt: Date.now(),
+      lastHeartbeatAt: Date.now(),
+    }, undefined, (status) => ownsDeliveryLease(status)).catch(() => undefined);
+    await clearPublishedDiagnostic(pending).catch(() => undefined);
+    clearDeliveryStatusIfCurrent(pending);
+  }
+
+  async function acknowledgeConfirmedDelivery(pending: PendingInboxDelivery): Promise<void> {
+    if (!teamName || !ackStillAppropriate(pending) || pending.ackInFlight) return;
+    pending.ackInFlight = true;
+    pauseAckRetry(pending);
+    try {
+      let marked = 0;
+      try {
+        marked = await messaging.commitInboxAcknowledgement(
+          teamName,
+          agentName,
+          pending.ids,
+          (status) => {
+            // Lease loss is terminal for this attempt. Interruption is not:
+            // the persisted pause may still precede a resumed running publish.
+            if (!status || status.instanceId !== runtimeInstanceId || status.activity === "stopped") {
+              pending.ackLeaseLost = true;
+            }
+            return ackStillAppropriate(pending) && status?.activity !== "interrupted";
+          },
+        );
+      } catch {
+        // The fallback can discover metadata committed by another consumer.
+        // It is fallible too, and remains inside the recovery try/finally.
+      }
+      if (pendingInboxDelivery !== pending) return;
+      if (marked > 0) {
+        // Retire a committed ACK before any fallible follow-up metadata/UI.
+        await finishAcceptedDelivery(pending);
+        return;
+      }
+      if (!ackStillAppropriate(pending)) return;
+      const stillUnread = await messaging.readInbox(teamName, agentName, true, false);
+      if (!ackStillAppropriate(pending)) return;
+      if (!stillUnread.some(message => pending.ids.includes(message.id))) {
+        await finishAcceptedDelivery(pending);
+      }
+    } catch {
+      // Keep the accepted object on every recoverable read/lock/write failure.
+      // Neither this path nor its timer ever re-injects the accepted prompt.
+    } finally {
+      pending.ackInFlight = false;
+      // Recovery belongs to the current object/state, not the old commit's
+      // snapshot. This also discharges a resume that raced an in-flight ACK.
+      scheduleAckRetry(pending);
+    }
+  }
+
+  function unknownDeliveryNote(pending: PendingInboxDelivery): string {
+    return `Awaiting confirmation for inbox Message-ID ${pending.ids.join(", ")}. Acceptance is unknown, not a confirmed failure. This process will not send another copy.`;
+  }
+
+  async function reportUnknownDelivery(pending: PendingInboxDelivery): Promise<void> {
+    if (pendingInboxDelivery !== pending || pending.confirmed || sessionStopping || !teamName) return;
+    const note = unknownDeliveryNote(pending);
+    if (!pending.diagnosticShown) {
+      pending.diagnosticShown = true;
+      sessionCtx?.ui?.notify?.(note, "warning");
+      if (pendingInboxDelivery === pending && !pending.confirmed) {
+        sessionCtx?.ui?.setStatus?.("pi-teams-delivery", `awaiting confirmation: ${pending.ids.join(", ")}`);
+      }
+    }
+    const diagnostic = {
+      messageIds: [...pending.ids],
+      since: pending.startedAt,
+      note,
+    };
+    try {
+      const updated = await runtime.updateRuntimeStatusForInstance(
+        teamName,
+        agentName,
+        runtimeInstanceId,
+        {
+          lastHeartbeatAt: Date.now(),
+          inboxAwaitingConfirmation: diagnostic,
+        },
+        undefined,
+        (status) => pendingInboxDelivery === pending
+          && !pending.confirmed
+          // This current unconfirmed object is the only publisher in this
+          // lease. It may replace older IDs whose accepted cleanup failed.
+          // Evaluate ownership under the runtime lock, never before awaiting it.
+          && ownsDeliveryLease(status),
+      );
+      if (pendingInboxDelivery !== pending || pending.confirmed || updated) return;
+    } catch {
+      if (pendingInboxDelivery !== pending || pending.confirmed || sessionStopping || pending.diagnosticTimer) return;
+      pending.diagnosticAttempts += 1;
+      if (pending.diagnosticAttempts > ACK_RETRY_DELAYS_MS.length) return;
+      const delay = ACK_RETRY_DELAYS_MS[pending.diagnosticAttempts - 1];
+      pending.diagnosticTimer = setTimeout(() => {
+        pending.diagnosticTimer = undefined;
+        if (pendingInboxDelivery !== pending || pending.confirmed) return;
+        void reportUnknownDelivery(pending).catch(() => undefined);
+      }, delay);
+    }
+  }
+
+  function scheduleUnknownDiagnostic(pending: PendingInboxDelivery) {
+    if (pending.diagnosticTimer) clearTimeout(pending.diagnosticTimer);
+    pending.diagnosticTimer = setTimeout(() => {
+      pending.diagnosticTimer = undefined;
+      if (pendingInboxDelivery !== pending || pending.confirmed) return;
+      void reportUnknownDelivery(pending).catch(() => undefined);
+    }, INBOX_UNKNOWN_DIAGNOSTIC_MS);
+  }
+
+  function interruptCommitAllowed(generation: number): boolean {
+    return pendingInterrupt?.generation === generation
+      && runtimeGeneration === generation
+      && locallyInterrupted
+      && !sessionStopping;
+  }
+
+  function leaseCanDeliver(status: runtime.AgentRuntimeStatus | null | undefined): status is runtime.AgentRuntimeStatus {
+    return !!status
+      && status.instanceId === runtimeInstanceId
+      && !UNDELIVERABLE_ACTIVITIES.includes(status.activity as typeof UNDELIVERABLE_ACTIVITIES[number]);
+  }
 
   function formatInboxDelivery(messages: Array<{ id: string; from: string; timestamp: string; summary?: string; text: string }>): string {
     return [
@@ -406,48 +812,63 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function deliverUnreadInbox(): Promise<void> {
-    if (inboxDeliveryInFlight || agentLoopActive || !teamName || !sessionCtx?.isIdle()) return;
+    if (
+      inboxDeliveryInFlight ||
+      pendingInboxDelivery ||
+      agentLoopActive ||
+      locallyInterrupted ||
+      sessionStopping ||
+      !teamName ||
+      !sessionCtx?.isIdle()
+    ) return;
+    const activeTeam = teamName;
     inboxDeliveryInFlight = true;
     try {
-      const leaseBeforeRead = await runtime.readRuntimeStatus(teamName, agentName);
-      if (leaseBeforeRead?.instanceId !== runtimeInstanceId) return;
-      // Only agent_settled transitions work from running to idle. Inbox polling
-      // must not race a newly started agent loop and misclassify it as idle.
-      if (leaseBeforeRead.activity === "running" || leaseBeforeRead.activity === "waiting" || leaseBeforeRead.activity === "stopped") return;
+      await control.withMemberControl(activeTeam, agentName, async current => {
+        if (isTeammate && (current.state.mode === "user" || current.state.instanceId !== runtimeInstanceId)) return;
+        const leaseBeforeRead = await runtime.readRuntimeStatus(activeTeam, agentName);
+        // Recheck after every await. A mode commit serializes on this control
+        // lock; abort, shutdown, and replacement also win at the runtime commit.
+        if (locallyInterrupted || sessionStopping || agentLoopActive || !leaseCanDeliver(leaseBeforeRead)) return;
 
-      const unread = await messaging.readInbox(teamName, agentName, true, false);
-      if (unread.length === 0 || !sessionCtx.isIdle() || agentLoopActive) {
-        if (leaseBeforeRead.activity === "queued") {
-          await runtime.updateRuntimeStatusForInstance(
-            teamName,
-            agentName,
-            runtimeInstanceId,
-            { activity: "idle", lastHeartbeatAt: Date.now() },
-            "queued",
-          );
+        const unread = await messaging.readInbox(activeTeam, agentName, true, false);
+        const leaseAfterRead = await runtime.readRuntimeStatus(activeTeam, agentName);
+        if (locallyInterrupted || sessionStopping || agentLoopActive || !sessionCtx.isIdle() || !leaseCanDeliver(leaseAfterRead)) return;
+
+        if (unread.length === 0) {
+          if (leaseAfterRead.activity === "queued") {
+            await runtime.updateRuntimeStatusForInstance(activeTeam, agentName, runtimeInstanceId,
+              { activity: "idle", lastHeartbeatAt: Date.now() }, "queued");
+          }
+          return;
         }
-        return;
-      }
-      if (leaseBeforeRead.activity === "idle") {
-        await runtime.markRuntimeQueuedIfIdle(teamName, agentName);
-      }
-      const leaseBeforeDelivery = await runtime.readRuntimeStatus(teamName, agentName);
-      if (leaseBeforeDelivery?.instanceId !== runtimeInstanceId) return;
-      const deliveryBatch = unread.slice(0, 1);
+        if (leaseAfterRead.activity === "idle") await runtime.markRuntimeQueuedIfIdle(activeTeam, agentName);
+        const leaseBeforeDelivery = await runtime.readRuntimeStatus(activeTeam, agentName);
+        if (locallyInterrupted || sessionStopping || agentLoopActive || !sessionCtx.isIdle() || !leaseCanDeliver(leaseBeforeDelivery)) return;
+        const deliveryBatch = unread.slice(0, 1);
 
-      // sendUserMessage is synchronous. Acknowledging only after it returns gives
-      // at-least-once delivery without losing messages appended concurrently.
-      pi.sendUserMessage(formatInboxDelivery(deliveryBatch));
-      const leaseAfterDelivery = await runtime.readRuntimeStatus(teamName, agentName);
-      if (leaseAfterDelivery?.instanceId !== runtimeInstanceId) return;
-      await messaging.markMessagesRead(teamName, agentName, deliveryBatch.map(message => message.id));
-      await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
-        lastInboxReadAt: Date.now(),
-        lastHeartbeatAt: Date.now(),
-        lastError: undefined,
+        // sendUserMessage returns before acceptance. The control lock makes a
+        // mode switch linearize before or after this handoff, never in between.
+        // Keep the same unread attempt until matching message_end proof.
+        if (locallyInterrupted || sessionStopping || pendingInboxDelivery) return;
+        current.assertOwned();
+        const pending: PendingInboxDelivery = {
+          ids: deliveryBatch.map(message => message.id),
+          token: ++deliveryToken,
+          confirmed: false,
+          ackAttempts: 0,
+          ackInFlight: false,
+          ackLeaseLost: false,
+          diagnosticAttempts: 0,
+          diagnosticShown: false,
+          startedAt: Date.now(),
+        };
+        pendingInboxDelivery = pending;
+        scheduleUnknownDiagnostic(pending);
+        pi.sendUserMessage(formatInboxDelivery(deliveryBatch));
       });
     } catch (error) {
-      if (teamName) {
+      if (teamName && !locallyInterrupted) {
         await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
           lastHeartbeatAt: Date.now(),
           lastError: runtime.createRuntimeError(error),
@@ -471,6 +892,82 @@ export default function (pi: ExtensionAPI) {
     inboxPollingStarted = false;
   }
 
+  function showControlMode(ctx: { ui: { setStatus: (key: string, text: string) => void } }) {
+    if (!isTeammate || !teamName || sessionStopping) return;
+    const current = control.readControlStateSync(teamName, agentName);
+    const lease = runtime.readRuntimeStatusSync(teamName, agentName);
+    if (current.instanceId !== runtimeInstanceId || lease?.instanceId !== runtimeInstanceId || lease.activity === "stopped") return;
+    // Read fresh at render time: an older async command must never paint its
+    // captured mode over a newer switch. Separate from delivery diagnostics.
+    ctx.ui.setStatus("pi-teams-control", current.mode === "user"
+      ? "Control: USER · leader reports held · /team-mode team"
+      : "Control: TEAM · /team-mode user");
+  }
+
+  pi.registerCommand("team-mode", {
+    description: "Teammate control: /team-mode [team|user|flush]. Show mode, enter user takeover, hand back, or explicitly flush held leader reports.",
+    getArgumentCompletions: prefix => {
+      const matches = ["team", "user", "flush"].filter(value => value.startsWith(prefix));
+      return matches.length ? matches.map(value => ({ value, label: value })) : null;
+    },
+    handler: async (args, ctx) => {
+      const action = args.trim();
+      const usage = "/team-mode user: human takeover; /team-mode team: hand back (NOT task complete); /team-mode flush: release held reports without changing mode.";
+      if (!isTeammate || !teamName || sessionStopping) {
+        ctx.ui.notify(`Unavailable: /team-mode runs only in a live teammate pane, not a lead or unbound session. ${usage}`, "warning");
+        return;
+      }
+      if (action && !["team", "user", "flush"].includes(action)) {
+        ctx.ui.notify(`Invalid team mode: ${action}. ${usage}`, "error");
+        return;
+      }
+      try {
+        const config = await teams.readConfig(teamName);
+        if (!config.members.some(member => member.name === agentName && member.agentType === "teammate")) {
+          throw new Error("This session is not a current teammate member of the team.");
+        }
+        const lease = await runtime.readRuntimeStatus(teamName, agentName);
+        if (lease?.instanceId !== runtimeInstanceId || lease.activity === "stopped") {
+          throw new Error("This teammate no longer owns a live runtime lease.");
+        }
+        if (!action) {
+          const current = control.controlSnapshot(control.readControlStateSync(teamName, agentName));
+          showControlMode(ctx);
+          ctx.ui.notify(`Control: ${current.mode.toUpperCase()}; held reports: ${current.heldReports}; held idle: ${current.heldIdle}; release pending: ${current.releasePending}. ${usage}`, "info");
+          return;
+        }
+        const allowed = () => !sessionStopping;
+        if (action === "user") {
+          await control.enterUserControl(teamName, agentName, runtimeInstanceId, allowed);
+        } else {
+          await control.releaseControlReports({
+            teamName,
+            agentName,
+            instanceId: runtimeInstanceId,
+            action: action as "team" | "flush",
+            allow: allowed,
+            getSnapshot: async () => {
+              const allTasks = await tasks.listTasks(teamName!);
+              const status = await runtime.readRuntimeStatus(teamName!, agentName);
+              return { activity: status?.activity ?? "unknown", tasks: allTasks, generation: runtimeGeneration, settled: !agentLoopActive };
+            },
+            getRunState: () => ({ generation: runtimeGeneration, settled: !agentLoopActive }),
+          });
+        }
+        showControlMode(ctx);
+        const current = control.readControlStateSync(teamName, agentName);
+        if (current.instanceId === runtimeInstanceId && !sessionStopping) {
+          ctx.ui.notify(`Control: ${current.mode.toUpperCase()}. ${action === "user" ? "Continue real work here; leader reports and idle inbox auto-start are held. Active explicit team_wait can still consume dependency mail." : "Report release finished. Handback is not task completion and does not resume an interrupted run."}`, "info");
+        }
+      } catch (error) {
+        // A mailbox append may have committed before outbox cleanup failed.
+        // Never claim rollback/cancellation; the saved batch ID makes retry safe.
+        try { showControlMode(ctx); } catch {}
+        ctx.ui.notify(`Team mode operation failed: ${error instanceof Error ? error.message : String(error)}. Undelivered reports remain pending; a saved batch may already be delivered. Inspect /team-mode and retry explicitly.`, "error");
+      }
+    },
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     paths.ensureDirs();
     sessionCtx = ctx;
@@ -479,7 +976,7 @@ export default function (pi: ExtensionAPI) {
       if (teamName) {
         const pidFile = path.join(paths.teamDir(teamName), `${agentName}.pid`);
         atomicWriteFileSync(pidFile, process.pid.toString());
-        await runtime.setRuntimeActivity(teamName, agentName, "starting", {
+        await control.claimMemberControl(teamName, agentName, runtimeInstanceId, () => runtime.setRuntimeActivity(teamName!, agentName, "starting", {
           instanceId: runtimeInstanceId,
           pid: process.pid,
           processStartToken,
@@ -487,7 +984,9 @@ export default function (pi: ExtensionAPI) {
           activityChangedAt: Date.now(),
           lastHeartbeatAt: Date.now(),
           lastError: undefined,
-        });
+          inboxAwaitingConfirmation: undefined,
+        }));
+        showControlMode(ctx);
         startInboxPolling();
       }
       ctx.ui.notify(`Teammate: ${agentName} (Team: ${teamName})`, "info");
@@ -525,6 +1024,7 @@ export default function (pi: ExtensionAPI) {
             activityChangedAt: startedAt,
             lastHeartbeatAt: startedAt,
             lastError: undefined,
+            inboxAwaitingConfirmation: undefined,
           },
           "starting",
         )
@@ -536,6 +1036,7 @@ export default function (pi: ExtensionAPI) {
           activityChangedAt: startedAt,
           lastHeartbeatAt: startedAt,
           lastError: undefined,
+          inboxAwaitingConfirmation: undefined,
         });
       if (!leadRuntime) {
         ctx.ui.notify(`Lead handoff for team ${teamName} is no longer valid.`, "error");
@@ -549,16 +1050,39 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  pi.on("message_end", async (event) => {
+    const pending = pendingInboxDelivery;
+    if (!pending || pending.confirmed || !teamName || locallyInterrupted || sessionStopping) return;
+    const text = userMessageText(event.message ?? {});
+    if (!text.includes("[pi-teams inbox delivery]")) return;
+    if (!pending.ids.every(id => text.includes(`Message-ID: ${id}`))) return;
+    pending.confirmed = true;
+    if (pending.diagnosticTimer) clearTimeout(pending.diagnosticTimer);
+    pending.diagnosticTimer = undefined;
+    if (pendingInboxDelivery === pending) {
+      sessionCtx?.ui?.setStatus?.("pi-teams-delivery", `acknowledgement pending: ${pending.ids.join(", ")}`);
+    }
+    // Acceptance is known now. Clear the unknown diagnostic even if the later
+    // mailbox acknowledgement fails, and do not let an in-flight unknown writer
+    // publish after this point: its commit guard observes pending.confirmed.
+    await clearPublishedDiagnostic(pending);
+    await acknowledgeConfirmedDelivery(pending);
+  });
+
   pi.on("agent_start", async () => {
+    // A direct user prompt starts a new run. Model selection alone does not
+    // emit this event and must not clear an interruption or an unknown inbox
+    // attempt. Bump generation before any await so a stale interrupted-publication
+    // retry cannot overwrite this run or clear the new publication.
+    const generation = ++runtimeGeneration;
     agentLoopActive = true;
-    if (!teamName) return;
-    await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
-      activity: "running",
-      pid: process.pid,
-      processStartToken,
-      lastHeartbeatAt: Date.now(),
-      lastError: undefined,
-    });
+    locallyInterrupted = false;
+    clearPendingInterrupt();
+    clearPendingResume();
+    if (!teamName || sessionStopping) return;
+    const pending: PendingResume = { generation, settled: false, attempts: 0, inFlight: false };
+    pendingResume = pending;
+    await publishResumedActivity(pending);
   });
 
   pi.on("turn_start", async (_event, ctx) => {
@@ -572,22 +1096,81 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("agent_settled", async () => {
+  pi.on("agent_settled", async (event) => {
+    const aborted = event.aborted === true;
+    const generation = runtimeGeneration;
+    const resume = pendingResume;
+    // Invalidate a running repair synchronously, before any runtime lock wait.
+    if (aborted) clearPendingResume();
+    else if (resume) resume.settled = true;
+    const settleCommitAllowed = () => runtimeGeneration === generation
+      && !agentLoopActive && !locallyInterrupted && !sessionStopping;
+    // Flip the pause before the first await. Pi has already dropped the run
+    // lock, so the idle poller can otherwise inject and resume this session.
+    if (aborted) {
+      locallyInterrupted = true;
+      // Keep the unknown or accepted-but-unacked attempt. Clearing it would
+      // let a later poll send a second copy. Do not acknowledge paused mail.
+      if (pendingInboxDelivery?.confirmed) pauseAckRetry(pendingInboxDelivery);
+      if (!pendingInterrupt) pendingInterrupt = { generation: runtimeGeneration, attempts: 0 };
+    }
     agentLoopActive = false;
-    if (!teamName) return;
+    if (!teamName) {
+      if (aborted) {
+        locallyInterrupted = false;
+        clearPendingInterrupt();
+      }
+      return;
+    }
+
+    const releaseInterruptIfLeaseLost = async () => {
+      const current = await runtime.readRuntimeStatus(teamName!, agentName);
+      if (!current || current.instanceId !== runtimeInstanceId || current.activity === "stopped") {
+        locallyInterrupted = false;
+      }
+    };
+
     try {
       const lease = await runtime.readRuntimeStatus(teamName, agentName);
-      if (lease?.instanceId !== runtimeInstanceId) return;
-      const hasUnreadWork = (await messaging.readInbox(teamName, agentName, true, false)).length > 0;
-      const settled = await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
-        activity: hasUnreadWork ? "queued" : "idle",
-        pid: process.pid,
-        processStartToken,
-        lastHeartbeatAt: Date.now(),
-        lastError: undefined,
-      });
+      // Stopped and replacement leases win over a late settlement, including
+      // one that already observed aborted=true.
+      if (!lease || lease.instanceId !== runtimeInstanceId || lease.activity === "stopped") {
+        if (aborted) {
+          locallyInterrupted = false;
+          clearPendingInterrupt();
+        }
+        return;
+      }
 
-      if (!settled || hasUnreadWork || !isTeammate) return;
+      if (aborted || locallyInterrupted) {
+        if (!pendingInterrupt) pendingInterrupt = { generation: runtimeGeneration, attempts: 0 };
+        await publishInterrupted();
+        // Metadata repair only. Do not read, inject, or acknowledge mail, and
+        // do not notify the lead or change task ownership.
+        return;
+      }
+
+      if (!settleCommitAllowed()) return;
+      let settled: runtime.AgentRuntimeStatus | null;
+      if (resume) {
+        // Only this direct run can repair a persisted interruption. If another
+        // attempt still owns the lock, its finally retries the new settled target.
+        // Detached recovery is metadata-only, not an idle notification replay.
+        settled = await publishResumedActivity(resume);
+      } else {
+        const hasUnreadWork = (await messaging.readInbox(teamName, agentName, true, false)).length > 0;
+        settled = await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+          activity: hasUnreadWork ? "queued" : "idle",
+          pid: process.pid,
+          processStartToken,
+          lastHeartbeatAt: Date.now(),
+          lastError: undefined,
+        }, ROUTINE_SETTLE_ACTIVITIES, settleCommitAllowed, () => ({
+          activity: control.readControlStateSync(teamName!, agentName).mode === "user" ? "idle" : hasUnreadWork ? "queued" : "idle",
+        }));
+      }
+
+      if (!settled || !settleCommitAllowed() || settled.activity !== "idle" || !isTeammate) return;
       const ownedTasks = (await tasks.listTasks(teamName))
         .filter(task => task.owner === agentName && task.status !== "completed" && task.status !== "deleted")
         .map(task => ({ id: task.id, subject: task.subject, status: task.status }));
@@ -595,24 +1178,47 @@ export default function (pi: ExtensionAPI) {
         ? ownedTasks.map(task => `- ${task.id} [${task.status}] ${task.subject}`)
         : ["- none"];
       const stillIdle = await runtime.readRuntimeStatus(teamName, agentName);
-      if (stillIdle?.instanceId !== runtimeInstanceId || stillIdle.activity !== "idle") return;
+      if (!settleCommitAllowed() || stillIdle?.instanceId !== runtimeInstanceId || stillIdle.activity !== "idle") return;
       await messaging.sendPlainMessage(
         teamName,
         agentName,
         "team-lead",
         [`Agent ${agentName} is idle.`, "Owned unfinished tasks:", ...taskLines].join("\n"),
         `${agentName} is idle`,
+        undefined,
+        { instanceId: runtimeInstanceId, kind: "idle", generation, allow: settleCommitAllowed },
       );
     } catch (error) {
+      // Never let a settlement error rewrite an interruption or a lost/stopped
+      // lease into idle. Ordinary failures may still record idle for a live lease.
+      if (aborted || locallyInterrupted) {
+        if (!pendingInterrupt) pendingInterrupt = { generation: runtimeGeneration, attempts: 0 };
+        await publishInterrupted().catch(() => undefined);
+        await releaseInterruptIfLeaseLost().catch(() => undefined);
+        return;
+      }
+      // A resume repair retains its own retry even if settlement's lease/read
+      // fails. Do not replace that intent with a routine idle fallback.
+      if (resume) {
+        scheduleResumeRetry(resume);
+        return;
+      }
       await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
         activity: "idle",
         lastError: runtime.createRuntimeError(error),
-      }).catch(() => undefined);
+      }, ROUTINE_SETTLE_ACTIVITIES, settleCommitAllowed).catch(() => undefined);
     }
   });
 
   pi.on("session_shutdown", async () => {
+    // Block injection before the first await, same as an aborted settlement.
+    sessionStopping = true;
+    runtimeGeneration += 1;
     agentLoopActive = false;
+    locallyInterrupted = false;
+    clearPendingInterrupt();
+    clearPendingResume();
+    clearPendingInboxDelivery();
     stopInboxPolling();
     if (!teamName) return;
     await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
@@ -620,6 +1226,7 @@ export default function (pi: ExtensionAPI) {
       pid: process.pid,
       processStartToken,
       lastHeartbeatAt: Date.now(),
+      inboxAwaitingConfirmation: undefined,
     });
   });
 
@@ -648,6 +1255,7 @@ export default function (pi: ExtensionAPI) {
         agentName,
         teamName,
         member,
+        controlMode: teamName ? control.readControlStateSync(teamName, agentName).mode : "team",
       }));
     }
 
@@ -657,8 +1265,11 @@ export default function (pi: ExtensionAPI) {
     }));
   });
 
-  async function killTeammate(teamName: string, member: Member) {
+  async function killTeammate(teamName: string, member: Member, heldControl?: control.LockedMemberControl): Promise<void> {
     if (member.name === "team-lead") return;
+    if (!heldControl) {
+      return control.withMemberControl(teamName, member.name, current => killTeammate(teamName, member, current));
+    }
 
     const runtimeStatus = await runtime.readRuntimeStatus(teamName, member.name);
     if (runtimeStatus?.instanceId) {
@@ -690,6 +1301,7 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    control.retireMemberControl(heldControl);
     if (member.windowId && terminal) {
       terminal.killWindow(member.windowId);
     }
@@ -733,6 +1345,7 @@ export default function (pi: ExtensionAPI) {
     const runtimeStatus = await runtime.readRuntimeStatus(team, member.name);
     const unreadCount = (await messaging.readInbox(team, member.name, true, false)).length;
     const alive = isMemberAlive(team, member, runtimeStatus);
+    const memberControl = control.readControlStateSync(team, member.name);
     const classified = classifyTeamWaitPeer({
       name: member.name,
       agentType: member.agentType,
@@ -741,6 +1354,7 @@ export default function (pi: ExtensionAPI) {
       activityChangedAt: runtimeStatus?.activityChangedAt,
       joinedAt: member.joinedAt,
       unreadCount,
+      controlMode: memberControl.mode,
     }, Date.now(), runtime.STARTUP_STALL_MS);
 
     return {
@@ -748,6 +1362,8 @@ export default function (pi: ExtensionAPI) {
       liveness: alive ? "alive" as const : "dead" as const,
       model: member.model,
       thinking: member.thinking,
+      awaitingConfirmation: runtimeStatus?.inboxAwaitingConfirmation,
+      control: control.controlSnapshot(memberControl),
       runtime: runtimeStatus,
     };
   }
@@ -934,6 +1550,10 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`Team ${params.team_name} does not exist`);
       }
 
+      return control.withMemberControl(safeTeamName, safeName, async memberControl => {
+      if (memberControl.state.mode === "user") {
+        throw new Error(`Teammate ${safeName} is user-controlled. Ask the human to run /team-mode team locally before delegating; no task, process, or model was changed.`);
+      }
       let teamConfig = await teams.readConfig(safeTeamName);
       let member = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
       const memberRuntime = member ? await runtime.readRuntimeStatus(safeTeamName, member.name) : null;
@@ -959,7 +1579,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (member && (reuse === "replace" || !memberAlive)) {
-        await killTeammate(safeTeamName, member);
+        await killTeammate(safeTeamName, member, memberControl);
         await teams.removeMember(safeTeamName, safeName);
         member = undefined;
         teamConfig = await teams.readConfig(safeTeamName);
@@ -1076,6 +1696,7 @@ export default function (pi: ExtensionAPI) {
         }],
         details: { task: assigned, teammate: member, spawned, terminalId, isWindow },
       };
+      });
     },
   });
 
@@ -1170,7 +1791,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "team_message",
     label: "Team Message",
-    description: "Send a message to one teammate, the lead, or everyone on the team.",
+    description: "Send a message to one teammate, the lead, or everyone on the team. Delivery does not resume an interrupted session; that mail stays unread until a direct user prompt in the recipient session.",
     parameters: Type.Object({
       team_name: Type.String(),
       to: Type.String({ description: "Recipient name, 'team-lead', or 'all'." }),
@@ -1181,10 +1802,10 @@ export default function (pi: ExtensionAPI) {
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
       const summary = params.summary || params.content.split("\n")[0].slice(0, 80);
       if (params.to === "all") {
-        await messaging.broadcastMessage(params.team_name, agentName, params.content, summary, params.color);
+        const delivery = await messaging.broadcastMessage(params.team_name, agentName, params.content, summary, params.color, { instanceId: runtimeInstanceId });
         return {
-          content: [{ type: "text", text: "Message sent to all team members." }],
-          details: { to: "all" },
+          content: [{ type: "text", text: `Broadcast: delivered to ${delivery.delivered.join(", ") || "none"}; held for ${delivery.held.join(", ") || "none"}; failed for ${delivery.failed.join(", ") || "none"}.` }],
+          details: { to: "all", ...delivery },
         };
       }
 
@@ -1193,10 +1814,13 @@ export default function (pi: ExtensionAPI) {
         throw new Error(`Agent ${params.to} is not a member of team ${params.team_name}`);
       }
 
-      await messaging.sendPlainMessage(params.team_name, agentName, params.to, params.content, summary, params.color);
+      const message = await messaging.sendPlainMessage(params.team_name, agentName, params.to, params.content, summary, params.color, { instanceId: runtimeInstanceId });
       return {
-        content: [{ type: "text", text: `Message sent to ${params.to}.` }],
-        details: { to: params.to },
+        content: [{ type: "text", text: message.delivery === "held"
+          ? `Report held for ${params.to} while user-controlled. Use /team-mode flush or /team-mode team locally to release it.`
+          : message.delivery === "suppressed" ? "Message was not sent: this operation no longer owns its runtime/control lease."
+          : `Message sent to ${params.to}.` }],
+        details: { to: params.to, delivery: message.delivery },
       };
     },
   });
@@ -1204,7 +1828,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "team_wait",
     label: "Team Wait",
-    description: "Block until this member receives a team message, no other member can make progress, an optional timeout expires, or the call is aborted. The default is an indefinite wait.",
+    description: "Block until this member receives a team message, no other live member can make progress, an optional timeout expires, or the call is aborted. A live interrupted peer is not progress-capable and does not auto-resume, but it keeps an indefinite wait open until it resumes, stops, or its process dies. The default is an indefinite wait.",
     executionMode: "sequential",
     parameters: Type.Object({
       team_name: Type.String(),
@@ -1245,6 +1869,7 @@ export default function (pi: ExtensionAPI) {
           timeoutSeconds: params.timeout_seconds,
           signal,
           consumeMessages: async () => {
+            if (signal?.aborted) throw waitAbort();
             const lease = await runtime.updateRuntimeStatusForInstance(
               safeTeamName,
               agentName,
@@ -1253,23 +1878,33 @@ export default function (pi: ExtensionAPI) {
               "waiting",
             );
             if (!lease) throw new Error(`Agent ${agentName} lost its runtime lease while waiting`);
+            if (signal?.aborted) throw waitAbort();
 
             const messages = await messaging.readInbox(safeTeamName, agentName, true, false);
-            if (messages.length > 0) {
-              const leaseAfterRead = await runtime.updateRuntimeStatusForInstance(
-                safeTeamName,
-                agentName,
-                runtimeInstanceId,
-                { lastInboxReadAt: Date.now(), lastHeartbeatAt: Date.now() },
-                "waiting",
-              );
-              if (!leaseAfterRead) throw new Error(`Agent ${agentName} lost its runtime lease before inbox delivery`);
+            if (signal?.aborted) throw waitAbort();
+            if (messages.length === 0) return [];
 
-              // A team_wait result is the delivery channel. Once this session
-              // owns the lease and returns the messages, acknowledge them now
-              // instead of waiting for an unrelated future settled event.
-              await messaging.markMessagesRead(safeTeamName, agentName, messages.map(message => message.id));
+            // Commit is the linearization point. Cancellation, pause, shutdown,
+            // or lease loss observed after the inbox lock is acquired leaves
+            // the mail unread. A commit that succeeds is not undone.
+            const marked = await messaging.commitInboxAcknowledgement(
+              safeTeamName,
+              agentName,
+              messages.map(message => message.id),
+              (status) => !signal?.aborted
+                && !locallyInterrupted
+                && !sessionStopping
+                && status?.instanceId === runtimeInstanceId
+                && status.activity === "waiting",
+            );
+            if (marked === 0) {
+              if (signal?.aborted) throw waitAbort();
+              throw new Error(`Agent ${agentName} lost its runtime lease before inbox delivery`);
             }
+            await runtime.updateRuntimeStatusForInstance(safeTeamName, agentName, runtimeInstanceId, {
+              lastInboxReadAt: Date.now(),
+              lastHeartbeatAt: Date.now(),
+            }, "waiting").catch(() => undefined);
             return messages;
           },
           getPeers: async () => {
@@ -1286,6 +1921,7 @@ export default function (pi: ExtensionAPI) {
                   agentType: member.agentType,
                   alive: isMemberAlive(safeTeamName, member, status),
                   activity: status?.activity,
+                  controlMode: control.readControlStateSync(safeTeamName, member.name).mode,
                   activityChangedAt: status?.activityChangedAt,
                   joinedAt: member.joinedAt,
                   unreadCount: (await messaging.readInbox(safeTeamName, member.name, true, false)).length,
@@ -1367,6 +2003,7 @@ export default function (pi: ExtensionAPI) {
       const task = await tasks.completeTask(params.team_name, params.task_id, {
         completedBy: agentName,
         summary: params.summary,
+        instanceId: runtimeInstanceId,
       });
       return {
         content: [{ type: "text", text: `Task ${params.task_id} completed.` }],
@@ -1463,7 +2100,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "check_teammate",
     label: "Check Teammate",
-    description: "Check a single teammate's status.",
+    description: "Check a single teammate's liveness, coordination activity (including interrupted), and unread messages.",
     parameters: Type.Object({
       team_name: Type.String(),
       agent_name: Type.String(),
@@ -1485,7 +2122,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "team_status",
     label: "Team Status",
-    description: "Show team members, task board, and runtime health in one response.",
+    description: "Show team members, task board, and runtime health in one response. Activity interrupted means that session was aborted and will not auto-resume until a direct user prompt. inboxAwaitingConfirmation means host acceptance of those message IDs is unknown, not that delivery failed; this process will not resend them.",
     parameters: Type.Object({
       team_name: Type.String(),
     }),

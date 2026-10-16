@@ -110,6 +110,30 @@ Now you have expensive reasoning for design and reviews, but fast/cheap implemen
 
 ---
 
+## Work directly in a teammate session
+
+For multi-turn **real work**, use the local command in that teammate's pane:
+
+```text
+/team-mode user
+```
+
+Then give ordinary corrections, edit files, run tools, and change models in the original session. No fork, freeze, automatic abort, or extra classifier/model call is involved. The persistent `Control: USER` indicator is separate from `running`/`idle`/`interrupted` activity.
+
+The harness holds routine idle notices, explicit reports to the lead, task-completion notifications, and a broadcast's leader recipient. Other peers still receive dependency messages. Task completion hooks and status commits are not paused. Idle inbox auto-start is paused; direct human input and an already-active explicit dependency `team_wait` still work. Already delivered reports and already handed-to-host inbox requests cannot be recalled. Unknown inbox acceptance is not reset; accepted acknowledgement retry remains metadata-only.
+
+```text
+/team-mode          Inspect mode and held-report counts
+/team-mode flush    Explicitly release reports now, remaining in user mode
+/team-mode team     Release reports and return team control
+```
+
+Release includes original report content, latest known activity/task states, and one coalesced idle snapshot. It is not an LLM-generated summary. No completion report means work may be unfinished; **handback is not task completion**. Repeated unchanged commands do not duplicate the release. On failure, inspect the error/pending state and retry explicitly; a batch may already be in the lead inbox. Do not retry `task_complete` after its task commit just because notification failed: explicit flush/handback recovers the saved notification intent.
+
+A live user-controlled idle peer keeps the lead's indefinite `team_wait` open without being counted as actual progress. Other peers' reports, explicit timeout, caller cancellation, death, and stop still win. The lead cannot silently redelegate or replace a user-controlled name. A normal restart preserves ownership/reports; an intentional stop/removal ends ownership but retains unflushed reports for an explicitly flushed replacement. Team deletion discards the state. See [persistence and delivery limits](reference.md#control-persistence-and-delivery-limits). Local handback never resumes an interrupted turn; a direct human prompt is still required.
+
+---
+
 ## Hook System
 
 ### Overview
@@ -269,7 +293,7 @@ Bad task:
 
 > **You:** "Wait for my inbox until a teammate reports back."
 
-With no `timeout_seconds`, `team_wait` is an indefinite barrier: long security reviews are not cut off by a default deadline. It returns with `outcome: "message"`, `"no_active_agents"`, or `"timeout"`. Use the result for review, coordination, and follow-up decisions; if teammates remain active, wait again.
+With no `timeout_seconds`, `team_wait` is an indefinite barrier: long security reviews are not cut off by a default deadline. It returns with `outcome: "message"`, `"no_active_agents"`, or `"timeout"`. A live interrupted teammate is not making progress, but that pause does not end the wait. Use the result for review, coordination, and follow-up decisions; if teammates remain active or interrupted, wait again.
 
 ### 7. Check Progress Regularly
 
@@ -288,12 +312,17 @@ This helps you catch blockers early and provide feedback.
 **Problem**: A teammate is idle but not picking up messages.
 
 **Solution**:
-1. Check if they're still running:
+1. Check `controlMode` first. If it is `user`, pending mail is intentional: use `/team-mode` in that pane and hand back locally when ready. Do not silently replace human-controlled work.
+2. Check if they're still running:
    > **You:** "Check on teammate named 'security-bot'"
-2. Check their inbox:
+3. Check their inbox:
    > **You:** "Read security-bot's inbox"
-3. Force kill and respawn if needed:
+4. Intentionally stop/remove and respawn only if needed; removal ends ownership but does not release pending reports:
    > **You:** "Force kill security-bot and respawn them"
+
+**Problem**: A teammate shows activity `interrupted`.
+
+The user aborted that session. Its tasks stay owned, its inbox stays unread, and pi-teams will not inject those messages or resume the run. A lead's indefinite `team_wait` also stays open while that process is alive. Resume it by typing a new prompt in that session. Selecting a model does not start execution, and there is no remote resume command. If the process has actually stopped or died, it no longer holds the wait. A direct prompt does not resend an inbox attempt whose host acceptance is still unknown; that attempt stays unread until Pi confirms it or a person starts a new process.
 
 ### tmux Pane Issues
 
@@ -335,9 +364,8 @@ Check your pi config for available models.
 ### Data Location
 
 All team data is stored in:
-- `~/.pi/teams/<team-name>/` - Team configuration, member list
-- `~/.pi/tasks/<team-name>/` - Task files
-- `~/.pi/messages/<team-name>/` - Message history
+- `~/.pi/teams/<team-name>/` - Team configuration/member list, `runtime/` telemetry, `inboxes/` message history, and `control/` ownership/report outboxes
+- `~/.pi/tasks/<team-name>/` - Task files and optional saved completion-notice intent
 
 You can manually inspect these JSON files to debug issues.
 
@@ -377,7 +405,7 @@ team_message({
 team_wait({ team_name: "my-team" })
 ```
 
-Ordinary idle teammates do not call `team_wait`; pi-teams delivers their unread messages automatically when their session is idle.
+Ordinary idle teammates in `team` mode do not call `team_wait`; pi-teams delivers their unread messages automatically when their session is idle. In `user` mode, idle auto-start stays paused but an already-active dependency wait can still consume messages. Interrupted teammates are paused until a direct user prompt in that session; mail does not resume them.
 
 ---
 
@@ -392,7 +420,7 @@ To remove all team data:
 # Then delete data directory
 rm -rf ~/.pi/teams/my-team/
 rm -rf ~/.pi/tasks/my-team/
-rm -rf ~/.pi/messages/my-team/
+# The team directory above also contains inbox/control history; deletion discards pending reports.
 ```
 
 Or use the delete command:

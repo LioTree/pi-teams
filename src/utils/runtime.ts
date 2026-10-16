@@ -3,6 +3,7 @@ import path from "node:path";
 import { withLock } from "./lock";
 import { runtimeStatusPath, teamDir } from "./paths";
 import { atomicWriteJsonSync } from "./atomic-file";
+import { readControlStateSync } from "./control-state";
 
 /**
  * Runtime constants for health checking.
@@ -17,6 +18,9 @@ export const AGENT_ACTIVITIES = [
   "running",
   "waiting",
   "idle",
+  // Live user-aborted pause. Not idle, not stopped, and not subject to
+  // startup-grace or staleness deadlines while the process remains alive.
+  "interrupted",
   "stopped",
 ] as const;
 
@@ -28,6 +32,13 @@ export type AgentActivity = (typeof AGENT_ACTIVITIES)[number];
 export interface RuntimeError {
   message: string;
   timestamp: number;
+}
+
+/** Unknown host acceptance. This is a diagnostic, not a confirmed delivery failure. */
+export interface InboxAwaitingConfirmation {
+  messageIds: string[];
+  since: number;
+  note: string;
 }
 
 export interface AgentRuntimeStatus {
@@ -42,6 +53,7 @@ export interface AgentRuntimeStatus {
   lastHeartbeatAt?: number;
   lastInboxReadAt?: number;
   lastError?: RuntimeError;
+  inboxAwaitingConfirmation?: InboxAwaitingConfirmation;
 }
 
 type LegacyRuntimeStatus = Partial<AgentRuntimeStatus> & { ready?: boolean };
@@ -88,6 +100,35 @@ function normalizeRuntimeStatus(
       value.activityChangedAt !== activityChangedAt ||
       "ready" in value,
   };
+}
+
+/** Read a runtime file the caller already holds the lock for. Do not lock again. */
+export function readRuntimeStatusSync(
+  teamName: string,
+  agentName: string,
+): AgentRuntimeStatus | null {
+  const p = runtimeStatusPath(teamName, agentName);
+  if (!fs.existsSync(p)) return null;
+  return readRuntimeFile(p, teamName, agentName)?.status ?? null;
+}
+
+/**
+ * Run a synchronous commit while this live runtime lease is locked. Callers
+ * acquire control/inbox locks first; the callback must not await or lock again.
+ */
+export async function withActiveRuntimeInstance<T>(
+  teamName: string,
+  agentName: string,
+  instanceId: string,
+  commit: (status: AgentRuntimeStatus) => T,
+): Promise<T | null> {
+  const file = runtimeStatusPath(teamName, agentName);
+  if (!fs.existsSync(file)) return null;
+  return withLock(file, async () => {
+    const status = readRuntimeStatusSync(teamName, agentName);
+    if (!status || status.instanceId !== instanceId || status.activity === "stopped") return null;
+    return commit(status);
+  });
 }
 
 function readRuntimeFile(
@@ -169,6 +210,13 @@ export async function updateRuntimeStatusForInstance(
   instanceId: string,
   updates: Partial<AgentRuntimeStatus>,
   expectedActivity?: AgentActivity | readonly AgentActivity[],
+  // Re-checked after this call has acquired the runtime lock, including when
+  // it had to wait. Must not await or take the runtime lock again.
+  commitGuard?: (current: AgentRuntimeStatus) => boolean,
+  // Optional synchronous final values (e.g. truthful idle in user mode). This
+  // reads ownership at the runtime commit, without holding control across an
+  // async publication or blocking a newer generation behind an old callback.
+  resolveUpdates?: (current: AgentRuntimeStatus) => Partial<AgentRuntimeStatus>,
 ): Promise<AgentRuntimeStatus | null> {
   const p = runtimeStatusPath(teamName, agentName);
   if (!fs.existsSync(p)) return null;
@@ -182,9 +230,11 @@ export async function updateRuntimeStatusForInstance(
       ? undefined
       : Array.isArray(expectedActivity) ? expectedActivity : [expectedActivity];
     if (expected && !expected.includes(loaded.status.activity)) return null;
+    if (commitGuard && !commitGuard(loaded.status)) return null;
 
     const next = mergeRuntimeStatus(loaded.status, {
       ...updates,
+      ...resolveUpdates?.(loaded.status),
       instanceId,
     });
     atomicWriteJsonSync(p, next);
@@ -276,7 +326,10 @@ export async function markRuntimeQueuedIfIdle(
     const loaded = readRuntimeFile(p, teamName, agentName);
     if (!loaded) return false;
 
-    if (loaded.status.activity !== "idle") {
+    // Only an idle recipient becomes queued. Interrupted, running, waiting,
+    // stopped, and starting sessions keep their activity so ordinary mail
+    // cannot auto-resume a user-aborted run.
+    if (loaded.status.activity !== "idle" || readControlStateSync(teamName, agentName).mode === "user") {
       if (loaded.changed) {
         atomicWriteJsonSync(p, loaded.status);
       }

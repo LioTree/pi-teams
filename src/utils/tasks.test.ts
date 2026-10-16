@@ -25,6 +25,8 @@ describe("Tasks Utilities", () => {
 
     vi.spyOn(process, "cwd").mockReturnValue(path.join(testDir, "project"));
     vi.spyOn(paths, "taskDir").mockReturnValue(testDir);
+    vi.spyOn(paths, "teamDir").mockReturnValue(testDir);
+    vi.spyOn(paths, "runtimeStatusPath").mockImplementation((_team, agent) => path.join(testDir, "runtime", `${agent}.json`));
     vi.spyOn(paths, "configPath").mockReturnValue(path.join(testDir, "config.json"));
     vi.spyOn(paths, "inboxPath").mockImplementation((_teamName, agentName) =>
       path.join(testDir, "inboxes", `${agentName}.json`));
@@ -175,7 +177,10 @@ describe("Tasks Utilities", () => {
       "team-lead",
       expect.stringContaining(`Task ${task.id}`),
       `Task ${task.id} completed`,
+      undefined,
+      { instanceId: undefined, messageId: completed.completionNotice?.id },
     );
+    expect(completed.completionNotice?.id).toEqual(expect.any(String));
   });
 
   it("does not let a non-owner complete another teammate's task", async () => {

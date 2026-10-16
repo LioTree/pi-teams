@@ -74,6 +74,9 @@ describe("buildLeadSystemPrompt", () => {
     expect(prompt).toContain("instead of continuing or duplicating");
     expect(prompt).toContain("if teammates are still active, call team_wait again");
     expect(prompt).toContain("team_status");
+    expect(prompt).toContain("live interrupted peer keeps an indefinite team_wait open");
+    expect(prompt).toContain("direct user prompt in that session");
+    expect(prompt).toContain("not a model change or remote resume");
     expect(prompt).not.toContain("plan_review");
     expect(prompt).not.toContain("plan_submit");
     expect(prompt).not.toContain("event=");
@@ -121,6 +124,9 @@ describe("buildTeammateSystemPrompt", () => {
     expect(prompt).toContain("Use team_message");
     expect(prompt).toContain("Call team_wait only after sending a dependency request");
     expect(prompt).toContain("do not call it merely to become idle");
+    expect(prompt).toContain("inbox delivery stays paused until a direct user prompt");
+    expect(prompt).toContain("host acceptance is unknown");
+    expect(prompt).toContain("not exactly-once delivery");
     expect(prompt).not.toContain("plan approval");
     expect(prompt).not.toContain("plan_submit");
   });
@@ -139,6 +145,8 @@ describe("buildTeammateSystemPrompt", () => {
       member,
     });
 
-    expect(prompt).toContain("You are currently using model: test/model with thinking level: high.");
+    expect(prompt).toContain("Stored launch model: test/model with thinking level: high.");
+    expect(prompt).toContain("not proof of the current runtime selection");
+    expect(prompt).not.toContain("use these exact values");
   });
 });
