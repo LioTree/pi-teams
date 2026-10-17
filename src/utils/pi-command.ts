@@ -7,11 +7,16 @@ export function getProjectTrustArg(argv: readonly string[] = process.argv): Proj
   return undefined;
 }
 
+export function shellArgument(value: string): string {
+  return /^[a-zA-Z0-9_./:@=-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 export function buildPiCommand(
   piBinary: string,
   model?: string,
   thinking?: string,
-  trustArg: ProjectTrustArg = getProjectTrustArg(),
+  trustArg: ProjectTrustArg | null = getProjectTrustArg(),
+  sessionFile?: string,
 ): string {
   const args: string[] = [];
   if (trustArg) args.push(trustArg);
@@ -20,5 +25,6 @@ export function buildPiCommand(
   } else if (thinking) {
     args.push("--thinking", thinking);
   }
-  return [piBinary, ...args].join(" ");
+  if (sessionFile) args.push("--session", sessionFile);
+  return [piBinary, ...args.map(shellArgument)].join(" ");
 }

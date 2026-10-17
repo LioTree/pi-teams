@@ -6,6 +6,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import extension from "./index";
+import { fixtureSession } from "./session-test-fixture";
 import type { Member } from "../src/utils/models";
 import * as messaging from "../src/utils/messaging";
 import * as paths from "../src/utils/paths";
@@ -97,6 +98,7 @@ function loadExtension(agentName: string): LoadedExtension {
   const tools = new Map<string, RegisteredTool>();
   const sent: string[] = [];
   const ctx = {
+    sessionManager: fixtureSession(root, teamName, agentName),
     isIdle: () => true,
     cwd: root,
     ui: { notify() {}, setStatus() {}, setTitle() {} },

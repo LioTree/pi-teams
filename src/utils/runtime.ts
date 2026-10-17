@@ -53,6 +53,12 @@ export interface AgentRuntimeStatus {
   lastInboxReadAt?: number;
   lastError?: RuntimeError;
   inboxAwaitingConfirmation?: InboxAwaitingConfirmation;
+  sessionId?: string;
+  sessionFile?: string;
+  /** A stopped/detached session is not the same as relinquished membership. */
+  detached?: boolean;
+  /** Retained across shutdown/startup, cleared only by legitimate direct work. */
+  paused?: boolean;
 }
 
 type LegacyRuntimeStatus = Partial<AgentRuntimeStatus> & { ready?: boolean };
@@ -225,6 +231,7 @@ export async function replaceRuntimeInstance(
   nextInstanceId: string | undefined,
   updates: Partial<AgentRuntimeStatus>,
   expectedActivity?: AgentActivity | readonly AgentActivity[],
+  commitGuard?: () => boolean,
 ): Promise<AgentRuntimeStatus | null> {
   const p = runtimeStatusPath(teamName, agentName);
   if (!fs.existsSync(p)) return null;
@@ -232,7 +239,7 @@ export async function replaceRuntimeInstance(
   return await withLock(p, async () => {
     if (!fs.existsSync(p)) return null;
     const loaded = readRuntimeFile(p, teamName, agentName);
-    if (!loaded || loaded.status.instanceId !== expectedInstanceId) return null;
+    if (!loaded || loaded.status.instanceId !== expectedInstanceId || commitGuard && !commitGuard()) return null;
 
     const expected = expectedActivity === undefined
       ? undefined

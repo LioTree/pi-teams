@@ -421,6 +421,20 @@ describe("team quiescence watermark", () => {
     expect(after.checkedGeneration).toBe(0);
   });
 
+  it("does not record a receipt from a session revoked while waiting on the coordinator lock", async () => {
+    await allIdle(); await openFormalGeneration(teamName);
+    const admitted = await admitQuiescenceInspection(teamName, alwaysAlive);
+    const deliveredText = `Message-ID: ${admitted.messageId}\n${(await leadUnread())[0].text}`;
+    const lock = path.join(teamRoot(), "quiescence.json.lock"); fs.writeFileSync(lock, "fixture");
+    let current = true;
+    const pending = noteInspectionAccepted(teamName, { messageId: admitted.messageId!, leaderInstanceId: "old-session",
+      runGeneration: 1, deliveredText, commitGuard: () => current });
+    await new Promise(resolve => setTimeout(resolve, 10)); current = false; fs.unlinkSync(lock);
+    expect(await pending).toEqual({ accepted: false });
+    expect((await readQuiescenceState(teamName)).inspection?.phase).toBe("pending");
+    expect((await readQuiescenceState(teamName)).checkedGeneration).toBe(0);
+  });
+
   it("reports false when the accepted record is already gone", async () => {
     const released = await releaseAcceptedInspection(teamName, {
       messageId: "already-gone",

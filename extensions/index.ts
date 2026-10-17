@@ -7,6 +7,9 @@ import * as tasks from "../src/utils/tasks";
 import * as messaging from "../src/utils/messaging";
 import * as runtime from "../src/utils/runtime";
 import { classifyTeamWaitPeer, waitForTeam } from "../src/utils/team-wait";
+import { allocateSession, claimSession, findSessionMember, sessionIdentity, restoreTeamPanes } from "../src/utils/team-session";
+import { launchReservedMember } from "../src/utils/member-launch";
+import { withLock } from "../src/utils/lock";
 import {
   acknowledgeAcceptedInspection,
   admitQuiescenceInspection,
@@ -18,7 +21,7 @@ import {
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-file";
 import { resolveAgentRole } from "../src/utils/agent-role";
 import { applyTeamSystemPrompt, buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
-import { buildPiCommand } from "../src/utils/pi-command";
+import { buildPiCommand, shellArgument } from "../src/utils/pi-command";
 import { Member, THINKING_LEVELS } from "../src/utils/models";
 import {
   type AgentSettings,
@@ -55,7 +58,7 @@ function getPiLaunchCommand(): string {
       || /(?:^|[/\\])dist[/\\]cli\.js$/i.test(argv1);
 
     if (looksLikeScript) {
-      return `node ${JSON.stringify(argv1)}`;
+      return `node ${shellArgument(argv1)}`;
     }
   }
 
@@ -63,7 +66,7 @@ function getPiLaunchCommand(): string {
   if (execPath) {
     const base = path.basename(execPath).toLowerCase();
     if (base !== "node" && base !== "node.exe" && base !== "bun" && base !== "bun.exe") {
-      return JSON.stringify(execPath);
+      return shellArgument(execPath);
     }
   }
 
@@ -378,17 +381,72 @@ function cleanupAgentSessionFolders(maxAgeMs: number = 24 * 60 * 60 * 1000): num
   return cleaned;
 }
 
+/** Each session has isolated closures; a late callback cannot acquire a new session's identity. */
 export default function (pi: ExtensionAPI) {
-  const { agentName, isTeammate } = resolveAgentRole(process.env.PI_AGENT_NAME);
+  type SessionRuntime = {
+    handlers: Map<string, (...args: any[]) => any>;
+    tools: Map<string, any>;
+    commands: Map<string, any>;
+    invalidate: () => void;
+  };
+  const build = (): SessionRuntime => {
+    const handlers = new Map<string, (...args: any[]) => any>();
+    const tools = new Map<string, any>();
+    const commands = new Map<string, any>();
+    const proxy = new Proxy(pi, { get(target, key) {
+      if (key === "on") return (name: string, handler: (...args: any[]) => any) => {
+        handlers.set(name, handler); return () => handlers.delete(name);
+      };
+      if (key === "registerTool") return (tool: any) => tools.set(tool.name, tool);
+      if (key === "registerCommand") return (name: string, command: any) => commands.set(name, command);
+      return Reflect.get(target, key);
+    } });
+    return { handlers, tools, commands, invalidate: createSessionExtension(proxy) };
+  };
+  let active = build();
+  let started = false;
+  for (const [name, tool] of active.tools) {
+    pi.registerTool({ ...tool, execute: (...args: any[]) => active.tools.get(name).execute(...args) });
+  }
+  for (const [name, command] of active.commands) {
+    pi.registerCommand?.(name, { ...command, handler: (...args: any[]) => active.commands.get(name).handler(...args) });
+  }
+  for (const name of active.handlers.keys()) {
+    (pi.on as any)(name, (event: any, ctx: any) => {
+      if (name === "session_start") {
+        if (started) {
+          const retired = active;
+          retired.invalidate();
+          active = build();
+          const next = active;
+          // Actual Pi normally emits shutdown first. This also makes repeated
+          // startup dispatch safe for hosts reusing a factory/context.
+          return Promise.resolve(retired.handlers.get("session_shutdown")?.(
+            { type: "session_shutdown", reason: event.reason }, ctx,
+          )).then(() => next.handlers.get(name)?.(event, ctx));
+        }
+        started = true;
+      }
+      return active.handlers.get(name)?.(event, ctx);
+    });
+  }
+}
+
+function createSessionExtension(pi: ExtensionAPI): () => void {
+  let { agentName, isTeammate } = resolveAgentRole(process.env.PI_AGENT_NAME);
   const runtimeInstanceId = randomUUID();
   const processStartToken = runtime.getProcessStartToken(process.pid);
   let incomingLeadHandoffToken = process.env.PI_TEAM_HANDOFF_TOKEN;
   delete process.env.PI_TEAM_HANDOFF_TOKEN;
+  const incomingRecoveryToken = process.env.PI_TEAM_RECOVERY_TOKEN;
+  delete process.env.PI_TEAM_RECOVERY_TOKEN;
   const envTeamName = process.env.PI_TEAM_NAME;
 
-  // For leads without PI_TEAM_NAME, check if we're registered as lead for a team
-  const detectedTeamName = envTeamName || findLeadTeamForSession();
-  let teamName = detectedTeamName;
+  // Environment is only a launch hint. session_start must prove the exact Pi
+  // identity (or the explicit live handoff token) before attaching any reader.
+  let teamName: string | null | undefined = envTeamName;
+  let identity: ReturnType<typeof sessionIdentity>;
+  let recoveryOutcomes: Awaited<ReturnType<typeof restoreTeamPanes>> = [];
 
   const terminal = getTerminalAdapter();
 
@@ -504,6 +562,7 @@ export default function (pi: ExtensionAPI) {
         processStartToken,
         lastHeartbeatAt: Date.now(),
         lastError: undefined,
+        paused: false,
       }, INTERRUPTIBLE_ACTIVITIES, commitAllowed);
       // Both the object and its target can change while waiting for the lock.
       // In particular a settled run must never be repaired back to running.
@@ -585,6 +644,7 @@ export default function (pi: ExtensionAPI) {
         runtimeInstanceId,
         {
           activity: "interrupted",
+          paused: true,
           pid: process.pid,
           processStartToken,
           lastHeartbeatAt: Date.now(),
@@ -1016,6 +1076,8 @@ export default function (pi: ExtensionAPI) {
   }
 
   function retainInspectionRelease(accepted: { messageId: string; generation: number; runGeneration: number }) {
+    if (pendingInspectionRelease && (pendingInspectionRelease.runGeneration > accepted.runGeneration
+      || pendingInspectionRelease.messageId === accepted.messageId && pendingInspectionRelease.runGeneration === accepted.runGeneration)) return;
     clearPendingInspectionRelease();
     pendingInspectionRelease = {
       ...accepted,
@@ -1093,85 +1155,109 @@ export default function (pi: ExtensionAPI) {
     inboxPollingStarted = false;
   }
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", attachSession);
+  async function attachSession(event: { reason?: string }, ctx: any): Promise<void> {
+    teamName = null;
     paths.ensureDirs();
     sessionCtx = ctx;
-
-    if (isTeammate) {
-      if (teamName) {
-        const pidFile = path.join(paths.teamDir(teamName), `${agentName}.pid`);
-        atomicWriteFileSync(pidFile, process.pid.toString());
-        await runtime.setRuntimeActivity(teamName, agentName, "starting", {
-          instanceId: runtimeInstanceId,
-          pid: process.pid,
-          processStartToken,
-          startedAt: Date.now(),
-          activityChangedAt: Date.now(),
-          lastHeartbeatAt: Date.now(),
-          lastError: undefined,
-          inboxAwaitingConfirmation: undefined,
-        });
-        startInboxPolling();
-      }
-      ctx.ui.notify(`Teammate: ${agentName} (Team: ${teamName})`, "info");
-      ctx.ui.setStatus("00-pi-teams", `[${agentName.toUpperCase()}]`);
-
-      if (terminal) {
-        const fullTitle = teamName ? `${teamName}: ${agentName}` : agentName;
-        const setIt = () => {
-          if ((ctx.ui as any).setTitle) (ctx.ui as any).setTitle(fullTitle);
-          terminal.setTitle(fullTitle);
-        };
-        setIt();
-        setTimeout(setIt, 500);
-        setTimeout(setIt, 2000);
-        setTimeout(setIt, 5000);
-      }
-
-    } else if (teamName) {
-      // Lead reconnecting to an existing team
-      ctx.ui.setStatus("pi-teams", `Lead @ ${teamName}`);
-      const startedAt = Date.now();
-      const handoffToken = incomingLeadHandoffToken;
-      incomingLeadHandoffToken = undefined;
-      const leadRuntime = handoffToken
-        ? await runtime.replaceRuntimeInstance(
-          teamName,
-          agentName,
-          handoffToken,
-          runtimeInstanceId,
-          {
-            activity: ctx.isIdle() ? "idle" : "running",
-            pid: process.pid,
-            processStartToken,
-            startedAt,
-            activityChangedAt: startedAt,
-            lastHeartbeatAt: startedAt,
-            lastError: undefined,
-            inboxAwaitingConfirmation: undefined,
-          },
-          "starting",
-        )
-        : await runtime.setRuntimeActivity(teamName, agentName, ctx.isIdle() ? "idle" : "running", {
-          instanceId: runtimeInstanceId,
-          pid: process.pid,
-          processStartToken,
-          startedAt,
-          activityChangedAt: startedAt,
-          lastHeartbeatAt: startedAt,
-          lastError: undefined,
-          inboxAwaitingConfirmation: undefined,
-        });
-      if (!leadRuntime) {
-        ctx.ui.notify(`Lead handoff for team ${teamName} is no longer valid.`, "error");
-        stopInboxPolling();
-        teamName = null;
-        setTimeout(() => ctx.shutdown(), 0);
+    const handoffToken = incomingLeadHandoffToken;
+    incomingLeadHandoffToken = undefined;
+    let attached = false;
+    try {
+      identity = sessionIdentity(ctx);
+      if (!identity) {
+        if (envTeamName) ctx.ui.notify("Team recovery blocked: this Pi session has no persistent session file.", "warning");
         return;
       }
-      registerLeadSession(teamName);
-      startInboxPolling();
+      const saved = findSessionMember(identity, envTeamName);
+      // Only a current-process reload may migrate a legacy env hint. A startup,
+      // new/fork/clone, or copied custom entry cannot establish that association.
+      const legacyReload = event.reason === "reload" && !!envTeamName;
+      const candidate = saved?.teamName ?? ((handoffToken || legacyReload) ? envTeamName : undefined);
+      if (!candidate) {
+        if (envTeamName) ctx.ui.notify("No exact team/session mapping; legacy data is preserved, not guessed or deleted.", "warning");
+        agentName = "team-lead"; isTeammate = false;
+        return;
+      }
+      const memberName = saved?.member.name ?? (handoffToken ? "team-lead" : agentName);
+      // Remember the candidate for stale-session shutdown CAS even if a switch
+      // happens just after the claim commits but before its await returns.
+      teamName = candidate;
+      agentName = memberName;
+      isTeammate = memberName !== "team-lead";
+      const claimed = await claimSession({ team: candidate, agent: memberName, identity,
+        instanceId: runtimeInstanceId, pid: process.pid, processStartToken,
+        paneId: process.env.TMUX_PANE, handoffToken, recoveryToken: incomingRecoveryToken, legacyReload,
+        current: () => !sessionStopping });
+      attached = true;
+      if (sessionStopping) return;
+      teamName = candidate;
+      agentName = memberName;
+      isTeammate = memberName !== "team-lead";
+      locallyInterrupted = claimed.activity === "interrupted";
+      if (claimed.inboxAwaitingConfirmation) {
+        // Keep unknown acceptance single-flight in the recovered process, too.
+        // No receipt is invented and a resume does not submit a second copy.
+        pendingInboxDelivery = {
+          ids: claimed.inboxAwaitingConfirmation.messageIds, token: ++deliveryToken,
+          confirmed: false, ackAttempts: 0, ackInFlight: false, ackLeaseLost: false,
+          diagnosticAttempts: 0, diagnosticShown: false, startedAt: claimed.inboxAwaitingConfirmation.since,
+        };
+        await reportUnknownDelivery(pendingInboxDelivery);
+      }
+      if (sessionStopping) return;
+      if (isTeammate) {
+        atomicWriteFileSync(path.join(paths.teamDir(teamName), `${agentName}.pid`), process.pid.toString());
+        ctx.ui.setStatus("00-pi-teams", `[${agentName.toUpperCase()}]`);
+      } else ctx.ui.setStatus("pi-teams", `Lead @ ${teamName}`);
+      if (!isTeammate) {
+        recoveryOutcomes = await restoreTeamPanes({ team: teamName, leaderInstanceId: runtimeInstanceId,
+          terminal, piBinary: getPiLaunchCommand(), anchorPaneId: process.env.TMUX_PANE,
+          current: () => !sessionStopping });
+        if (!sessionStopping && recoveryOutcomes.length) ctx.ui.notify(
+          recoveryOutcomes.map(item => `${item.name}: ${item.status}${item.note ? ` — ${item.note}` : ""}`).join("\n"),
+          recoveryOutcomes.some(item => item.status === "blocked") ? "warning" : "info");
+      }
+      if (!sessionStopping) startInboxPolling();
+      if (!sessionStopping && terminal) terminal.setTitle(`${teamName}: ${agentName}`);
+    } catch (error) {
+      if (attached) {
+        // A PID-file/UI/pane-restoration failure after successful admission must
+        // not strand our live runtime lease without its inbox consumer.
+        if (!sessionStopping) startInboxPolling();
+      } else {
+        stopInboxPolling();
+        teamName = null;
+        agentName = "team-lead"; isTeammate = false;
+      }
+      ctx.ui.notify(`Team recovery ${attached ? "attached with a restoration fault" : "blocked"}: ${error instanceof Error ? error.message : String(error)}`, "error");
     }
+  }
+
+  pi.registerCommand("team-resume", {
+    description: "Attach this exact saved Pi conversation, explicitly associate an unmapped dead legacy lead, or retry its missing tmux panes. Never forces a live owner.",
+    handler: async (args, ctx) => {
+      const requested = paths.sanitizeName(args.trim());
+      if (!requested) throw new Error("Usage: /team-resume <team>");
+      if (sessionStopping) throw new Error("Session is detaching");
+      const actual = sessionIdentity(ctx);
+      if (!actual) throw new Error("Persistent Pi session required");
+      if (teamName && (teamName !== requested || isTeammate)) throw new Error("Already attached to another team/member");
+      if (!teamName) {
+        const saved = findSessionMember(actual);
+        if (saved && (saved.teamName !== requested || saved.member.agentType !== "lead")) throw new Error("This conversation is already bound to another team/member");
+        await claimSession({ team: requested, agent: "team-lead", identity: actual,
+          instanceId: runtimeInstanceId, pid: process.pid, processStartToken, manualAssociation: true,
+          paneId: process.env.TMUX_PANE, current: () => !sessionStopping });
+        // Now metadata has an exact mapping; use the normal attachment path.
+        await attachSession({ reason: "resume" }, ctx);
+      } else {
+        recoveryOutcomes = await restoreTeamPanes({ team: requested, leaderInstanceId: runtimeInstanceId,
+          terminal, piBinary: getPiLaunchCommand(), anchorPaneId: process.env.TMUX_PANE,
+          current: () => !sessionStopping });
+        if (!sessionStopping) ctx.ui.notify(recoveryOutcomes.map(item => `${item.name}: ${item.status}${item.note ? ` — ${item.note}` : ""}`).join("\n") || "No missing roster members.", "info");
+      }
+    },
   });
 
   pi.on("message_end", async (event) => {
@@ -1192,15 +1278,31 @@ export default function (pi: ExtensionAPI) {
       const messageId = pending.ids.find(id => text.includes(`Message-ID: ${id}`));
       if (messageId) {
         try {
+          const receiptRun = runtimeGeneration;
+          const receiptCurrent = () => !sessionStopping && !locallyInterrupted
+            && agentLoopActive && runtimeGeneration === receiptRun;
           const noted = await noteInspectionAccepted(teamName, {
             messageId,
             leaderInstanceId: runtimeInstanceId,
-            runGeneration: runtimeGeneration,
+            runGeneration: receiptRun,
             deliveredText: text,
+            commitGuard: async () => {
+              if (!receiptCurrent()) return false;
+              const lease = await runtime.readRuntimeStatus(teamName!, agentName);
+              return receiptCurrent() && lease?.instanceId === runtimeInstanceId && lease.activity !== "stopped";
+            },
           });
           if (noted.accepted && noted.generation !== undefined) {
-            acceptedInspection = { messageId, generation: noted.generation, runGeneration: runtimeGeneration };
-            inspectionAckPending = false;
+            const accepted = { messageId, generation: noted.generation, runGeneration: receiptRun };
+            if (receiptCurrent()) {
+              acceptedInspection = accepted;
+              inspectionAckPending = false;
+            } else {
+              // Interruption/replacement after a committed receipt must not lose
+              // the durable acceptance nor let an unrelated run acknowledge it.
+              retainInspectionRelease(accepted);
+              await attemptInspectionRelease(true);
+            }
           }
         } catch {
           // Inbox acknowledgement below still proceeds. A later settlement retry
@@ -1347,6 +1449,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_shutdown", async () => {
+    const wasPaused = locallyInterrupted;
     // Block injection before the first await, same as an aborted settlement.
     sessionStopping = true;
     runtimeGeneration += 1;
@@ -1363,10 +1466,11 @@ export default function (pi: ExtensionAPI) {
     if (!teamName) return;
     await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
       activity: "stopped",
+      detached: true,
+      ...(wasPaused ? { paused: true } : {}),
       pid: process.pid,
       processStartToken,
       lastHeartbeatAt: Date.now(),
-      inboxAwaitingConfirmation: undefined,
     });
     // File-only check. Do not inject into this stopping session.
     await admitQuiescenceInspection(teamName, { isMemberAlive }).catch(() => undefined);
@@ -1450,6 +1554,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   function isMemberAlive(team: string, member: Member, runtimeStatus?: runtime.AgentRuntimeStatus | null): boolean {
+    if (member.session) return !!runtimeStatus && !runtimeStatus.detached
+      && runtimeStatus.sessionId === member.session.id && runtimeStatus.sessionFile === member.session.file
+      && runtime.isRuntimeProcessAlive(runtimeStatus);
     if (runtimeStatus?.pid !== undefined) {
       if (!runtime.isRuntimeProcessAlive(runtimeStatus)) return false;
       if (!runtimeStatus.processStartToken) {
@@ -1497,7 +1604,11 @@ export default function (pi: ExtensionAPI) {
       liveness: alive ? "alive" as const : "dead" as const,
       model: member.model,
       thinking: member.thinking,
+      modelThinkingSource: "spawn-time hints; current/restored Pi session can differ",
+      recoveryOutcome: recoveryOutcomes.find(item => item.name === member.name),
       awaitingConfirmation: runtimeStatus?.inboxAwaitingConfirmation,
+      session: member.session ? { id: member.session.id, confirmed: member.session.confirmed } : undefined,
+      recovery: member.recovery,
       runtime: runtimeStatus,
     };
   }
@@ -1545,6 +1656,14 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  function spawnEnvironment(team: string, agent: string, session?: Member["session"]): Record<string, string> {
+    const env: Record<string, string> = { ...process.env as Record<string, string>, PI_TEAM_NAME: team, PI_AGENT_NAME: agent };
+    delete env.PI_SESSION_ID; delete env.PI_SESSION_FILE;
+    delete env.PI_TEAM_HANDOFF_TOKEN; delete env.PI_TEAM_RECOVERY_TOKEN;
+    if (session?.agentDir) env.PI_CODING_AGENT_DIR = session.agentDir;
+    return env;
+  }
+
   async function spawnTeammateProcess(
     safeTeamName: string,
     safeName: string,
@@ -1561,24 +1680,10 @@ export default function (pi: ExtensionAPI) {
       throw new Error(`Separate windows mode is not supported in ${terminal.name}.`);
     }
 
-    const piCmd = buildPiCommand(getPiLaunchCommand(), chosenModel, thinking);
-    const env: Record<string, string> = {
-      ...process.env,
-      PI_TEAM_NAME: safeTeamName,
-      PI_AGENT_NAME: safeName,
-    };
-
-    if (useSeparateWindow) {
-      const terminalId = terminal.spawnWindow({
-        name: safeName,
-        cwd,
-        command: piCmd,
-        env,
-        teamName: safeTeamName,
-      });
-      await teams.updateMember(safeTeamName, safeName, { windowId: terminalId });
-      return { terminalId, isWindow: true };
-    }
+    if (sessionStopping) throw new Error("Session detached before teammate launch");
+    const reserved = (await teams.readConfig(safeTeamName)).members.find(m => m.name === safeName);
+    const piCmd = buildPiCommand(getPiLaunchCommand(), chosenModel, thinking, undefined, reserved?.session?.file);
+    const env = spawnEnvironment(safeTeamName, safeName, reserved?.session);
 
     if (terminal instanceof Iterm2Adapter) {
       const teammates = teamConfig.members.filter((m: Member) => m.agentType === "teammate" && m.tmuxPaneId.startsWith("iterm_"));
@@ -1593,15 +1698,11 @@ export default function (pi: ExtensionAPI) {
       ? leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined
       : undefined;
 
-    const terminalId = terminal.spawn({
-      name: safeName,
-      cwd,
-      command: piCmd,
-      env,
-      anchorPaneId,
-    });
-    await teams.updateMember(safeTeamName, safeName, { tmuxPaneId: terminalId });
-    return { terminalId, isWindow: false };
+    if (!reserved?.session) throw new Error("Member has no reserved Pi session");
+    return launchReservedMember({ team: safeTeamName, agent: safeName, session: reserved.session,
+      ownerInstanceId: runtimeInstanceId, terminal, separateWindow: useSeparateWindow,
+      options: { name: safeName, cwd, command: piCmd, env, anchorPaneId, teamName: safeTeamName },
+      current: () => !sessionStopping, authority: teamName ? { team: teamName, agent: agentName } : undefined });
   }
 
   function delegatedTaskPrompt(task: any, prompt: string | undefined): string {
@@ -1611,6 +1712,17 @@ export default function (pi: ExtensionAPI) {
       task.description,
       prompt ? `\nAdditional instructions:\n${prompt}` : "",
     ].filter(Boolean).join("\n");
+  }
+
+  async function attachCreatedTeam(name: string, ctx: any): Promise<void> {
+    identity = sessionIdentity(ctx) ?? identity;
+    if (!identity) throw new Error("A persistent Pi session is required to create a recoverable team");
+    await teams.updateMember(name, "team-lead", { session: identity, cwd: identity.cwd });
+    await claimSession({ team: name, agent: "team-lead", identity, instanceId: runtimeInstanceId,
+      pid: process.pid, processStartToken, paneId: process.env.TMUX_PANE, current: () => !sessionStopping });
+    if (sessionStopping) throw new Error("Session changed while creating the team");
+    teamName = name;
+    startInboxPolling();
   }
 
   // Tools
@@ -1628,30 +1740,15 @@ export default function (pi: ExtensionAPI) {
       if (teamName) {
         throw new Error(`This lead session is already bound to team ${teamName}; shut it down before creating another team`);
       }
-      // Auto-cleanup stale team if the previous lead process is dead
-      // This handles the case where a session was aborted and restarted
       if (teams.teamExists(params.team_name)) {
-        const cleaned = cleanupStaleTeam(params.team_name, terminal);
-        if (!cleaned && teams.teamExists(params.team_name)) {
-          throw new Error(`Team ${params.team_name} already exists and has an active or recoverable lead session`);
-        }
+        throw new Error(`Team ${params.team_name} already exists; resume its original Pi session (data preserved)`);
       }
+      identity = sessionIdentity(ctx) ?? identity;
+      if (!identity) throw new Error("A persistent Pi session is required to create a recoverable team");
       
-      const config = await teams.createTeam(params.team_name, "local-session", "lead-agent", params.description, params.default_model, params.separate_windows);
-      // Register this session as the lead so it can receive inbox messages
-      registerLeadSession(params.team_name);
-      // Update teamName and start inbox polling for the lead
-      teamName = params.team_name;
-      await runtime.setRuntimeActivity(params.team_name, agentName, "running", {
-        instanceId: runtimeInstanceId,
-        pid: process.pid,
-        processStartToken,
-        startedAt: Date.now(),
-        activityChangedAt: Date.now(),
-        lastHeartbeatAt: Date.now(),
-        lastError: undefined,
-      });
-      startInboxPolling();
+      if (findSessionMember(identity)) throw new Error("This conversation already has a team/member binding");
+      const config = await teams.createTeam(params.team_name, identity.id, "lead-agent", params.description, params.default_model, params.separate_windows);
+      await attachCreatedTeam(params.team_name, ctx);
       return {
         content: [{ type: "text", text: `Team ${params.team_name} created.` }],
         details: { config },
@@ -1688,14 +1785,18 @@ export default function (pi: ExtensionAPI) {
       let member = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
       const memberRuntime = member ? await runtime.readRuntimeStatus(safeTeamName, member.name) : null;
       const memberAlive = member ? isMemberAlive(safeTeamName, member, memberRuntime) : false;
-      const willSpawn = !member || reuse === "replace" || !memberAlive;
+      const restoreExisting = !!member && reuse === "existing" && !memberAlive;
+      const willSpawn = !member || reuse === "replace";
+      if (restoreExisting && member?.recovery && ["reserved", "launched"].includes(member.recovery.phase)) {
+        throw new Error("Original member launch is still unconfirmed; not replacing its session or duplicating it");
+      }
       const requestedSeparateWindow = params.separate_window ?? teamConfig.separateWindows ?? false;
 
       if (member && reuse === "error") {
         throw new Error(`Teammate ${safeName} already exists in team ${safeTeamName}`);
       }
 
-      if (member && memberAlive && reuse === "existing" && member.cwd && path.resolve(member.cwd) !== path.resolve(params.cwd)) {
+      if (member && reuse === "existing" && member.cwd && path.resolve(member.cwd) !== path.resolve(params.cwd)) {
         throw new Error(`Teammate ${safeName} is already running in ${member.cwd}. Use reuse="replace" to restart it in ${params.cwd}.`);
       }
 
@@ -1708,7 +1809,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      if (member && (reuse === "replace" || !memberAlive)) {
+      if (member && reuse === "replace") {
         await killTeammate(safeTeamName, member);
         await teams.removeMember(safeTeamName, safeName);
         member = undefined;
@@ -1744,6 +1845,7 @@ export default function (pi: ExtensionAPI) {
           prompt: delegatedTaskPrompt(task, params.prompt),
           color: "blue",
           thinking: chosenThinking,
+          session: allocateSession(safeTeamName, params.cwd),
         };
 
         try {
@@ -1804,6 +1906,10 @@ export default function (pi: ExtensionAPI) {
           isWindow = spawnResult.isWindow;
           spawned = true;
         } catch (error) {
+          if ((error as { mayHaveLaunched?: boolean }).mayHaveLaunched) {
+            await openFormalGeneration(safeTeamName);
+            throw new Error(`Launch unconfirmed for ${safeName}; task ${task.id}, inbox and original session retained. ${String(error)}`);
+          }
           await teams.removeMember(safeTeamName, safeName);
           const inbox = paths.inboxPath(safeTeamName, safeName);
           if (fs.existsSync(inbox)) fs.unlinkSync(inbox);
@@ -1819,16 +1925,19 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // Successful delegate/redelegate is the formal work boundary. A failed
-      // spawn returns above and must not arm an inspection for work that was rolled back.
+      const restoreOutcome = restoreExisting ? (await restoreTeamPanes({ team: safeTeamName,
+        leaderInstanceId: runtimeInstanceId, terminal, piBinary: getPiLaunchCommand(),
+        anchorPaneId: process.env.TMUX_PANE, members: [safeName], current: () => !sessionStopping }))[0] : undefined;
+      // Restoration itself does not arm a generation; this new assignment does,
+      // even if its original-session pane recovery is blocked.
       await openFormalGeneration(safeTeamName);
 
       return {
         content: [{
           type: "text",
-          text: `Task ${task.id} delegated to ${safeName}${spawned ? ` in ${isWindow ? "window" : "pane"} ${terminalId}` : ""}.`,
+          text: `Task ${task.id} delegated to ${safeName}${spawned ? ` in ${isWindow ? "window" : "pane"} ${terminalId}` : ""}.${restoreOutcome ? ` Original-session recovery: ${restoreOutcome.status} — ${restoreOutcome.note ?? ""}` : ""}`,
         }],
-        details: { task: assigned, teammate: member, spawned, terminalId, isWindow },
+        details: { task: assigned, teammate: member, spawned, terminalId, isWindow, restoreOutcome },
       };
     },
   });
@@ -1851,7 +1960,8 @@ export default function (pi: ExtensionAPI) {
 
       const teamConfig = await teams.readConfig(safeTeamName);
       const cwd = params.cwd || process.cwd();
-      const piCmd = buildPiCommand(getPiLaunchCommand(), teamConfig.defaultModel);
+      const handoffSession = allocateSession(safeTeamName, cwd);
+      const piCmd = buildPiCommand(getPiLaunchCommand(), teamConfig.defaultModel, undefined, undefined, handoffSession.file);
 
       const handoffToken = randomUUID();
       const handoffStartedAt = Date.now();
@@ -1870,21 +1980,30 @@ export default function (pi: ExtensionAPI) {
           lastError: undefined,
         },
         ["starting", "queued", "running", "idle"],
+        () => !sessionStopping,
       );
       if (!placeholder) {
         throw new Error("This lead session no longer owns the active runtime lease");
       }
       stopInboxPolling();
 
-      const env = {
-        ...process.env,
-        PI_TEAM_NAME: safeTeamName,
-        PI_AGENT_NAME: "team-lead",
-        PI_TEAM_HANDOFF_TOKEN: handoffToken,
-      };
+      const env = { ...spawnEnvironment(safeTeamName, "team-lead", handoffSession), PI_TEAM_HANDOFF_TOKEN: handoffToken };
+      const updateHandoffMember = (updates: Partial<Member>, expectedId: string | undefined) => withLock(paths.configPath(safeTeamName), async () => {
+        const config = JSON.parse(fs.readFileSync(paths.configPath(safeTeamName), "utf8"));
+        const lead = config.members.find((item: Member) => item.name === "team-lead");
+        if (sessionStopping || !lead || lead.session?.id !== expectedId) throw new Error("handoff binding was superseded");
+        Object.assign(lead, updates);
+        if (updates.session) config.leadSessionId = updates.session.id;
+        atomicWriteJsonSync(paths.configPath(safeTeamName), config);
+      });
       try {
-        const windowId = terminal.spawnWindow({ name: "team-lead", cwd, command: piCmd, env, teamName: safeTeamName });
-        await teams.updateMember(safeTeamName, "team-lead", { windowId });
+        await updateHandoffMember({ session: handoffSession }, identity?.id);
+        const windowId = await withLock(paths.runtimeStatusPath(safeTeamName, agentName), async () => {
+          const lease = runtime.readRuntimeStatusSync(safeTeamName, agentName);
+          if (sessionStopping || lease?.instanceId !== handoffToken || lease.activity !== "starting") throw new Error("handoff authority lost before launch");
+          return terminal.spawnWindow({ name: "team-lead", cwd, command: piCmd, env, teamName: safeTeamName });
+        });
+        await updateHandoffMember({ windowId }, handoffSession.id);
         teamName = null;
         ctx.ui.setStatus("pi-teams", undefined);
         setTimeout(() => ctx.shutdown(), 250);
@@ -1908,13 +2027,15 @@ export default function (pi: ExtensionAPI) {
             lastError: runtime.createRuntimeError(e),
           },
           "starting",
+          () => !sessionStopping,
         ).catch(() => null);
         if (restored) {
+          await updateHandoffMember({ session: identity }, handoffSession.id);
           startInboxPolling();
         } else {
           teamName = null;
           ctx.ui.setStatus("pi-teams", undefined);
-          setTimeout(() => ctx.shutdown(), 0);
+          if (!sessionStopping) setTimeout(() => ctx.shutdown(), 0);
         }
         throw new Error(`Failed: ${e}`);
       }
@@ -2259,7 +2380,8 @@ export default function (pi: ExtensionAPI) {
       const taskList = await tasks.listTasks(params.team_name);
       const members = await Promise.all(config.members.map(member => memberSnapshot(params.team_name, member)));
 
-      const result = { team: config.name, members, tasks: taskList };
+      const result = { team: config.name, members, tasks: taskList,
+        recovery: params.team_name === teamName ? recoveryOutcomes : undefined };
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         details: result,
@@ -2280,8 +2402,10 @@ export default function (pi: ExtensionAPI) {
       const member = config.members.find(m => m.name === params.agent_name);
       if (!member) throw new Error(`Teammate ${params.agent_name} not found`);
 
-      await killTeammate(params.team_name, member);
+      // Persist removal before fallible process cleanup, so recovery can never
+      // race a shutdown approval into resurrecting the same roster entry.
       await teams.removeMember(params.team_name, params.agent_name);
+      await killTeammate(params.team_name, member);
       return {
         content: [{ type: "text", text: `Teammate ${params.agent_name} has been shut down.` }],
         details: {},
@@ -2374,20 +2498,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Create the team
-      const config = await teams.createTeam(params.team_name, "local-session", "lead-agent", `Predefined team: ${params.predefined_team}`, params.default_model, params.separate_windows);
-      registerLeadSession(params.team_name);
-      // Update teamName and start inbox polling for the lead
-      teamName = params.team_name;
-      await runtime.setRuntimeActivity(params.team_name, agentName, "running", {
-        instanceId: runtimeInstanceId,
-        pid: process.pid,
-        processStartToken,
-        startedAt: Date.now(),
-        activityChangedAt: Date.now(),
-        lastHeartbeatAt: Date.now(),
-        lastError: undefined,
-      });
-      startInboxPolling();
+      identity = sessionIdentity(ctx) ?? identity;
+      if (!identity) throw new Error("A persistent Pi session is required to create a recoverable team");
+      if (findSessionMember(identity)) throw new Error("This conversation already has a team/member binding");
+      const config = await teams.createTeam(params.team_name, identity.id, "lead-agent", `Predefined team: ${params.predefined_team}`, params.default_model, params.separate_windows);
+      await attachCreatedTeam(params.team_name, ctx);
 
       const agentDefinitions = predefined.getAllAgentDefinitions(projectDir);
       const spawnResults: Array<{ name: string; status: string; error?: string }> = [];
@@ -2444,6 +2559,7 @@ export default function (pi: ExtensionAPI) {
             prompt: agentDef.prompt,
             color: "blue",
             thinking: chosenThinking,
+            session: allocateSession(safeTeamName, params.cwd),
           };
 
           await teams.addMember(safeTeamName, member);
@@ -2458,57 +2574,12 @@ export default function (pi: ExtensionAPI) {
           });
           await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, agentDef.prompt, "Initial prompt from predefined team");
 
-          const piCmd = buildPiCommand(getPiLaunchCommand(), chosenModel, chosenThinking);
-
-          const env: Record<string, string> = {
-            ...process.env,
-            PI_TEAM_NAME: safeTeamName,
-            PI_AGENT_NAME: safeName,
-          };
-
-          let terminalId = "";
-          let isWindow = false;
-
           try {
-            if (useSeparateWindow) {
-              isWindow = true;
-              terminalId = terminal.spawnWindow({
-                name: safeName,
-                cwd: params.cwd,
-                command: piCmd,
-                env: env,
-                teamName: safeTeamName,
-              });
-              await teams.updateMember(safeTeamName, safeName, { windowId: terminalId });
-            } else {
-              if (terminal instanceof Iterm2Adapter) {
-                const teammates = (await teams.readConfig(safeTeamName)).members.filter(m => m.agentType === "teammate" && m.tmuxPaneId.startsWith("iterm_"));
-                const lastTeammate = teammates.length > 0 ? teammates[teammates.length - 1] : null;
-                if (lastTeammate?.tmuxPaneId) {
-                  terminal.setSpawnContext({ lastSessionId: lastTeammate.tmuxPaneId.replace("iterm_", "") });
-                } else {
-                  terminal.setSpawnContext({});
-                }
-              }
-
-              const leadMember = (await teams.readConfig(safeTeamName)).members.find(m => m.name === "team-lead");
-              const anchorPaneId = terminal.name === "tmux"
-                ? leadMember?.tmuxPaneId || process.env.TMUX_PANE || undefined
-                : undefined;
-
-              terminalId = terminal.spawn({
-                name: safeName,
-                cwd: params.cwd,
-                command: piCmd,
-                env: env,
-                anchorPaneId,
-              });
-              await teams.updateMember(safeTeamName, safeName, { tmuxPaneId: terminalId });
-            }
-
+            await spawnTeammateProcess(safeTeamName, safeName, params.cwd, chosenModel, chosenThinking,
+              useSeparateWindow, await teams.readConfig(safeTeamName));
             spawnResults.push({ name: agentName, status: "spawned", error: undefined });
           } catch (e) {
-            spawnResults.push({ name: agentName, status: "error", error: `Failed to spawn: ${e}` });
+            spawnResults.push({ name: agentName, status: (e as { mayHaveLaunched?: boolean }).mayHaveLaunched ? "launch-unknown" : "error", error: `Failed to confirm spawn; member/session preserved: ${e}` });
           }
         } catch (e) {
           spawnResults.push({ name: agentName, status: "error", error: String(e) });
@@ -2516,7 +2587,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       const summary = spawnResults.map(r => `${r.name}: ${r.status}${r.error ? ` (${r.error})` : ""}`).join("\n");
-      if (spawnResults.some(result => result.status === "spawned")) {
+      if (spawnResults.some(result => result.status === "spawned" || result.status === "launch-unknown")) {
         await openFormalGeneration(paths.sanitizeName(params.team_name));
       }
 
@@ -2623,4 +2694,17 @@ You can now use this template with:
       };
     },
   });
+
+  return () => {
+    // Synchronous invalidation precedes any lock wait during session replacement.
+    sessionStopping = true;
+    runtimeGeneration += 1;
+    stopInboxPolling();
+    clearPendingInterrupt();
+    clearPendingResume();
+    clearPendingInboxDelivery();
+    clearPendingInspectionRelease();
+    acceptedInspection = undefined;
+    inspectionAckPending = false;
+  };
 }

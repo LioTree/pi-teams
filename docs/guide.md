@@ -297,7 +297,13 @@ This helps you catch blockers early and provide feedback.
 
 **Problem**: A teammate shows activity `interrupted`.
 
-The user aborted that session. Its tasks stay owned, its inbox stays unread, and pi-teams will not inject those messages or resume the run. A lead's indefinite `team_wait` also stays open while that process is alive. Resume it by typing a new prompt in that session. Selecting a model does not start execution, and there is no remote resume command. If the process has actually stopped or died, it no longer holds the wait. A direct prompt does not resend an inbox attempt whose host acceptance is still unknown; that attempt stays unread until Pi confirms it or a person starts a new process.
+The user aborted that session. Its tasks stay owned, its inbox stays unread, and pi-teams will not inject those messages or resume the run. A lead's indefinite `team_wait` also stays open while that process is alive. Resume it by typing a new prompt in that session. Selecting a model does not start execution, and there is no remote resume command. If the process has actually stopped or died, it no longer holds the wait. A direct prompt does not resend an inbox attempt whose host acceptance is still unknown. Persisted unknown-acceptance evidence remains single-flight across recovery, too; no restart is an acceptance receipt.
+
+### Recovering after Pi or terminal exit
+
+Resume the original lead conversation. Exact Pi session identity reconnects its inbox and restores missing roster peers' original sessions in tmux panes; live peers are retained. Manual quit, Ctrl+D, and terminal loss do not remove roster intent. Explicit member removal or destructive `team_shutdown` does. Dissolution deletes roster/tasks/inbox, not Pi chat history: original conversations remain available for manual `/resume` without automatic team reattachment. Recovery never replays assignments/continuation prompts or resumes interrupted work; restoring context does not roll back background tools or filesystem effects.
+
+Missing/corrupt/unmapped sessions are reported without deletion or fresh replacement. For an unmapped legacy lead whose old process is gone, `/team-resume <team>` explicitly associates this saved conversation. A current lead may use it for one bounded pane retry. It never forces a live owner or guesses recent chat files. Automatic pane restoration is tmux-only; other adapters can recover the lead inbox. See [design and migration limits](design/team-session-recovery.md).
 
 ### tmux Pane Issues
 

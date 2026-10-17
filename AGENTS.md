@@ -78,6 +78,10 @@ Use automated hooks to ensure standards.
 - **Parallel Testing**: Running different test suites in parallel.
 - **Code Review**: Having one agent write code and another (specialized) agent review it.
 
+## Session Recovery
+
+Resume the original lead Pi conversation to reconnect its inbox and restore missing roster peers' original sessions in tmux panes. Live owners/peers are never force-replaced. Process exit (even manual quit) leaves recovery intent in the roster; explicit member removal or destructive `team_shutdown` removes it. Dissolution deletes roster/tasks/mail, not Pi chat history; manual `/resume` remains possible without automatic team reattachment. Recovery never replays assignments, sends a continuation prompt, or opens a work generation; interrupted sessions remain paused. Missing session mappings/files are reported with data preserved. `/team-resume <team>` is a narrow legacy dead-lead association/current-lead retry, not force takeover. New/fork/clone conversations do not inherit membership. Context recovery is not rollback of background tools or filesystem effects.
+
 ## ⚠️ Best Practices
 - **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.
 - **Clear Prompts**: Be specific about the teammate's role and boundaries when spawning.

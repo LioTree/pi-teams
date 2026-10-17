@@ -2,6 +2,15 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
+export interface TeamSession {
+  id: string;
+  file: string;
+  cwd: string;
+  confirmed: boolean;
+  agentDir?: string;
+  trustArg?: "--approve" | "--no-approve";
+}
+
 export interface Member {
   agentId: string;
   name: string;
@@ -19,6 +28,13 @@ export interface Member {
   planModeRequired?: boolean;
   backendType?: string;
   isActive?: boolean;
+  session?: TeamSession;
+  recovery?: {
+    token: string;
+    ownerInstanceId: string;
+    phase: "reserved" | "launched" | "attached" | "failed";
+    error?: string;
+  };
 }
 
 export interface TeamConfig {

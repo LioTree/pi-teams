@@ -222,7 +222,8 @@ describe("before_agent_start registered by the extension factory", () => {
       expect(section).toContain("Create a team with team_create");
       expect(event.systemPromptOptions.sections.magic_context).toBe(`Magic Context supplied for turn ${turn}`);
     }
-    expect(mocks.existsSync).toHaveBeenCalled();
+    // Identity lookup belongs to session_start, not factory/PID discovery.
+    expect(mocks.existsSync).not.toHaveBeenCalled();
     expect(mocks.readConfig).not.toHaveBeenCalled();
     expect(mocks.updateRuntimeStatusForInstance).not.toHaveBeenCalled();
   });

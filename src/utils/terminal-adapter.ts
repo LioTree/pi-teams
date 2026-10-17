@@ -23,6 +23,8 @@ export interface SpawnOptions {
   teamName?: string;
   /** Optional pane ID to anchor pane-based layouts to a specific origin pane */
   anchorPaneId?: string;
+  /** Durable nonce to reconcile a launch whose parent metadata commit failed. */
+  recoveryToken?: string;
 }
 
 /**
@@ -33,6 +35,7 @@ export interface SpawnOptions {
 export interface TerminalAdapter {
   /** Unique name identifier for this terminal type */
   readonly name: string;
+  findRecoveryPane?(token: string): string | undefined;
 
   /**
    * Detect if this terminal is currently available/active.

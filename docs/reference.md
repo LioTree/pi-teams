@@ -265,7 +265,7 @@ An attempt whose acceptance is unknown stays single-flight in that live process.
 
 The batch is marked read only after Pi emits `message_end` for the user message containing `[pi-teams inbox delivery]` and that batch's `Message-ID`, and only if the acknowledgement commit still owns a live unpaused lease. That confirmation clears the unknown-acceptance diagnostic immediately, even if the mailbox acknowledgement then fails. A failed acknowledgement stays a separate metadata retry. It does not inject the prompt again, and interruption pauses that retry without acknowledging. A later direct run resumes the metadata acknowledgement only. Stop, shutdown, or lease loss before the commit leaves the mail unread.
 
-A preflight rejection or handled input is not a distinct signal on this void host API, so those attempts also stay unknown and unread. A direct prompt in the same process does not reset an unknown attempt. Starting a new process is deliberate human recovery and can submit the still-unread message again. That is not exactly-once delivery, and it is not a guarantee that every future Pi 1.x host or restart confirms acceptance the same way.
+A preflight rejection or handled input is not a distinct signal on this void host API, so those attempts also stay unknown and unread. A direct prompt in the same process does not reset an unknown attempt. Starting a new process is deliberate human recovery, not an acceptance receipt. Persisted unknown-acceptance diagnostics stay single-flight rather than being silently cleared or resubmitted. If a crash happened before that evidence was stored, a new process may submit still-unread mail again; this is not exactly-once delivery or a guarantee about future Pi 1.x hosts.
 
 If the teammate is busy, messages stay unread until its next idle delivery. While an unknown attempt is outstanding, idle polls do not inject that attempt again or start a later batch. If it is blocked inside `team_wait`, the active wait consumes the message and resumes the agent. This keeps teammates responsive without asking them to call `team_wait` just to idle.
 
@@ -319,6 +319,18 @@ Activity describes coordination state separately from process liveness:
 `team_status` and `check_teammate` expose both liveness and activity. This lets `team_wait` distinguish a long-running job from a team in which every remaining member is idle or waiting, and from a live interrupted peer that must keep an indefinite wait open. Routine per-teammate idle notices are not sent; the team-wide quiescence fallback below wakes the lead once per formally dispatched work generation when the whole team is quiescent.
 
 ---
+
+## Persistent Session Recovery
+
+Teams bind each member to its actual Pi session ID and canonical absolute file. Resuming the original conversation can reclaim a dead/detached owner's lease; a live owner is refused. New, forked, cloned, or unrelated same-PID conversations do not inherit ownership. The explicit `spawn_lead_window` token handoff remains supported.
+
+On original lead attachment, one bounded tmux pass restores missing roster peers using their original `--session` file/cwd/agent directory/trust override, without model/thinking defaults, assignment replay, or synthetic continuation. Existing live processes are retained even if their pane ID is stale. Recovery does not dispatch work or change tasks/mail/generations. Interrupted state and known unknown-acceptance diagnostics survive startup; they do not become proof of acceptance or an automatic resume.
+
+Roster membership is recovery intent, including manual quit/Ctrl+D/terminal loss. Only explicit removal or destructive `team_shutdown` prevents restoration. Worker chats are allocated in Pi's persistent session storage outside team/task directories; dissolution removes roster/tasks/inbox, not conversation history. Manual `/resume` does not recreate removed membership. Session context restoration does not roll back background tools or external effects. Missing/corrupt/unconfirmed files and unmapped legacy peers are individually blocked with data preserved. Other adapters recover the lead inbox but report missing-pane restoration unsupported.
+
+`/team-resume <team>` explicitly associates an unmapped legacy lead only after both old runtime/advisory process authority are gone; an existing mapping must match this exact conversation. It never forces a live owner or searches chat files. A currently attached lead can use the command for a bounded pane retry. Unknown launch outcomes remain reserved and blocked unless an exact tmux nonce reconciles them; no automatic respawn loop runs.
+
+See [the design](design/team-session-recovery.md) for migration, partial-failure, restart, and exactly-once limits.
 
 ## Team Quiescence Fallback
 

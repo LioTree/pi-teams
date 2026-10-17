@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import extension from "./index";
+import { fixtureSession } from "./session-test-fixture";
 import type { Member } from "../src/utils/models";
 import * as messaging from "../src/utils/messaging";
 import * as paths from "../src/utils/paths";
@@ -115,6 +116,7 @@ function loadExtension(agentName: string): LoadedExtension {
   const tools = new Map<string, RegisteredTool>();
   const sent: string[] = [];
   const ctx = {
+    sessionManager: fixtureSession(root, teamName, agentName),
     isIdle: () => true,
     ui: { notify() {}, setStatus() {}, setTitle() {} },
   };
@@ -435,6 +437,10 @@ describe("registered interruption lifecycle", () => {
 
 describe("registered team_wait and messaging tools", () => {
   async function runningLead() {
+    // These sequential wait subcases are successive owners, not simultaneous
+    // resumptions. Relinquish the preceding fixture's runtime lease explicitly.
+    const previous = loaded.filter(item => item.agentName === "team-lead").at(-1);
+    if (previous) await emit(previous, "session_shutdown", { type: "session_shutdown", reason: "quit" });
     const lead = loadExtension("team-lead");
     await startSession(lead);
     await emit(lead, "agent_start");

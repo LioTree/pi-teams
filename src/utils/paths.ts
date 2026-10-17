@@ -40,6 +40,11 @@ export function configPath(teamName: string) {
   return path.join(teamDir(teamName), "config.json");
 }
 
+export function listTeamNames(): string[] {
+  if (!fs.existsSync(TEAMS_DIR)) return [];
+  return fs.readdirSync(TEAMS_DIR).filter(name => /^[a-zA-Z0-9_-]+$/.test(name));
+}
+
 export function leadSessionPath(teamName: string) {
   return path.join(teamDir(teamName), "lead-session.json");
 }

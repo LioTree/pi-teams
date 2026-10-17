@@ -427,6 +427,7 @@ export async function noteInspectionAccepted(
     leaderInstanceId: string;
     runGeneration: number;
     deliveredText: string;
+    commitGuard?: () => Promise<boolean> | boolean;
   },
 ): Promise<{ accepted: boolean; generation?: number }> {
   if (!input.deliveredText.includes(QUIESCENCE_MARKER)) return { accepted: false };
@@ -438,6 +439,7 @@ export async function noteInspectionAccepted(
     const inspection = state.inspection;
     if (!inspection || inspection.messageId !== input.messageId) return { accepted: false };
     if (tagged !== inspection.generation) return { accepted: false };
+    if (input.commitGuard && !await input.commitGuard()) return { accepted: false };
     if (inspection.phase === "accepted") {
       const same = inspection.leaderInstanceId === input.leaderInstanceId
         && inspection.runGeneration === input.runGeneration;

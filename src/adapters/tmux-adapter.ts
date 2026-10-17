@@ -64,6 +64,9 @@ export class TmuxAdapter implements TerminalAdapter {
       .map(([k, v]) => `${k}=${v}`);
 
     const originPaneId = this.getOriginPaneId(options.anchorPaneId);
+    if (options.recoveryToken && !originPaneId) {
+      throw Object.assign(new Error("No verified lead tmux pane anchor; refusing global target selection"), { spawned: false });
+    }
     const tmuxArgs = [
       "split-window",
       "-h", "-dP",
@@ -83,10 +86,14 @@ export class TmuxAdapter implements TerminalAdapter {
     const result = execCommand("tmux", tmuxArgs);
     
     if (result.status !== 0) {
-      throw new Error(`tmux spawn failed with status ${result.status}: ${result.stderr}`);
+      throw Object.assign(new Error(`tmux spawn failed with status ${result.status}: ${result.stderr}`), { spawned: false });
     }
 
     const newPaneId = result.stdout.trim();
+    if (options.recoveryToken) {
+      const tagged = execCommand("tmux", ["set-option", "-p", "-t", newPaneId, "@pi-teams-recovery", options.recoveryToken]);
+      if (tagged.status !== 0) throw new Error("pane launched but recovery nonce could not be recorded; do not retry blindly");
+    }
     const layoutTarget = this.getWindowIdForPane(originPaneId) ?? this.getWindowIdForPane(newPaneId);
 
     // Apply layout to the exact window that contains the spawned pane so the
@@ -94,12 +101,19 @@ export class TmuxAdapter implements TerminalAdapter {
     if (layoutTarget) {
       execCommand("tmux", ["set-window-option", "-t", layoutTarget, "main-pane-width", "60%"]);
       execCommand("tmux", ["select-layout", "-t", layoutTarget, "main-vertical"]);
-    } else {
+    } else if (!options.recoveryToken) {
       execCommand("tmux", ["set-window-option", "main-pane-width", "60%"]);
       execCommand("tmux", ["select-layout", "main-vertical"]);
     }
 
     return newPaneId;
+  }
+
+  findRecoveryPane(token: string): string | undefined {
+    const result = execCommand("tmux", ["list-panes", "-a", "-F", "#{pane_id} #{@pi-teams-recovery}"]);
+    if (result.status !== 0) throw new Error("tmux recovery metadata unavailable");
+    const rows = result.stdout.trim().split("\n").map(row => row.split(" "));
+    return rows.find(([, value]) => value === token)?.[0];
   }
 
   kill(paneId: string): void {

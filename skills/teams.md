@@ -52,6 +52,12 @@ When you are spawned as a teammate:
 - **Formal Follow-ups**: Use `delegate_task` for new or follow-up teammate work. It is the dispatch boundary that arms the quiescence fallback. An ordinary `team_message` does not re-arm it, even if it says to continue.
 - **Read Status**: Use `team_status` to see the full team roster and current task board.
 
+## Session Recovery
+
+Resume the original Pi conversation, not a new/forked/cloned chat: exact session ID/file identifies the team member. Original lead attachment recovers the inbox and makes one bounded tmux pass to restore missing roster peers with their original sessions/model/thinking, retaining live peers. Recovery is not dispatch and never replays tasks or continuation prompts; interrupted work stays paused.
+
+Quitting or losing a terminal leaves roster intent; only explicit removal or destructive `team_shutdown` prevents restoration. This deletes team/task/mail metadata, not Pi conversation history: manual `/resume` remains possible without restoring removed membership. Missing/corrupt/unmapped sessions remain blocked with data preserved. `/team-resume <team>` can explicitly associate an unmapped dead legacy lead or retry panes for the current lead; it cannot force a live owner or guess chat files. Other adapters retain lead inbox recovery but not automatic pane restoration. Restoring context does not roll back background tools or side effects.
+
 ## Team Quiescence Fallback
 
 Routine per-teammate idle notices are not sent. Instead, a formal dispatch arms one team-wide fallback for that work generation:

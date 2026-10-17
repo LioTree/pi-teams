@@ -175,6 +175,16 @@ If you need to clean up agent sessions without shutting down a team, or want to 
 
 ---
 
+## Recovering a Team
+
+Resume the **original lead Pi conversation**. Its exact session ID/file reattaches the inbox; on tmux, missing roster teammates reopen their **original sessions** in new panes. Live peers are kept. Model/thinking history, tasks, and unread mail are preserved; recovery does not replay assignments, send a continuation prompt, or open a new work generation. Interrupted sessions stay paused until direct user input.
+
+Quitting Pi or losing a terminal does not remove membership—even a manual quit remains recoverable. Only explicit member removal or `team_shutdown` prevents restoration. Detaching tmux keeps processes alive; `team_shutdown` deletes roster/tasks/mail, not Pi conversation history; chats remain available for manual `/resume` without automatic team reattachment. It is dissolution, not suspension. Restoring context does not roll back background tools or filesystem effects.
+
+Missing/corrupt session files and unmapped legacy members are reported without deletion or fresh-chat substitution. For a legacy lead with no saved binding and **no live old owner**, explicitly associate the current saved conversation with `/team-resume <team>`; a current lead may also use it for a bounded pane retry. New/forked/cloned conversations never inherit team ownership automatically. Automatic pane restoration currently requires tmux; other adapters can still recover the lead inbox.
+
+See [session recovery design and limits](docs/design/team-session-recovery.md).
+
 ## 🏗️ Predefined Teams
 
 Predefined teams let you define reusable team templates in a `teams.yaml` file. This is perfect for common workflows where you always want the same set of specialists.

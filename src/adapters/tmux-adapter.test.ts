@@ -218,6 +218,26 @@ describe("TmuxAdapter", () => {
     );
   });
 
+  it("records an exact recovery nonce on the new pane and reconciles only that nonce", () => {
+    mockExecCommand.mockImplementation((_bin: string, args: string[]) => {
+      if (args[0] === "split-window") return { stdout: "%42", stderr: "", status: 0 };
+      if (args[0] === "list-panes") return { stdout: "%41 unrelated\n%42 exact-nonce\n", stderr: "", status: 0 };
+      if (args[0] === "display-message") return { stdout: args.at(-1) === "#{pane_id}" ? "%16" : "@7", stderr: "", status: 0 };
+      return { stdout: "", stderr: "", status: 0 };
+    });
+    adapter.spawn({ name: "worker", cwd: "/tmp/path with spaces", command: "pi --session '/tmp/a b.jsonl'",
+      env: {}, anchorPaneId: "%16", recoveryToken: "exact-nonce" });
+    expect(mockExecCommand).toHaveBeenCalledWith("tmux", ["set-option", "-p", "-t", "%42", "@pi-teams-recovery", "exact-nonce"]);
+    expect(adapter.findRecoveryPane("exact-nonce")).toBe("%42");
+    expect(adapter.findRecoveryPane("missing")).toBeUndefined();
+  });
+
+  it("refuses recovery without a verified anchor instead of splitting a globally selected window", () => {
+    mockExecCommand.mockReturnValue({ stdout: "", stderr: "missing", status: 1 });
+    expect(() => adapter.spawn({ name: "worker", cwd: "/tmp", command: "pi", env: {}, recoveryToken: "nonce" })).toThrow("No verified lead");
+    expect(mockExecCommand.mock.calls.some((call: any[]) => call[1][0] === "split-window")).toBe(false);
+  });
+
   it("should target the current pane when setting the title", () => {
     mockExecCommand.mockReturnValue({ stdout: "", stderr: "", status: 0 });
 
