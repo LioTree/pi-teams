@@ -305,6 +305,10 @@ Resume the original lead conversation. Exact Pi session identity reconnects its 
 
 Missing/corrupt/unmapped sessions are reported without deletion or fresh replacement. For an unmapped legacy lead whose old process is gone, `/team-resume <team>` explicitly associates this saved conversation. A current lead may use it for one bounded pane retry. It never forces a live owner or guesses recent chat files. Automatic pane restoration is tmux-only; other adapters can recover the lead inbox. See [design and migration limits](design/team-session-recovery.md).
 
+### Reloading every teammate after an update
+
+Run `/team-reload` in the lead session. Every live member runs Pi's `/reload` on its own once it is safe: busy runs finish first, and pending inbox delivery, inspection bookkeeping, or an active `team_wait` defer it. Interrupted sessions reload and remain paused. A reloading member is never treated as stopped, so the lead does not reopen its pane; the lead's own reload also skips pane restoration (run `/team-resume <team>` to retry it). If a reload fails after starting, the member stays marked `reloading` in `/team-reload status` (shown as `pending (reloading)`) and in `team_status`/`check_teammate` with a frozen `reloadingSince` timestamp: fix the code on disk and reload that pane again to recover. Check progress with `/team-reload status`; a member is `reloaded` only when its newly loaded code has written a receipt. Install the update on disk first (`pi update`/`pi install`). Sessions running an older pi-teams without this command must be reloaded manually once.
+
 ### tmux Pane Issues
 
 **Problem**: tmux panes don't close when killing teammates.

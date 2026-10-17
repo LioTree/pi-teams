@@ -332,6 +332,18 @@ Roster membership is recovery intent, including manual quit/Ctrl+D/terminal loss
 
 See [the design](design/team-session-recovery.md) for migration, partial-failure, restart, and exactly-once limits.
 
+## Team Reload
+
+`/team-reload` (lead only) writes `reload/request.json` in the team directory with a fresh request ID and timestamp, then prints per-member status. `/team-reload status` prints status without writing a request. Teammates calling the command get an error.
+
+Each member's 1s coordination poller checks the request. A request is due when the loaded extension code is older than the request. A due request is executed only when the session is idle (no agent loop, settlement, or stop in progress) and has no pending inbox delivery, unknown inbox acceptance, accepted or unacknowledged inspection, pending inspection release, pending interrupt/resume, or active `team_wait`. Interrupted sessions qualify. The poller then submits the internal `/team-reload-self <id>` command, which calls Pi's `ctx.reload()`; if a run starts in between and the host refuses, the poller retries after 10s.
+
+While reloading, a member's runtime keeps its PID and activity and gains `reloading: true` (plus `reloadingSince`, visible in `team_status` and in quiescence member lists as `reloading extension code`); it is never published as stopped or detached. Peers therefore keep treating it as live: the lead does not restore a duplicate pane for it, its own reload shutdown admits no quiescence inspection (an idle reloading member still counts as idle for the lead's inspection, which annotates it `reloading extension code`), and an interrupted member keeps an indefinite `team_wait` open. The new extension instance re-claims the lease only when the process identity and conversation match: with a process start token (Linux) the token must be defined and equal; without one (other platforms) the matching live PID and session must be accompanied by the `reloading` marker this process's own shutdown wrote. A lead's own reload skips missing-pane restoration; use `/team-resume <team>` to retry it explicitly.
+
+If a reload fails after the shutdown ran (for example a syntax error in the new code), the process stays alive with no pi-teams instance and the `reloading` marker stays behind: the member still shows as live with a frozen `reloadingSince`. Fix the code on disk and run `/reload` in that pane to re-claim (a stranded member has no poller, so a lead-side `/team-reload` cannot reach it). Downgrading to a pi-teams version without this re-claim path is not supported through `/reload`: quit that pane and start a new conversation instead, otherwise the member is stranded as `reloading`.
+
+After reload, the new code sees a request older than its load time and writes `reload/<member>.json` (`requestId`, `pid`, `reloadedAt`). This receipt is what `status` reports as `reloaded`; `pending (reloading)` means a reload is in progress. Loop prevention comes from the reloaded code's newer load time. Interrupted pause state survives the reload. Reload does not open a work generation or change tasks or inbox; re-claiming the session refreshes the member's own session and pane metadata.
+
 ## Team Quiescence Fallback
 
 Formal dispatch opens one work generation. `delegate_task` (new work, follow-up, or re-dispatch of a live teammate) and a successful `create_predefined_team` worker launch open a generation. Team creation alone, draft task creation, direct user prompts, model changes, status polling, ordinary `team_message`, progress updates, and acknowledgements do not.

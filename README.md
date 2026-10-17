@@ -185,6 +185,12 @@ Missing/corrupt session files and unmapped legacy members are reported without d
 
 See [session recovery design and limits](docs/design/team-session-recovery.md).
 
+## Reloading the Whole Team
+
+After updating pi-teams (or any extension) on disk, run `/team-reload` once in the lead session instead of typing `/reload` in every pane. Each live member reloads itself as soon as it is safe: a busy teammate finishes its current run first and is never interrupted, and pending inbox delivery or an active `team_wait` also defers it. Interrupted sessions reload and stay paused. `/team-reload status` shows which members are `reloaded` or still `pending`, without sending a new request.
+
+Reload is not dispatch; it leaves tasks, mail, and work generations unchanged. It only loads code already on disk, so run `pi update`/`pi install` first. Sessions still running a pi-teams version without this feature need one manual `/reload`.
+
 ## 🏗️ Predefined Teams
 
 Predefined teams let you define reusable team templates in a `teams.yaml` file. This is perfect for common workflows where you always want the same set of specialists.

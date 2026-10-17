@@ -9,6 +9,7 @@ import * as runtime from "../src/utils/runtime";
 import { classifyTeamWaitPeer, waitForTeam } from "../src/utils/team-wait";
 import { allocateSession, claimSession, findSessionMember, sessionIdentity, restoreTeamPanes } from "../src/utils/team-session";
 import { launchReservedMember } from "../src/utils/member-launch";
+import { isReloadedFor, readReloadReceipt, readReloadRequest, recordReloaded, reloadDue, requestTeamReload } from "../src/utils/team-reload";
 import { withLock } from "../src/utils/lock";
 import {
   acknowledgeAcceptedInspection,
@@ -37,6 +38,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+
+// Pi reloads extensions without a module cache, so this marks when the code
+// currently running was read from disk.
+const EXTENSION_LOADED_AT = Date.now();
+const RELOAD_SELF_COMMAND = "team-reload-self";
 
 /**
  * Build the command used to relaunch pi for teammate processes.
@@ -509,6 +515,10 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   // Unknown acceptance stays on this object for the life of the process.
   // Timeouts, settlements, unrelated runs, and model selection must not replace it.
   let pendingInboxDelivery: PendingInboxDelivery | null = null;
+  // Set only while this session's own reload command is awaiting ctx.reload().
+  let reloadingForRequest: string | undefined;
+  let reloadDispatchedAt = 0;
+  const RELOAD_DISPATCH_TIMEOUT_MS = 10_000;
   const INTERRUPT_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600, 3200, 5000];
   const INSPECTION_RELEASE_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600, 3200, 5000];
   const ACK_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600, 3200, 5000];
@@ -987,6 +997,47 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     ) {
       await admitQuiescenceInspection(teamName, { isMemberAlive }).catch(() => undefined);
     }
+    dispatchRequestedReload();
+  }
+
+  // A reload replaces this closure, so it must wait until no in-memory duty
+  // (delivery, receipt, inspection ACK/release, activity retry) would be lost.
+  // An interrupted session may reload: its pause is persisted and restored.
+  function reloadIsSafe(): boolean {
+    return !!teamName
+      && !sessionStopping
+      && !settlementActive
+      && !agentLoopActive
+      && !!sessionCtx?.isIdle()
+      && !inboxDeliveryInFlight
+      && !pendingInboxDelivery
+      && !acceptedInspection
+      && !inspectionAckPending
+      && !pendingInspectionRelease
+      && !pendingInterrupt
+      && !pendingResume;
+  }
+
+  function dueReloadRequest() {
+    if (!teamName) return undefined;
+    const request = readReloadRequest(teamName);
+    if (!request) return undefined;
+    const receipt = readReloadReceipt(teamName, agentName);
+    if (EXTENSION_LOADED_AT > request.requestedAt && !isReloadedFor(request, receipt)) {
+      // Code loaded after the request (including by this reload) is current.
+      try { recordReloaded(teamName, agentName, request.id); } catch {}
+    }
+    return reloadDue(request, EXTENSION_LOADED_AT) ? request : undefined;
+  }
+
+  function dispatchRequestedReload() {
+    if (!teamName || sessionStopping || reloadingForRequest || Date.now() - reloadDispatchedAt < RELOAD_DISPATCH_TIMEOUT_MS) return;
+    const request = dueReloadRequest();
+    if (!request || !reloadIsSafe()) return;
+    reloadDispatchedAt = Date.now();
+    // Dispatched as this extension's own command: it reaches no model, starts no
+    // run, and does not resume an interrupted session.
+    pi.sendUserMessage(`/${RELOAD_SELF_COMMAND} ${request.id}`, { expandPromptTemplates: true });
   }
 
   async function acknowledgeInspectionAfterSettlement(): Promise<void> {
@@ -1188,7 +1239,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       const claimed = await claimSession({ team: candidate, agent: memberName, identity,
         instanceId: runtimeInstanceId, pid: process.pid, processStartToken,
         paneId: process.env.TMUX_PANE, handoffToken, recoveryToken: incomingRecoveryToken, legacyReload,
-        current: () => !sessionStopping });
+        sameProcessReload: event.reason === "reload", current: () => !sessionStopping });
       attached = true;
       if (sessionStopping) return;
       teamName = candidate;
@@ -1210,7 +1261,9 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
         atomicWriteFileSync(path.join(paths.teamDir(teamName), `${agentName}.pid`), process.pid.toString());
         ctx.ui.setStatus("00-pi-teams", `[${agentName.toUpperCase()}]`);
       } else ctx.ui.setStatus("pi-teams", `Lead @ ${teamName}`);
-      if (!isTeammate) {
+      // A same-process reload has no lost panes to restore, and peers may be
+      // mid-reload themselves. `/team-resume` remains the explicit retry.
+      if (!isTeammate && event.reason !== "reload") {
         recoveryOutcomes = await restoreTeamPanes({ team: teamName, leaderInstanceId: runtimeInstanceId,
           terminal, piBinary: getPiLaunchCommand(), anchorPaneId: process.env.TMUX_PANE,
           current: () => !sessionStopping });
@@ -1257,6 +1310,45 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
           current: () => !sessionStopping });
         if (!sessionStopping) ctx.ui.notify(recoveryOutcomes.map(item => `${item.name}: ${item.status}${item.note ? ` — ${item.note}` : ""}`).join("\n") || "No missing roster members.", "info");
       }
+    },
+  });
+
+  pi.registerCommand("team-reload", {
+    description: "Reload pi-teams code in every team member once it is idle (`/team-reload status` shows progress). Busy members finish their current run first.",
+    handler: async (args, ctx) => {
+      if (!teamName) throw new Error("This session is not attached to a team");
+      if (isTeammate) throw new Error("Only the team lead can request a team reload");
+      const team = teamName;
+      if (args.trim() !== "status") {
+        requestTeamReload(team);
+        reloadDispatchedAt = 0;
+      }
+      const request = readReloadRequest(team);
+      if (!request) {
+        ctx.ui.notify("No team reload has been requested.", "info");
+        return;
+      }
+      const config = await teams.readConfig(team);
+      const lines = await Promise.all(config.members.map(async member => {
+        if (isReloadedFor(request, readReloadReceipt(team, member.name))) return `${member.name}: reloaded`;
+        const status = await runtime.readRuntimeStatus(team, member.name);
+        return `${member.name}: pending (${status?.reloading ? "reloading" : status?.activity ?? "not running"})`;
+      }));
+      ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand(RELOAD_SELF_COMMAND, {
+    description: "Internal: reload this member for a pending /team-reload request.",
+    handler: async (args, ctx) => {
+      reloadDispatchedAt = 0;
+      const request = dueReloadRequest();
+      if (!request || request.id !== args.trim() || reloadingForRequest || !reloadIsSafe()) return;
+      reloadingForRequest = request.id;
+      await ctx.reload();
+      // Still active here means the host refused (e.g. a run started); the
+      // poller retries. On success this closure is retired and must not be used.
+      if (!sessionStopping) reloadingForRequest = undefined;
     },
   });
 
@@ -1448,8 +1540,9 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     }
   }
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (event) => {
     const wasPaused = locallyInterrupted;
+    const reloading = event?.reason === "reload";
     // Block injection before the first await, same as an aborted settlement.
     sessionStopping = true;
     runtimeGeneration += 1;
@@ -1464,6 +1557,18 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     clearPendingInspectionRelease();
     stopInboxPolling();
     if (!teamName) return;
+    if (reloading) {
+      // The process stays alive and its new extension instance re-claims this
+      // lease. Peers must not see it as stopped (duplicate restore, false
+      // quiescence fault, early no_active_agents).
+      await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+        reloading: true,
+        reloadingSince: Date.now(),
+        ...(wasPaused ? { paused: true } : {}),
+        lastHeartbeatAt: Date.now(),
+      }).catch(() => undefined);
+      return;
+    }
     await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
       activity: "stopped",
       detached: true,
@@ -1602,6 +1707,8 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     return {
       ...classified,
       liveness: alive ? "alive" as const : "dead" as const,
+      reloading: !!runtimeStatus?.reloading,
+      reloadingSince: runtimeStatus?.reloadingSince,
       model: member.model,
       thinking: member.thinking,
       modelThinkingSource: "spawn-time hints; current/restored Pi session can differ",

@@ -35,6 +35,8 @@ export interface QuiescenceMemberView {
   unreadCount: number;
   unreadIds: string[];
   awaitingConfirmation: boolean;
+  /** Set while the member's process is swapping extension code (same PID). */
+  reloading?: boolean;
   instanceId?: string;
 }
 
@@ -196,7 +198,7 @@ export function formatInspection(
   faults: string[],
 ): string {
   const members = snapshot.members.map(member =>
-    `- ${member.name} (${member.agentType}): ${member.alive ? "alive" : "dead"} ${member.activity}`);
+    `- ${member.name} (${member.agentType}): ${member.alive ? "alive" : "dead"} ${member.activity}${member.reloading ? " (reloading extension code)" : ""}`);
   const tasks = snapshot.tasks.length > 0
     ? snapshot.tasks.map(task => `- ${task.id} [${task.status}] owner=${task.owner ?? "none"} ${task.subject}`)
     : ["- none recorded"];
@@ -254,6 +256,7 @@ async function snapshotOf(
       unreadCount: unread.length,
       unreadIds: unread.map(message => message.id),
       awaitingConfirmation: !!status?.inboxAwaitingConfirmation,
+      reloading: !!status?.reloading,
       instanceId: status?.instanceId,
     });
   }

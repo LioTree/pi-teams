@@ -59,6 +59,10 @@ export interface AgentRuntimeStatus {
   detached?: boolean;
   /** Retained across shutdown/startup, cleared only by legitimate direct work. */
   paused?: boolean;
+  /** Same process is swapping extension code; it stays alive and keeps its activity. */
+  reloading?: boolean;
+  /** When the reloading marker was written; a stale value means the reload never finished. */
+  reloadingSince?: number;
 }
 
 type LegacyRuntimeStatus = Partial<AgentRuntimeStatus> & { ready?: boolean };

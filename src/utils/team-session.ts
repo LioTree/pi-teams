@@ -120,7 +120,7 @@ function assertNoOrphanLivePid(team: string, member: Member): void {
 export async function claimSession(input: {
   team: string; agent: string; identity: TeamSession; instanceId: string;
   pid: number; processStartToken?: string; paneId?: string; handoffToken?: string; recoveryToken?: string;
-  legacyReload?: boolean; manualAssociation?: boolean;
+  legacyReload?: boolean; sameProcessReload?: boolean; manualAssociation?: boolean;
   alive?: typeof runtime.isRuntimeProcessAlive; current?: () => boolean;
 }): Promise<runtime.AgentRuntimeStatus> {
   const configFile = paths.configPath(input.team);
@@ -158,14 +158,26 @@ export async function claimSession(input: {
       if (!handoff && !sameSession(member.session, input.identity) && !ownedLegacy && !manualLegacy) {
         throw new Error("no exact saved Pi session mapping; legacy recovery is blocked (data preserved)");
       }
-      if (!handoff && !ownedLegacy && previous?.instanceId !== input.instanceId && previous && !previous.detached && alive(previous)) {
+      // A reload replaces only the extension instance; the previous owner is this
+      // exact process (PID + start token) on this exact conversation. Hosts without
+      // a start token (non-Linux) cannot prove the process through /proc, so there
+      // the re-claim additionally requires the `reloading` marker this process's
+      // own shutdown wrote, alongside the matching live PID and conversation.
+      const tokenProvesProcess = !!previous && previous.processStartToken !== undefined
+        && previous.processStartToken === input.processStartToken;
+      const markerProvesProcess = !!previous && previous.processStartToken === undefined
+        && input.processStartToken === undefined && previous.reloading === true;
+      const ownReload = !!input.sameProcessReload && !!previous && previous.pid === input.pid
+        && (tokenProvesProcess || markerProvesProcess)
+        && previous.sessionId === input.identity.id && previous.sessionFile === input.identity.file;
+      if (!handoff && !ownedLegacy && !ownReload && previous?.instanceId !== input.instanceId && previous && !previous.detached && alive(previous)) {
         throw new Error("another live process owns this member; no takeover or duplicate launch");
       }
       const paused = previous?.paused || previous?.activity === "interrupted";
       const next: runtime.AgentRuntimeStatus = {
         ...previous,
         teamName: input.team, agentName: input.agent,
-        activity: paused ? "interrupted" : "idle", paused: !!paused, detached: false,
+        activity: paused ? "interrupted" : "idle", paused: !!paused, detached: false, reloading: undefined, reloadingSince: undefined,
         instanceId: input.instanceId, pid: input.pid, processStartToken: input.processStartToken,
         sessionId: input.identity.id, sessionFile: input.identity.file,
         activityChangedAt: Date.now(), startedAt: Date.now(), lastHeartbeatAt: Date.now(),

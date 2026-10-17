@@ -58,6 +58,10 @@ Resume the original Pi conversation, not a new/forked/cloned chat: exact session
 
 Quitting or losing a terminal leaves roster intent; only explicit removal or destructive `team_shutdown` prevents restoration. This deletes team/task/mail metadata, not Pi conversation history: manual `/resume` remains possible without restoring removed membership. Missing/corrupt/unmapped sessions remain blocked with data preserved. `/team-resume <team>` can explicitly associate an unmapped dead legacy lead or retry panes for the current lead; it cannot force a live owner or guess chat files. Other adapters retain lead inbox recovery but not automatic pane restoration. Restoring context does not roll back background tools or side effects.
 
+## Team Reload
+
+`/team-reload` is a user command in the lead session, not a tool. Every live member reloads itself once safe; busy members finish their run first and are not interrupted. It does not dispatch work or change tasks/mail. Do not treat a reload as a reason to re-send assignments.
+
 ## Team Quiescence Fallback
 
 Routine per-teammate idle notices are not sent. Instead, a formal dispatch arms one team-wide fallback for that work generation:

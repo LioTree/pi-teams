@@ -82,6 +82,10 @@ Use automated hooks to ensure standards.
 
 Resume the original lead Pi conversation to reconnect its inbox and restore missing roster peers' original sessions in tmux panes. Live owners/peers are never force-replaced. Process exit (even manual quit) leaves recovery intent in the roster; explicit member removal or destructive `team_shutdown` removes it. Dissolution deletes roster/tasks/mail, not Pi chat history; manual `/resume` remains possible without automatic team reattachment. Recovery never replays assignments, sends a continuation prompt, or opens a work generation; interrupted sessions remain paused. Missing session mappings/files are reported with data preserved. `/team-resume <team>` is a narrow legacy dead-lead association/current-lead retry, not force takeover. New/fork/clone conversations do not inherit membership. Context recovery is not rollback of background tools or filesystem effects.
 
+## Team Reload
+
+`/team-reload` in the lead session reloads every live member after an on-disk update. Each member reloads itself only when safe: busy runs finish first (never interrupted), and pending inbox delivery, inspection bookkeeping, or an active wait defer it. Interrupted sessions reload and stay paused. `/team-reload status` reports `reloaded`/`pending` from receipts written by the newly loaded code. Reload is not dispatch and never touches tasks, mail, or work generations. Members on a pi-teams version without this feature need one manual `/reload`.
+
 ## ⚠️ Best Practices
 - **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.
 - **Clear Prompts**: Be specific about the teammate's role and boundaries when spawning.
