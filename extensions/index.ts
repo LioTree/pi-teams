@@ -7,6 +7,14 @@ import * as tasks from "../src/utils/tasks";
 import * as messaging from "../src/utils/messaging";
 import * as runtime from "../src/utils/runtime";
 import { classifyTeamWaitPeer, waitForTeam } from "../src/utils/team-wait";
+import {
+  acknowledgeAcceptedInspection,
+  admitQuiescenceInspection,
+  noteInspectionAccepted,
+  openFormalGeneration,
+  QUIESCENCE_MARKER,
+  releaseAcceptedInspection,
+} from "../src/utils/quiescence";
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-file";
 import { resolveAgentRole } from "../src/utils/agent-role";
 import { applyTeamSystemPrompt, buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
@@ -397,6 +405,24 @@ export default function (pi: ExtensionAPI) {
   // Bumped synchronously when a new run or shutdown supersedes an in-flight
   // interrupted publication, including one still waiting for the runtime lock.
   let runtimeGeneration = 0;
+  // True while this session is inside agent_settled. Delivery must not re-enter it.
+  let settlementActive = false;
+  let acceptedInspection: { messageId: string; generation: number; runGeneration: number } | undefined;
+  let inspectionAckPending = false;
+  interface PendingInspectionRelease {
+    messageId: string;
+    generation: number;
+    leaderInstanceId: string;
+    runGeneration: number;
+    attempts: number;
+    inFlight: boolean;
+    timer?: ReturnType<typeof setTimeout>;
+  }
+  // Retained after an aborted settlement until the durable accepted record is
+  // released or conclusively no longer ours. This duty never checks the
+  // generation and never wakes the interrupted session; it only cleans up
+  // metadata. It is not an acknowledgement and not a new inspection.
+  let pendingInspectionRelease: PendingInspectionRelease | null = null;
   let pendingInterrupt: { generation: number; attempts: number; timer?: ReturnType<typeof setTimeout> } | null = null;
   interface PendingResume {
     generation: number;
@@ -426,6 +452,7 @@ export default function (pi: ExtensionAPI) {
   // Timeouts, settlements, unrelated runs, and model selection must not replace it.
   let pendingInboxDelivery: PendingInboxDelivery | null = null;
   const INTERRUPT_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600, 3200, 5000];
+  const INSPECTION_RELEASE_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600, 3200, 5000];
   const ACK_RETRY_DELAYS_MS = [100, 200, 400, 800, 1600, 3200, 5000];
   const INBOX_UNKNOWN_DIAGNOSTIC_MS = 1500;
   const INTERRUPTIBLE_ACTIVITIES = ["starting", "queued", "running", "waiting", "idle", "interrupted"] as const;
@@ -814,6 +841,7 @@ export default function (pi: ExtensionAPI) {
       inboxDeliveryInFlight ||
       pendingInboxDelivery ||
       agentLoopActive ||
+      settlementActive ||
       locallyInterrupted ||
       sessionStopping ||
       !teamName ||
@@ -824,11 +852,11 @@ export default function (pi: ExtensionAPI) {
       const leaseBeforeRead = await runtime.readRuntimeStatus(teamName, agentName);
       // Recheck after every await. An aborted settlement or replacement can
       // land while this poll is in flight and must not be resumed from here.
-      if (locallyInterrupted || sessionStopping || agentLoopActive || !leaseCanDeliver(leaseBeforeRead)) return;
+      if (locallyInterrupted || sessionStopping || settlementActive || agentLoopActive || !leaseCanDeliver(leaseBeforeRead)) return;
 
       const unread = await messaging.readInbox(teamName, agentName, true, false);
       const leaseAfterRead = await runtime.readRuntimeStatus(teamName, agentName);
-      if (locallyInterrupted || sessionStopping || agentLoopActive || !sessionCtx.isIdle() || !leaseCanDeliver(leaseAfterRead)) return;
+      if (locallyInterrupted || sessionStopping || settlementActive || agentLoopActive || !sessionCtx.isIdle() || !leaseCanDeliver(leaseAfterRead)) return;
 
       if (unread.length === 0) {
         if (leaseAfterRead.activity === "queued") {
@@ -846,13 +874,13 @@ export default function (pi: ExtensionAPI) {
         await runtime.markRuntimeQueuedIfIdle(teamName, agentName);
       }
       const leaseBeforeDelivery = await runtime.readRuntimeStatus(teamName, agentName);
-      if (locallyInterrupted || sessionStopping || agentLoopActive || !sessionCtx.isIdle() || !leaseCanDeliver(leaseBeforeDelivery)) return;
+      if (locallyInterrupted || sessionStopping || settlementActive || agentLoopActive || !sessionCtx.isIdle() || !leaseCanDeliver(leaseBeforeDelivery)) return;
       const deliveryBatch = unread.slice(0, 1);
 
       // pi.sendUserMessage returns void before Pi accepts the prompt. That
       // return, a timer, or a missing error is not acceptance. Keep this
       // attempt single-flight and unread until a matching user message_end.
-      if (locallyInterrupted || sessionStopping || pendingInboxDelivery) return;
+      if (locallyInterrupted || sessionStopping || settlementActive || pendingInboxDelivery) return;
       const pending: PendingInboxDelivery = {
         ids: deliveryBatch.map(message => message.id),
         token: ++deliveryToken,
@@ -879,11 +907,184 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  async function pollTeamCoordination(): Promise<void> {
+    await deliverUnreadInbox();
+    if (pendingInspectionRelease && !settlementActive && !sessionStopping) {
+      // Retry metadata-only cleanup even while paused. This neither starts a
+      // model nor admits an inspection; the backoff timer owns the pace.
+      await attemptInspectionRelease().catch(() => undefined);
+    }
+    if (inspectionAckPending && !settlementActive && !locallyInterrupted && !sessionStopping) {
+      await acknowledgeInspectionAfterSettlement().catch(() => undefined);
+    }
+    if (
+      teamName
+      && !locallyInterrupted
+      && !sessionStopping
+      && !settlementActive
+      && !agentLoopActive
+      && sessionCtx?.isIdle()
+    ) {
+      await admitQuiescenceInspection(teamName, { isMemberAlive }).catch(() => undefined);
+    }
+  }
+
+  async function acknowledgeInspectionAfterSettlement(): Promise<void> {
+    const accepted = acceptedInspection;
+    if (!accepted || !teamName || isTeammate || locallyInterrupted || sessionStopping) return;
+    const lease = await runtime.readRuntimeStatus(teamName, agentName);
+    if (!lease || lease.instanceId !== runtimeInstanceId || lease.activity === "stopped") {
+      if (acceptedInspection === accepted) acceptedInspection = undefined;
+      inspectionAckPending = false;
+      return;
+    }
+    try {
+      const ack = await acknowledgeAcceptedInspection(teamName, {
+        messageId: accepted.messageId,
+        leaderInstanceId: runtimeInstanceId,
+        runGeneration: accepted.runGeneration,
+      }, {
+        stillAuthorized: async () => {
+          // The in-memory obligation can be revoked while this settlement or a
+          // poll retry waits for the coordinator lock (abort, stop, shutdown),
+          // and the runtime lease can be replaced by another lead process.
+          const stillOurs = () => acceptedInspection === accepted
+            && !locallyInterrupted
+            && !sessionStopping;
+          if (!stillOurs()) return "revoked" as const;
+          const current = await runtime.readRuntimeStatus(teamName!, agentName);
+          if (!stillOurs()) return "revoked" as const;
+          return current
+            && current.instanceId === runtimeInstanceId
+            && current.activity !== "stopped"
+            ? "authorized" as const
+            : "not-ours" as const;
+        },
+      });
+      if (ack.checked) {
+        if (acceptedInspection === accepted) acceptedInspection = undefined;
+        inspectionAckPending = false;
+        return;
+      }
+      if (ack.decision === "revoked") {
+        // The obligation was revoked while the commit waited, so this ACK must
+        // never check. Do not discard the durable record with it: hand it to
+        // the release duty. If the abort path already took ownership, it has
+        // already retained the same duty.
+        if (acceptedInspection === accepted) {
+          acceptedInspection = undefined;
+          retainInspectionRelease(accepted);
+          await attemptInspectionRelease(true).catch(() => undefined);
+        }
+        inspectionAckPending = false;
+        return;
+      }
+      // not-ours: the durable record was released, replaced, or never matched
+      // this writer. Conclusive ownership loss, so drop the local obligation.
+      if (acceptedInspection === accepted) acceptedInspection = undefined;
+      inspectionAckPending = false;
+    } catch {
+      inspectionAckPending = true;
+    }
+  }
+
+  async function releaseInspectionAfterAbort(): Promise<void> {
+    const accepted = acceptedInspection;
+    if (!accepted || !teamName) return;
+    // The aborted run must never acknowledge its inspection. Move the duty to a
+    // lease/run/message-bound release obligation that survives a transient
+    // cleanup failure, then clear the normal ACK record immediately.
+    if (acceptedInspection === accepted) acceptedInspection = undefined;
+    inspectionAckPending = false;
+    retainInspectionRelease(accepted);
+    await attemptInspectionRelease(true).catch(() => undefined);
+  }
+
+  function clearPendingInspectionRelease() {
+    if (pendingInspectionRelease?.timer) clearTimeout(pendingInspectionRelease.timer);
+    pendingInspectionRelease = null;
+  }
+
+  function scheduleInspectionReleaseRetry(pending: PendingInspectionRelease) {
+    if (pendingInspectionRelease !== pending || pending.inFlight || pending.timer) return;
+    // Cap the interval, not the lifetime of the release obligation.
+    const delay = INSPECTION_RELEASE_RETRY_DELAYS_MS[Math.min(pending.attempts++, INSPECTION_RELEASE_RETRY_DELAYS_MS.length - 1)];
+    pending.timer = setTimeout(() => {
+      pending.timer = undefined;
+      void attemptInspectionRelease().catch(() => undefined);
+    }, delay);
+  }
+
+  function retainInspectionRelease(accepted: { messageId: string; generation: number; runGeneration: number }) {
+    clearPendingInspectionRelease();
+    pendingInspectionRelease = {
+      ...accepted,
+      leaderInstanceId: runtimeInstanceId,
+      attempts: 0,
+      inFlight: false,
+    };
+  }
+
+  // Durable metadata cleanup only. `false` means the durable accepted record is
+  // no longer ours (released, replaced, or gone), so the obligation is
+  // conclusively finished; a thrown error keeps it for a bounded-backoff retry.
+  async function attemptInspectionRelease(force = false): Promise<boolean> {
+    const pending = pendingInspectionRelease;
+    if (!pending || !teamName || pending.inFlight) return false;
+    if (pending.timer && !force) return false;
+    pending.inFlight = true;
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+      pending.timer = undefined;
+    }
+    let failed = false;
+    try {
+      const released = await releaseAcceptedInspection(teamName, {
+        messageId: pending.messageId,
+        leaderInstanceId: pending.leaderInstanceId,
+        runGeneration: pending.runGeneration,
+      });
+      if (pendingInspectionRelease === pending) clearPendingInspectionRelease();
+      return released;
+    } catch {
+      failed = true;
+      return false;
+    } finally {
+      // Clear in-flight before arming the retry; the scheduler refuses to arm
+      // while this attempt still looks in flight.
+      pending.inFlight = false;
+      if (failed && pendingInspectionRelease === pending) scheduleInspectionReleaseRetry(pending);
+    }
+  }
+
+  async function finishAgentSettlement(aborted: boolean): Promise<void> {
+    try {
+      if (teamName) {
+        if (aborted || locallyInterrupted) {
+          await releaseInspectionAfterAbort();
+        } else {
+          // Finish an outstanding abort-release before acknowledging, so a
+          // normal settlement cannot strand the cleanup duty.
+          await attemptInspectionRelease(true).catch(() => undefined);
+          await acknowledgeInspectionAfterSettlement();
+        }
+      }
+      // Append only. The poller must not inject until this settlement returns.
+      if (!aborted && !locallyInterrupted && !sessionStopping && teamName) {
+        await admitQuiescenceInspection(teamName, { isMemberAlive }).catch(() => undefined);
+      }
+    } catch {
+      // A failed watermark write is retried by this process. It is not a new dispatch.
+    } finally {
+      settlementActive = false;
+    }
+  }
+
   function startInboxPolling() {
     if (inboxPollingStarted || !sessionCtx || !teamName) return;
     inboxPollingStarted = true;
-    void deliverUnreadInbox();
-    inboxPollingTimer = setInterval(() => void deliverUnreadInbox(), 1000);
+    void pollTeamCoordination();
+    inboxPollingTimer = setInterval(() => void pollTeamCoordination(), 1000);
   }
 
   function stopInboxPolling() {
@@ -985,6 +1186,28 @@ export default function (pi: ExtensionAPI) {
     if (pendingInboxDelivery === pending) {
       sessionCtx?.ui?.setStatus?.("pi-teams-delivery", `acknowledgement pending: ${pending.ids.join(", ")}`);
     }
+    // Acceptance is this user message_end plus the delivered ids. A void send,
+    // a timer, or an assistant message_end cannot reach this point.
+    if (!isTeammate && agentLoopActive && text.includes(QUIESCENCE_MARKER)) {
+      const messageId = pending.ids.find(id => text.includes(`Message-ID: ${id}`));
+      if (messageId) {
+        try {
+          const noted = await noteInspectionAccepted(teamName, {
+            messageId,
+            leaderInstanceId: runtimeInstanceId,
+            runGeneration: runtimeGeneration,
+            deliveredText: text,
+          });
+          if (noted.accepted && noted.generation !== undefined) {
+            acceptedInspection = { messageId, generation: noted.generation, runGeneration: runtimeGeneration };
+            inspectionAckPending = false;
+          }
+        } catch {
+          // Inbox acknowledgement below still proceeds. A later settlement retry
+          // can record the same accepted ids; this does not open a generation.
+        }
+      }
+    }
     // Acceptance is known now. Clear the unknown diagnostic even if the later
     // mailbox acknowledgement fails, and do not let an in-flight unknown writer
     // publish after this point: its commit guard observes pending.confirmed.
@@ -1003,6 +1226,8 @@ export default function (pi: ExtensionAPI) {
     clearPendingInterrupt();
     clearPendingResume();
     if (!teamName || sessionStopping) return;
+    // A direct resume is a legitimate moment to finish metadata cleanup quickly.
+    if (pendingInspectionRelease) await attemptInspectionRelease(true).catch(() => undefined);
     const pending: PendingResume = { generation, settled: false, attempts: 0, inFlight: false };
     pendingResume = pending;
     await publishResumedActivity(pending);
@@ -1020,6 +1245,15 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", async (event) => {
+    settlementActive = true;
+    try {
+      await settleAgentRun(event);
+    } finally {
+      await finishAgentSettlement(event.aborted === true);
+    }
+  });
+
+  async function settleAgentRun(event: { aborted?: boolean }): Promise<void> {
     const aborted = event.aborted === true;
     const generation = runtimeGeneration;
     const resume = pendingResume;
@@ -1074,15 +1308,14 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (!settleCommitAllowed()) return;
-      let settled: runtime.AgentRuntimeStatus | null;
       if (resume) {
         // Only this direct run can repair a persisted interruption. If another
         // attempt still owns the lock, its finally retries the new settled target.
         // Detached recovery is metadata-only, not an idle notification replay.
-        settled = await publishResumedActivity(resume);
+        await publishResumedActivity(resume);
       } else {
         const hasUnreadWork = (await messaging.readInbox(teamName, agentName, true, false)).length > 0;
-        settled = await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+        await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
           activity: hasUnreadWork ? "queued" : "idle",
           pid: process.pid,
           processStartToken,
@@ -1091,22 +1324,6 @@ export default function (pi: ExtensionAPI) {
         }, ROUTINE_SETTLE_ACTIVITIES, settleCommitAllowed);
       }
 
-      if (!settled || !settleCommitAllowed() || settled.activity !== "idle" || !isTeammate) return;
-      const ownedTasks = (await tasks.listTasks(teamName))
-        .filter(task => task.owner === agentName && task.status !== "completed" && task.status !== "deleted")
-        .map(task => ({ id: task.id, subject: task.subject, status: task.status }));
-      const taskLines = ownedTasks.length > 0
-        ? ownedTasks.map(task => `- ${task.id} [${task.status}] ${task.subject}`)
-        : ["- none"];
-      const stillIdle = await runtime.readRuntimeStatus(teamName, agentName);
-      if (!settleCommitAllowed() || stillIdle?.instanceId !== runtimeInstanceId || stillIdle.activity !== "idle") return;
-      await messaging.sendPlainMessage(
-        teamName,
-        agentName,
-        "team-lead",
-        [`Agent ${agentName} is idle.`, "Owned unfinished tasks:", ...taskLines].join("\n"),
-        `${agentName} is idle`,
-      );
     } catch (error) {
       // Never let a settlement error rewrite an interruption or a lost/stopped
       // lease into idle. Ordinary failures may still record idle for a live lease.
@@ -1127,7 +1344,7 @@ export default function (pi: ExtensionAPI) {
         lastError: runtime.createRuntimeError(error),
       }, ROUTINE_SETTLE_ACTIVITIES, settleCommitAllowed).catch(() => undefined);
     }
-  });
+  }
 
   pi.on("session_shutdown", async () => {
     // Block injection before the first await, same as an aborted settlement.
@@ -1138,6 +1355,10 @@ export default function (pi: ExtensionAPI) {
     clearPendingInterrupt();
     clearPendingResume();
     clearPendingInboxDelivery();
+    // Best-effort durable cleanup before this process ends; a failure is not
+    // fatal because a replacement lead instance drops the stale acceptance.
+    if (pendingInspectionRelease) await attemptInspectionRelease(true).catch(() => undefined);
+    clearPendingInspectionRelease();
     stopInboxPolling();
     if (!teamName) return;
     await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
@@ -1147,6 +1368,8 @@ export default function (pi: ExtensionAPI) {
       lastHeartbeatAt: Date.now(),
       inboxAwaitingConfirmation: undefined,
     });
+    // File-only check. Do not inject into this stopping session.
+    await admitQuiescenceInspection(teamName, { isMemberAlive }).catch(() => undefined);
   });
 
   // Pi rebuilds prompt options for each new run. Refresh our own section rather
@@ -1439,7 +1662,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "delegate_task",
     label: "Delegate Task",
-    description: "Create a task, assign it to a teammate, and spawn or reuse that teammate as needed.",
+    description: "Create a task, assign it to a teammate, and spawn or reuse that teammate as needed. This is the formal dispatch boundary: it arms the team quiescence fallback for new or follow-up work.",
     parameters: Type.Object({
       team_name: Type.String(),
       teammate_name: Type.String(),
@@ -1595,6 +1818,10 @@ export default function (pi: ExtensionAPI) {
           throw error;
         }
       }
+
+      // Successful delegate/redelegate is the formal work boundary. A failed
+      // spawn returns above and must not arm an inspection for work that was rolled back.
+      await openFormalGeneration(safeTeamName);
 
       return {
         content: [{
@@ -2122,7 +2349,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "create_predefined_team",
     label: "Create Predefined Team",
-    description: "Create a team from a predefined team configuration. Spawns all agents defined in the team template from teams.yaml. Each agent is spawned with its predefined prompt, tools, and settings.",
+    description: "Create a team from a predefined team configuration. Spawns all agents defined in the team template from teams.yaml. Each agent is spawned with its predefined prompt, tools, and settings. Successful worker launches arm the team quiescence fallback.",
     parameters: Type.Object({
       team_name: Type.String({ description: "Name for the new team instance" }),
       predefined_team: Type.String({ description: "Name of the predefined team template from teams.yaml" }),
@@ -2289,7 +2516,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       const summary = spawnResults.map(r => `${r.name}: ${r.status}${r.error ? ` (${r.error})` : ""}`).join("\n");
-      
+      if (spawnResults.some(result => result.status === "spawned")) {
+        await openFormalGeneration(paths.sanitizeName(params.team_name));
+      }
+
       return {
         content: [{ type: "text", text: `Team "${params.team_name}" created from predefined team "${params.predefined_team}".\n\nAgent spawn results:\n${summary}` }],
         details: { teamName: params.team_name, predefinedTeam: params.predefined_team, results: spawnResults },

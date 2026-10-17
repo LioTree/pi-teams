@@ -265,7 +265,7 @@ describe("registered interruption lifecycle", () => {
     expect(readTask()).toEqual(originalTask);
   });
 
-  it("preserves ordinary idle notification and later delivers mail after a normal settlement", async () => {
+  it("does not send a routine idle notice and still delivers later mail after a normal settlement", async () => {
     const teammate = loadExtension(teammateName);
     writeTask();
     await startSession(teammate);
@@ -273,10 +273,7 @@ describe("registered interruption lifecycle", () => {
     await emit(teammate, "agent_settled", { type: "agent_settled", aborted: false });
 
     expect(await activityOf(teammateName)).toBe("idle");
-    const notice = await unread("team-lead");
-    expect(notice).toHaveLength(1);
-    expect(notice[0].text).toContain("Agent implementer is idle.");
-    expect(notice[0].text).toContain("1 [in_progress] Implement interruption-aware wait");
+    expect(await unread("team-lead")).toEqual([]);
     expect(readTask().status).toBe("in_progress");
     expect(readTask().owner).toBe(teammateName);
 

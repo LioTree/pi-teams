@@ -74,6 +74,7 @@ Prompt composition and tool registration are tested with Pi `1.1.0` and magic-co
 - **Broadcast Messaging**: Send a message to the entire team at once for global coordination and announcements.
 - **Quality Gate Hooks**: Automated shell scripts run when tasks are completed (e.g., to run tests or linting).
 - **Thinking Level Control**: Set per-teammate thinking levels (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`) to balance speed vs. reasoning depth.
+- **Quiescence Fallback**: One team-wide inspection per formally dispatched work generation when everyone is idle, replacing routine per-teammate idle notices. Use `delegate_task` for follow-up work to re-arm it.
 
 ## 💬 Key Examples
 
@@ -156,6 +157,8 @@ team_wait({ team_name: "my-team" })
 ```
 
 Teammates do not call `team_wait` merely because they are idle; idle inbox delivery is automatic.
+
+Routine per-teammate idle notices are replaced by one team-wide inspection per formal dispatch generation. `delegate_task` (new work, follow-up, or re-dispatch) and a successful predefined-team launch arm it; ordinary `team_message` does not, even when it says to continue. When the whole team is quiescent with the generation unchecked, the lead receives an inspection naming the generation, member states, faults, and tasks. The inspection is an opportunity to inspect artifacts and finish or formally dispatch more work; it is never a claim that the work is complete and never marks a task complete. Explicit reports and task notifications are still delivered immediately.
 
 ### 4. Broadcast to Team
 > **You:** "Broadcast to the entire team: 'The API endpoint has changed to /v2. Please update your work accordingly.'"

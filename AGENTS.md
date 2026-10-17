@@ -44,6 +44,7 @@ Communication flows naturally between team members:
 - **Inbox Delivery**: About once per second, an idle teammate receives the actual contents of unread inbox messages. Busy agents leave messages unread; an agent in `team_wait` consumes them through the active wait. An `interrupted` session is not polled and does not auto-resume. Unknown host acceptance stays single-flight and unread in that process; it is not automatically resent and is not a confirmed failure.
 - **Blocking Waits**: Any member can call `team_wait({ team_name, timeout_seconds? })`. Omit the timeout for a long-lived barrier; it returns on a message, timeout, or when no other member can make progress. A live `interrupted` peer is not progress-capable, but it keeps an indefinite wait open until it resumes, stops, or dies.
 - **Activity Tracking**: Members report `starting`, `queued`, `running`, `waiting`, `idle`, `interrupted`, or `stopped`, independently from process liveness. `interrupted` means the user aborted that session. Recovery is a direct user prompt there, not a model change or remote resume.
+- **Quiescence Fallback**: Routine per-teammate idle notices are replaced by one team-wide inspection per formally dispatched work generation. `delegate_task` and successful predefined-team launches arm it; ordinary messages do not. When every live member is idle, the lead receives one inspection tagged with the latest unchecked generation; only the lead's normal settlement after actually accepting it records that generation checked. An inspection is not task completion and never completes a task.
 
 ---
 
@@ -55,6 +56,7 @@ Use this when you have 3-4 independent features to build.
 2. Use `delegate_task` for each specialist and feature.
 3. Call `team_wait({ team_name: "feature-sprint" })` after delegation.
 4. On return, coordinate from the message and status snapshot. If specialists are still active, wait again; do not duplicate their assigned work.
+5. For any follow-up round, use `delegate_task` again; it re-arms the quiescence fallback for the new work.
 
 ### Pattern 2: The "Dependency Handoff"
 Use this when one teammate unexpectedly needs information or work from another.

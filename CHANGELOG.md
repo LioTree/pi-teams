@@ -5,16 +5,19 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **Abort inspection release**: Releasing an accepted quiescence inspection after an aborted run is now a retained, retried metadata duty. A transient coordinator write failure no longer strands the durable `accepted` record: cleanup retries with capped backoff while the session is paused without starting a model or admitting an inspection. A later normal settlement never acknowledges an aborted inspection, and a successful release still requires a fresh inspection on a later run.
 - **Role guidance on every run**: Team lead and teammate instructions are refreshed for each new prompt instead of disappearing after the first run. Teammate model/thinking metadata is re-read on each refresh.
 - **Structured prompt composition**: Use a dedicated `pi_teams` section on current Pi versions instead of forcing a complete system prompt. This preserves magic-context's guidance in either extension load order. Keep the legacy prompt-return fallback for API compatibility.
 - **Interrupted teammates**: Preserve an `interrupted` activity on cancellation without sending an idle notification or auto-delivering inbox messages. A live interrupted peer keeps `team_wait` open until it resumes, stops, dies, or the wait receives a message, times out, or is cancelled. A direct user prompt in the paused session resumes execution.
 
 ### Changed
+- **Quiescence fallback instead of routine idle notices**: A teammate settling to `idle` no longer sends a per-member notice to the lead. A formal dispatch instead arms one team-wide fallback: when every live member is idle with no queued work, unread mail, unknown inbox acceptance, or active wait, pi-teams admits one inspection tagged with the latest unchecked work generation. The inspection lists members, faults, and tasks and is explicitly an inspection opportunity, never a completion report. Aborting the lead run releases its acceptance without checking the generation, and the release is retried after transient storage failures until the durable record is gone; a successful release still requires a fresh inspection on a later run. Only a normal leader settlement after actually accepting a fresh inspection records it checked. Explicit reports and task notifications are still delivered immediately.
 - **Pi 1.x support**: Require Pi `>=1.1.0 <2` and develop/typecheck against Pi `1.1.0`. The minimum host must expose `agent_settled.aborted` for interruption-aware coordination.
 - **Host-provided dependencies**: Declare Pi AI and TypeBox as peer dependencies with development copies for tests, avoiding duplicate runtime installations.
 - Document the user-level magic-context subprocess extension isolation setting.
 
 ### Added
+- **Formal work generations**: `delegate_task` and a successful `create_predefined_team` worker launch open one work generation. Reusing a live teammate through `delegate_task` opens a new generation for follow-up work. Team creation, draft tasks, direct prompts, model changes, status polling, ordinary `team_message`, progress updates, and acknowledgements do not open a generation; an ordinary continuation message does not re-arm the fallback.
 - **Teammate defaults from Pi agent settings**: pi-teams reads `~/.pi/agent/settings.json`, or `$PI_CODING_AGENT_DIR/settings.json` when that environment variable is set:
   - `teammateDefaultModel` (optional `teammateDefaultProvider` if the model is bare)
   - `teammateDefaultThinkingLevel`

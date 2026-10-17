@@ -533,7 +533,7 @@ describe("C4 direct-resume publication recovery", () => {
     },
   );
 
-  it("preserves normal settled idle notification and task ownership after a failed direct start", async () => {
+  it("preserves task ownership after a failed direct start without a routine idle notice", async () => {
     const target = await idleWorker();
     await emit(target, "agent_start");
     await emit(target, "agent_settled", { type: "agent_settled", aborted: true });
@@ -557,12 +557,12 @@ describe("C4 direct-resume publication recovery", () => {
       if (!/audit fake provider/.test(error.message)) throw error;
     });
     const notices = await unread("team-lead");
-    expect(notices).toHaveLength(before + 1);
-    expect(notices.at(-1)?.text).toContain("1 [in_progress] still assigned");
+    expect(notices).toHaveLength(before);
+    expect(notices.some(message => message.text.includes("still assigned"))).toBe(false);
     expect(fs.readFileSync(taskFile, "utf8")).toBe(task);
     expect(await activityOf(teammateName)).toBe("idle");
     await pollTicks(10);
-    expect(await unread("team-lead")).toHaveLength(before + 1);
+    expect(await unread("team-lead")).toHaveLength(before);
   });
 
   it("keeps the same unknown attempt unread across a failed direct resume and later polls", async () => {

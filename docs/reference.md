@@ -313,10 +313,26 @@ Activity describes coordination state separately from process liveness:
 - `running`: The Pi agent is actively processing or performing work
 - `waiting`: The member is blocked in `team_wait` on a real dependency
 - `idle`: The Pi agent has settled and is ready for new work
-- `interrupted`: The user aborted the session. Task ownership and status are unchanged, unread inbox messages stay unread, and the ordinary idle notification is suppressed. The session is not idle and will not auto-resume
+- `interrupted`: The user aborted the session. Task ownership and status are unchanged, unread inbox messages stay unread, and settlement publishes no idle notification. The session is not idle and will not auto-resume
 - `stopped`: The member has shut down
 
-`team_status` and `check_teammate` expose both liveness and activity. This lets `team_wait` distinguish a long-running job from a team in which every remaining member is idle or waiting, and from a live interrupted peer that must keep an indefinite wait open. A teammate becoming idle also sends a structured notification to the lead with its unfinished owned tasks. An interrupted settlement does not send that notification.
+`team_status` and `check_teammate` expose both liveness and activity. This lets `team_wait` distinguish a long-running job from a team in which every remaining member is idle or waiting, and from a live interrupted peer that must keep an indefinite wait open. Routine per-teammate idle notices are not sent; the team-wide quiescence fallback below wakes the lead once per formally dispatched work generation when the whole team is quiescent.
+
+---
+
+## Team Quiescence Fallback
+
+Formal dispatch opens one work generation. `delegate_task` (new work, follow-up, or re-dispatch of a live teammate) and a successful `create_predefined_team` worker launch open a generation. Team creation alone, draft task creation, direct user prompts, model changes, status polling, ordinary `team_message`, progress updates, and acknowledgements do not.
+
+When every live participant is idle and no member is queued, starting, running, waiting, or interrupted, has unread mail, or has unknown inbox acceptance, pi-teams admits at most one inspection message for the latest unchecked generation. Multiple outstanding dispatches coalesce into one inspection tagged with the latest generation. Stopped or dead members do not block the check, but they are reported as faults; they never count as success.
+
+The inspection names the generation, the member snapshot, faults, and the current task list. It is an inspection opportunity with no completion report: it never completes a task, never claims the work is done, and does not summarise the work for the lead. If a member stopped or died, the inspection exposes that as a fault to investigate.
+
+Only an inspection that Pi actually accepted into a leader run, and whose run later settled normally, records its tagged generation as checked. The coordinator revalidates the current leader lease and the still-authorized acknowledgement obligation at the commit boundary, so a replacement lease or an acknowledgement revoked by a later abort, stop, or shutdown cannot check the generation. If that revalidation rejects an acknowledgement because the obligation was revoked, the durable `accepted` record is handed to the retryable release path instead of being stranded; a rejection because the record is no longer ours is conclusive ownership loss. An aborted run releases the acceptance without checking it; the release is retried after transient storage failures until the durable record is gone. Succeeding at that cleanup does not check anything: the next run must accept a fresh inspection before the generation can be checked, and an unrelated normal settlement never checks an inspection it did not accept.
+
+A checked generation stays checked across later direct human turns and unrelated settlements. With no new formal dispatch, no further automatic inspections occur. To re-arm the fallback for new or follow-up work, use `delegate_task` (or the predefined-team launch); an ordinary `team_message` that says to continue does not re-arm it. Explicit reports (`team_message`, task assignment and completion notifications) are still delivered immediately and are not held or muted by this fallback.
+
+Limits: the watermark is local coordination state in the team directory, not a distributed exactly-once protocol across restarts or machines. A retry after a storage failure reuses the reserved message ID, so it cannot create a duplicate inspection for the same admission. A corrupt watermark records nothing and surfaces as an error instead of silently rearming. An interrupted member is never resumed by this mechanism, and stopping the lead records the inspection for whichever lead session continues the team.
 
 ---
 
@@ -492,7 +508,7 @@ rm ~/.pi/teams/my-team/.lock
 
 ### Idle Polling Overhead
 
-Teammates poll their inboxes about once per second only while idle or already queued for delivery. Each poll is a local JSON read. Busy, stopped, and interrupted sessions are not polled for injection. A session in `team_wait` consumes messages through that active wait.
+Teammates poll their inboxes about once per second only while idle or already queued for delivery. Each poll is a local JSON read and also evaluates the team-wide quiescence watermark described above. Busy, stopped, and interrupted sessions are not polled for injection. A session in `team_wait` consumes messages through that active wait.
 
 ### Lock Timeout
 

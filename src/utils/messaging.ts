@@ -33,6 +33,63 @@ function ensureMessageIds(messages: InboxMessage[]): boolean {
   return changed;
 }
 
+export async function appendMessageOnce(
+  teamName: string,
+  agentName: string,
+  message: InboxMessage,
+): Promise<InboxMessage> {
+  if (!hasUsableId(message)) throw new Error("appendMessageOnce requires a message id");
+  const p = inboxPath(teamName, agentName);
+  const dir = path.dirname(p);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+  return await withLock(p, async () => {
+    let msgs: InboxMessage[] = [];
+    if (fs.existsSync(p)) msgs = JSON.parse(fs.readFileSync(p, "utf-8"));
+    ensureMessageIds(msgs);
+    const existing = msgs.find(item => item.id === message.id);
+    if (existing) return existing;
+    msgs.push(message);
+    atomicWriteJsonSync(p, msgs);
+    return message;
+  });
+}
+
+export async function readInboxMessage(
+  teamName: string,
+  agentName: string,
+  id: string,
+): Promise<InboxMessage | null> {
+  const p = inboxPath(teamName, agentName);
+  if (!fs.existsSync(p)) return null;
+  return await withLock(p, async () => {
+    if (!fs.existsSync(p)) return null;
+    const msgs = JSON.parse(fs.readFileSync(p, "utf-8")) as InboxMessage[];
+    return msgs.find(item => item.id === id) ?? null;
+  });
+}
+
+export async function rewriteUnreadMessage(
+  teamName: string,
+  agentName: string,
+  id: string,
+  text: string,
+  summary: string,
+): Promise<boolean> {
+  const p = inboxPath(teamName, agentName);
+  if (!fs.existsSync(p)) return false;
+  return await withLock(p, async () => {
+    if (!fs.existsSync(p)) return false;
+    const msgs = JSON.parse(fs.readFileSync(p, "utf-8")) as InboxMessage[];
+    const message = msgs.find(item => item.id === id);
+    if (!message || message.read) return false;
+    message.text = text;
+    message.summary = summary;
+    atomicWriteJsonSync(p, msgs);
+    return true;
+  });
+}
+
 export async function appendMessage(
   teamName: string,
   agentName: string,

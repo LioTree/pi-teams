@@ -41,6 +41,7 @@ export function buildLeadSystemPrompt(options: LeadSystemPromptOptions): string 
     `\n\n${roleLine}` +
     `\n- Follow the Agent Teams skill guidance for detailed team workflow and tool usage.` +
     `\n- Use delegate_task for significant teammate work so the task board, ownership, initial message, and process lifecycle stay in sync.` +
+    `\n- New or follow-up teammate work must use delegate_task, or create_predefined_team for a template launch. An ordinary team_message does not open another inspection, even if it says to continue.` +
     `\n- Give each teammate a clear role, task, input context, expected output, boundaries, and completion condition.` +
     `\n- After delegating work, call team_wait instead of continuing or duplicating the delegated work.` +
     `\n- When team_wait returns, do coordination work only; if teammates are still active, call team_wait again.` +

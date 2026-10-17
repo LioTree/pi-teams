@@ -70,6 +70,7 @@ describe("buildLeadSystemPrompt", () => {
     expect(prompt).toContain("team lead");
     expect(prompt).toContain("'refactor-squad'");
     expect(prompt).toContain("delegate_task");
+    expect(prompt).toContain("ordinary team_message does not open another inspection");
     expect(prompt).toContain("call team_wait");
     expect(prompt).toContain("instead of continuing or duplicating");
     expect(prompt).toContain("if teammates are still active, call team_wait again");

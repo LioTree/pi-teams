@@ -49,7 +49,20 @@ When you are spawned as a teammate:
 - **Delegate Then Wait**: After delegating, call `team_wait({ team_name })` so you pause until a message arrives or no teammate can make progress. Do not perform the teammate's assigned work.
 - **Coordinate, Then Wait Again**: When a wait returns, handle reports and blockers only. If teammates are still active, call `team_wait` again.
 - **Direct Feedback**: Use `team_message` to provide course corrections or new instructions to teammates.
+- **Formal Follow-ups**: Use `delegate_task` for new or follow-up teammate work. It is the dispatch boundary that arms the quiescence fallback. An ordinary `team_message` does not re-arm it, even if it says to continue.
 - **Read Status**: Use `team_status` to see the full team roster and current task board.
+
+## Team Quiescence Fallback
+
+Routine per-teammate idle notices are not sent. Instead, a formal dispatch arms one team-wide fallback for that work generation:
+
+- `delegate_task` and a successful `create_predefined_team` worker launch open a generation. Team creation, draft tasks, direct user prompts, model changes, status polling, ordinary `team_message`, progress updates, and acknowledgements do not.
+- When every live member is idle with no queued work, unread mail, unknown inbox acceptance, or active dependency wait, pi-teams admits one inspection message tagged with the latest unchecked generation. Multiple dispatches may coalesce into one inspection.
+- The inspection lists the generation, members, faults, and tasks. It is an inspection opportunity, not a completion report, and it never marks work complete. Stopped or dead members appear as faults, not success.
+- Only a leader run that actually accepted the inspection and then settled normally records its tagged generation as checked. An aborted run releases it without checking it. A checked generation stays checked across later human turns and unrelated settlements.
+- Explicit reports (`team_message`, task assignment and completion notifications) are still delivered immediately and are not muted by the fallback.
+
+To re-arm the fallback after checked work, use `delegate_task` for the follow-up; a plain `team_message` will not.
 
 ## `team_wait` Result
 
