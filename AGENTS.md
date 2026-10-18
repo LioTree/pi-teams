@@ -82,9 +82,17 @@ Use automated hooks to ensure standards.
 
 Resume the original lead Pi conversation to reconnect its inbox and restore missing roster peers' original sessions in tmux panes. Live owners/peers are never force-replaced. Process exit (even manual quit) leaves recovery intent in the roster; explicit member removal or destructive `team_shutdown` removes it. Dissolution deletes roster/tasks/mail, not Pi chat history; manual `/resume` remains possible without automatic team reattachment. Recovery never replays assignments, sends a continuation prompt, or opens a work generation; interrupted sessions remain paused. Missing session mappings/files are reported with data preserved. `/team-resume <team>` is a narrow legacy dead-lead association/current-lead retry, not force takeover. New/fork/clone conversations do not inherit membership. Context recovery is not rollback of background tools or filesystem effects.
 
+## Changing a Teammate Model
+
+`/team-model <teammate> <provider/model> [thinking]` is a lead command. The teammate extension applies `setModel` directly; the teammate model is not asked and no inbox message is sent. An in-flight turn keeps the old model until it ends. Interrupted sessions stay paused. This is not dispatch and does not open a work generation. `delegate_task` reuse still does not change a live model.
+
 ## Team Reload
 
 `/team-reload` in the lead session reloads every live member after an on-disk update. Each member reloads itself only when safe: busy runs finish first (never interrupted), and pending inbox delivery, inspection bookkeeping, or an active wait defer it. Interrupted sessions reload and stay paused. `/team-reload status` reports `reloaded`/`pending` from receipts written by the newly loaded code. Reload is not dispatch and never touches tasks, mail, or work generations. Members on a pi-teams version without this feature need one manual `/reload`.
+
+## Closing Panes
+
+`/team-close` closes every live teammate pane while keeping roster, tasks, and inbox. Only the live lead of that team can run it. The lead pane stays. Already-stopped, detached, or dead members are skipped. A pending restore is cancelled so its child cannot attach. Busy runs are killed; sessions stay resumable and are restored on the next original-lead attach or `/team-resume`. `/team-shutdown` does that close and then deletes roster, tasks, and inbox. Chat history survives for manual `/resume` without reattachment. Windows Terminal and Zellij cannot close panes: when a teammate or pending launch still needs closing, both commands refuse without marking members stopped. An already stopped team can still be dissolved.
 
 ## ⚠️ Best Practices
 - **Isolation**: Give teammates tasks that don't overlap too much to avoid git conflicts.

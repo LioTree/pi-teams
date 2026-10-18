@@ -63,6 +63,13 @@ export interface TerminalAdapter {
   kill(paneId: string): void;
 
   /**
+   * Whether kill/killWindow actually stop the pane or its process.
+   * Omitted means yes, except the Windows Terminal and Zellij adapters,
+   * whose current kill methods do not close anything.
+   */
+  closesProcesses?(): boolean;
+
+  /**
    * Check if a terminal pane is still alive/active.
    * 
    * @param paneId - The pane ID returned from spawn()
@@ -120,6 +127,13 @@ export interface TerminalAdapter {
    * @returns true if window exists and is active
    */
   isWindowAlive(windowId: string): boolean;
+}
+
+/** True when this adapter can actually stop a teammate pane or its process. */
+export function terminalClosesProcesses(terminal: Pick<TerminalAdapter, "name" | "closesProcesses"> | null | undefined): boolean {
+  if (!terminal) return false;
+  if (terminal.closesProcesses) return terminal.closesProcesses();
+  return terminal.name !== "windows" && terminal.name !== "zellij";
 }
 
 /**

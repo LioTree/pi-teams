@@ -10,6 +10,7 @@ import {
   cleanupStaleRuntimeFiles,
   createRuntimeError,
   getProcessStartToken,
+  hasConfirmedProcessIdentity,
   isRuntimeProcessAlive,
   markRuntimeQueuedIfIdle,
   setRuntimeActivity,
@@ -213,6 +214,11 @@ describe("runtime status", () => {
       expect(isRuntimeProcessAlive({ pid: process.pid, processStartToken: `${processStartToken}-old` })).toBe(false);
     }
     expect(isRuntimeProcessAlive({ pid: 999_999_999 })).toBe(false);
+    expect(hasConfirmedProcessIdentity({ pid: process.pid })).toBe(false);
+    expect(hasConfirmedProcessIdentity({ pid: process.pid, processStartToken: "unread-token" })).toBe(false);
+    if (processStartToken) {
+      expect(hasConfirmedProcessIdentity({ pid: process.pid, processStartToken })).toBe(true);
+    }
   });
 
   describe("deleteRuntimeStatus", () => {

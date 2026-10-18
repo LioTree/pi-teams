@@ -58,9 +58,17 @@ Resume the original Pi conversation, not a new/forked/cloned chat: exact session
 
 Quitting or losing a terminal leaves roster intent; only explicit removal or destructive `team_shutdown` prevents restoration. This deletes team/task/mail metadata, not Pi conversation history: manual `/resume` remains possible without restoring removed membership. Missing/corrupt/unmapped sessions remain blocked with data preserved. `/team-resume <team>` can explicitly associate an unmapped dead legacy lead or retry panes for the current lead; it cannot force a live owner or guess chat files. Other adapters retain lead inbox recovery but not automatic pane restoration. Restoring context does not roll back background tools or side effects.
 
+## Changing a Teammate Model
+
+`/team-model <teammate> <provider/model> [thinking]` switches a live session without asking that model. Use it when the teammate model has no quota. Do not send the switch as `team_message` or `delegate_task`: those either wait for the model or open a new work generation. An in-flight turn keeps the old model. A paused teammate stays paused.
+
 ## Team Reload
 
 `/team-reload` is a user command in the lead session, not a tool. Every live member reloads itself once safe; busy members finish their run first and are not interrupted. It does not dispatch work or change tasks/mail. Do not treat a reload as a reason to re-send assignments.
+
+## Closing Panes
+
+`/team-close` closes live teammate panes only. Roster, tasks, and inbox stay, so the next original-lead attach restores the panes. `/team-shutdown` does that close and then deletes team metadata; Pi chat history remains for manual `/resume` without membership. Only the live lead of that team can run either command. Windows Terminal and Zellij cannot close panes. When a teammate or pending launch still needs closing, the commands refuse rather than marking members stopped; an already stopped team can still be dissolved. Neither command is a work dispatch. Do not treat a closed pane as task completion.
 
 ## Team Quiescence Fallback
 

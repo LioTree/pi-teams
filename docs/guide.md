@@ -305,9 +305,19 @@ Resume the original lead conversation. Exact Pi session identity reconnects its 
 
 Missing/corrupt/unmapped sessions are reported without deletion or fresh replacement. For an unmapped legacy lead whose old process is gone, `/team-resume <team>` explicitly associates this saved conversation. A current lead may use it for one bounded pane retry. It never forces a live owner or guesses recent chat files. Automatic pane restoration is tmux-only; other adapters can recover the lead inbox. See [design and migration limits](design/team-session-recovery.md).
 
+### Changing a teammate's model while it is live
+
+`/team-model worker xai/grok-4.7 xhigh` switches that session from the lead. The worker's extension applies the host model change itself, so it works when the worker's current model has no quota and cannot answer. The turn already running keeps the old model; nothing is aborted. A paused worker stays paused. Omit the thinking level to leave it unchanged. `delegate_task` still does not change a live member's model.
+
 ### Reloading every teammate after an update
 
 Run `/team-reload` in the lead session. Every live member runs Pi's `/reload` on its own once it is safe: busy runs finish first, and pending inbox delivery, inspection bookkeeping, or an active `team_wait` defer it. Interrupted sessions reload and remain paused. A reloading member is never treated as stopped, so the lead does not reopen its pane; the lead's own reload also skips pane restoration (run `/team-resume <team>` to retry it). If a reload fails after starting, the member stays marked `reloading` in `/team-reload status` (shown as `pending (reloading)`) and in `team_status`/`check_teammate` with a frozen `reloadingSince` timestamp: fix the code on disk and reload that pane again to recover. Check progress with `/team-reload status`; a member is `reloaded` only when its newly loaded code has written a receipt. Install the update on disk first (`pi update`/`pi install`). Sessions running an older pi-teams without this command must be reloaded manually once.
+
+### Closing every teammate pane
+
+`/team-close` closes every live teammate pane at once. The team, tasks, and inbox stay, and the lead pane stays open. Only the Pi session that currently owns that team's lead lease can run it; another window cannot name the team and close it. Members that are already stopped, detached, or dead are listed as `not running` and are not killed again. A teammate pane that was launched for recovery but has not registered is closed, and that launch can no longer attach. A busy teammate is stopped mid-run; its Pi session remains resumable. Resume the original lead conversation, or run `/team-resume <team>`, to open the panes again. This is suspension, not dissolution.
+
+`/team-shutdown` performs that same close, then deletes roster, tasks, and inbox. Conversation history stays in Pi's normal session storage for a manual `/resume`, without rejoining the team. With no argument, both commands use the team this session is attached to. On Windows Terminal and Zellij the close is not implemented. If a teammate or a pending launch still needs closing, including one that appears after the first check, the command reports that and does not mark anyone stopped or delete the team. An already stopped team can still be dissolved.
 
 ### tmux Pane Issues
 

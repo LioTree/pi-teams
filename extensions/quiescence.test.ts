@@ -602,7 +602,7 @@ describe("registered team quiescence fallback", () => {
     const lead = loadExtension("team-lead");
     expect([...lead.tools.keys()].filter(name => /mode|takeover|flush|handback/i.test(name))).toEqual([]);
     const source = fs.readFileSync(path.resolve("extensions/index.ts"), "utf-8");
-    expect(source).not.toMatch(/controlMode|team-mode|control-state|takeover/i);
+    expect(source).not.toMatch(/\bcontrolMode\b|\bteam-mode\b|\bcontrol-state\b|\btakeover\b/i);
   });
 });
 

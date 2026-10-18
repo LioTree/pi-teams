@@ -7,6 +7,73 @@
 
 import { TerminalAdapter, SpawnOptions, execCommand } from "../utils/terminal-adapter";
 
+export interface WindowsPane {
+  pid?: number;
+}
+
+export interface WindowsWindow {
+  id: string;
+  pid?: number;
+  panes: WindowsPane[];
+}
+
+/** `wt list --format json` is either flat pane rows or windows with tabs/panes. */
+export function parseWindowsList(stdout: string): WindowsWindow[] {
+  let data: unknown;
+  try {
+    data = JSON.parse(stdout);
+  } catch {
+    return [];
+  }
+  const raw = Array.isArray(data)
+    ? data
+    : data && typeof data === "object" && Array.isArray((data as { windows?: unknown }).windows)
+      ? (data as { windows: unknown[] }).windows
+      : [];
+  if (raw.length === 0) return [];
+  const first = raw[0] as { window?: unknown; tabs?: unknown; panes?: unknown };
+  if (first.window !== undefined && first.tabs === undefined && first.panes === undefined) {
+    const byWindow = new Map<string, WindowsPane[]>();
+    for (const row of raw as Array<{ window?: unknown; pid?: unknown }>) {
+      const id = String(row.window);
+      const panes = byWindow.get(id) ?? [];
+      panes.push({ pid: typeof row.pid === "number" ? row.pid : undefined });
+      byWindow.set(id, panes);
+    }
+    return [...byWindow].map(([id, panes]) => ({ id, panes }));
+  }
+  return (raw as Array<Record<string, unknown>>).map((win, index) => {
+    const tabs = Array.isArray(win.tabs) ? win.tabs as Array<{ panes?: unknown }> : [];
+    const nested = tabs.flatMap(tab => Array.isArray(tab.panes) ? tab.panes : []);
+    const direct = Array.isArray(win.panes) ? win.panes : [];
+    const panes = [...direct, ...nested].map(pane => {
+      const pid = pane && typeof pane === "object" ? (pane as { pid?: unknown }).pid : undefined;
+      return { pid: typeof pid === "number" ? pid : undefined };
+    });
+    const id = win.id ?? win.name ?? index;
+    return { id: String(id), pid: typeof win.pid === "number" ? win.pid : undefined, panes };
+  });
+}
+
+/**
+ * Prefer the window this process is actually in. `WT_SESSION` is that
+ * window's id. Otherwise match a pane pid. `-w 0` is WT's current window
+ * only as a last resort, when the list does not identify us.
+ */
+export function selectWindowsTarget(
+  windows: readonly WindowsWindow[],
+  options: { session?: string; pid: number },
+): { windowId: string; panes: WindowsPane[] } {
+  const session = options.session?.trim();
+  if (session) {
+    return { windowId: session, panes: windows.find(win => win.id === session)?.panes ?? [] };
+  }
+  const owner = windows.find(win => win.pid === options.pid || win.panes.some(pane => pane.pid === options.pid));
+  if (owner) return { windowId: owner.id, panes: owner.panes };
+  if (windows[0]) return { windowId: windows[0].id, panes: windows[0].panes };
+  return { windowId: "0", panes: [] };
+}
+
 export class WindowsAdapter implements TerminalAdapter {
   readonly name = "Windows";
 
@@ -117,28 +184,24 @@ export class WindowsAdapter implements TerminalAdapter {
   }
 
   /**
-   * Get all panes in the current window to determine layout state.
-   * wt cli list returns JSON with pane information.
+   * Panes in the lead's Windows Terminal window, plus the id `wt -w` must
+   * target. `split-pane` without `-w` opens another window when more than
+   * one exists, or when this process is not WT's "current" window.
    */
-  private getPanes(): any[] {
+  private currentWindow(): { windowId: string; panes: WindowsPane[] } {
     const wtBin = this.findWtBinary();
-    if (!wtBin) return [];
-
+    if (!wtBin) return selectWindowsTarget([], { session: process.env.WT_SESSION, pid: process.pid });
     try {
       const result = execCommand(wtBin, ["list", "--format", "json"]);
-      if (result.status !== 0) return [];
-
-      const allPanes = JSON.parse(result.stdout);
-      
-      // Filter to get panes from current window only
-      // We can't easily get the current pane ID on Windows, so we assume
-      // the first window in the list is the current one
-      if (allPanes.length === 0) return [];
-      
-      const currentWindowId = allPanes[0].window;
-      return allPanes.filter((p: any) => p.window === currentWindowId);
+      if (result.status !== 0 || !result.stdout.trim()) {
+        return selectWindowsTarget([], { session: process.env.WT_SESSION, pid: process.pid });
+      }
+      return selectWindowsTarget(parseWindowsList(result.stdout), {
+        session: process.env.WT_SESSION,
+        pid: process.pid,
+      });
     } catch {
-      return [];
+      return selectWindowsTarget([], { session: process.env.WT_SESSION, pid: process.pid });
     }
   }
 
@@ -149,7 +212,8 @@ export class WindowsAdapter implements TerminalAdapter {
     }
 
     const psBin = this.findPsBinary();
-    const panes = this.getPanes();
+    const current = this.currentWindow();
+    const panes = current.panes;
 
     // Build environment variables for PowerShell
     const envVars = Object.entries(options.env)
@@ -169,15 +233,15 @@ export class WindowsAdapter implements TerminalAdapter {
 
     if (isFirstPane) {
       wtArgs = [
+        "-w", current.windowId,
         "split-pane",
         "--vertical",
         "--size", "50%",
         "--", psBin, "-NoExit", "-Command", psCommand
       ];
     } else {
-      // Create a new tab for subsequent panes (Windows Terminal limitation)
-      // Alternatively split horizontally at the bottom
       wtArgs = [
+        "-w", current.windowId,
         "split-pane",
         "--horizontal",
         "--size", "50%",
@@ -194,6 +258,10 @@ export class WindowsAdapter implements TerminalAdapter {
     // We'll use a timestamp + name to make it unique
     const syntheticId = `windows_${Date.now()}_${options.name}`;
     return syntheticId;
+  }
+
+  closesProcesses(): boolean {
+    return false;
   }
 
   kill(paneId: string): void {
@@ -220,7 +288,10 @@ export class WindowsAdapter implements TerminalAdapter {
 
     try {
       // Set tab title (Windows Terminal uses tab titles, not pane titles)
-      execCommand(wtBin, ["set-tab-title", title]);
+      const args = process.env.WT_SESSION
+        ? ["-w", process.env.WT_SESSION, "set-tab-title", title]
+        : ["set-tab-title", title];
+      execCommand(wtBin, args);
     } catch {
       // Silently fail
     }

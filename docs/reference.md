@@ -65,7 +65,7 @@ check_teammate({ team_name: "my-team", agent_name: "security-bot" })
 
 ### process_shutdown_approved
 
-Initiate orderly shutdown for a finished teammate.
+Initiate orderly shutdown for a finished teammate. The roster entry is removed before process cleanup. If that cleanup loses the runtime lease, the tool reports the lease change and does not claim the process was stopped; the removal stays.
 
 **Parameters**:
 - `team_name` (required): Name of the team
@@ -332,6 +332,10 @@ Roster membership is recovery intent, including manual quit/Ctrl+D/terminal loss
 
 See [the design](design/team-session-recovery.md) for migration, partial-failure, restart, and exactly-once limits.
 
+## Changing a teammate model
+
+`/team-model <teammate> <provider/model> [thinking]` is lead-only and uses the same live-lead lease check as close. It writes `model-change/<teammate>.json`. The target session's coordination poller calls `pi.setModel` (and `setThinkingLevel` only when a level was given) on the model found in that session's registry. No inbox message is sent and the teammate model does not run. A busy session is switched immediately for its next turn; the in-flight turn keeps the previous model. `interrupted` stays paused. Success updates the roster model hint. A missing model or `setModel` returning false (no provider authentication) writes a terminal refusal. A thrown host error retries on the next poll. The command does not open a work generation. `/team-model status` reads the result files.
+
 ## Team Reload
 
 `/team-reload` (lead only) writes `reload/request.json` in the team directory with a fresh request ID and timestamp, then prints per-member status. `/team-reload status` prints status without writing a request. Teammates calling the command get an error.
@@ -343,6 +347,12 @@ While reloading, a member's runtime keeps its PID and activity and gains `reload
 If a reload fails after the shutdown ran (for example a syntax error in the new code), the process stays alive with no pi-teams instance and the `reloading` marker stays behind: the member still shows as live with a frozen `reloadingSince`. Fix the code on disk and run `/reload` in that pane to re-claim (a stranded member has no poller, so a lead-side `/team-reload` cannot reach it). Downgrading to a pi-teams version without this re-claim path is not supported through `/reload`: quit that pane and start a new conversation instead, otherwise the member is stranded as `reloading`.
 
 After reload, the new code sees a request older than its load time and writes `reload/<member>.json` (`requestId`, `pid`, `reloadedAt`). This receipt is what `status` reports as `reloaded`; `pending (reloading)` means a reload is in progress. Loop prevention comes from the reloaded code's newer load time. Interrupted pause state survives the reload. Reload does not open a work generation or change tasks or inbox; re-claiming the session refreshes the member's own session and pane metadata.
+
+## Closing panes
+
+`/team-close [team]` closes every non-lead member that is still a live, attached process, but only when this session is that team's live lead: the saved lead session and the current runtime lease, including its instance id, must both match. Another team, an unattached session, a teammate, and a stale lead instance are refused. The command and the `team_shutdown` tool share that check. It marks the runtime `stopped` only after that lease compare-and-swap commits; a lost compare does not kill the pane and is reported `lease changed`. `delegate_task` with `reuse: "replace"` stops on that result and does not delete the member or spawn a replacement. `process_shutdown_approved` still removes the roster entry first; if the following cleanup loses the lease, it reports that the process was not stopped. `SIGKILL` is sent only when the pid file matches and the current process start token was read and equals the stored token. An unreadable token skips the signal. The terminal adapter then kills the pane and any separate window. Members that are already `stopped`, `detached`, or whose process is dead are reported `not running` and are not killed again. A recovery record still in `reserved` or `launched` is marked `failed` before any late child can claim it. The pane id and window id are taken from that locked record: a window-only launch is closed with `killWindow` even when it has no pane id. Roster, tasks, inbox, and Pi session files are untouched. The lead session stays attached and is not stopped. Closing does not restore panes in the same process; the next original-lead `session_start`, or `/team-resume <team>`, runs the normal bounded restore. Busy work is killed mid-run. This is not a work dispatch and does not complete tasks.
+
+`/team-shutdown [team]` is the user-facing form of the `team_shutdown` tool and uses the same close, including the skip and pending-launch rules, then deletes the team directory and task directory. Pi conversation files outside those directories remain. If this session is attached to the named team, it stops inbox polling and clears its team attachment after the close. Windows Terminal and Zellij adapters do not close processes. When any teammate or pending launch still needs a close, both commands throw before changing runtime records or deleting team data, including when that need appears after the first look. A team whose teammates are already stopped, detached, or dead, with no pending launch, can still be closed or dissolved. With no argument, both commands use the attached team name.
 
 ## Team Quiescence Fallback
 

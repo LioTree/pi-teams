@@ -289,6 +289,18 @@ export function getProcessStartToken(pid: number): string | undefined {
   }
 }
 
+/**
+ * Identity check for destructive signals. Unlike {@link isRuntimeProcessAlive},
+ * an unreadable start token does not count as a match: skip the signal instead
+ * of killing whatever now owns that PID.
+ */
+export function hasConfirmedProcessIdentity(status: Pick<AgentRuntimeStatus, "pid" | "processStartToken">): boolean {
+  if (status.pid === undefined || !status.processStartToken) return false;
+  if (!isProcessAlive(status.pid)) return false;
+  const currentToken = getProcessStartToken(status.pid);
+  return currentToken !== undefined && currentToken === status.processStartToken;
+}
+
 export function isRuntimeProcessAlive(status: Pick<AgentRuntimeStatus, "pid" | "processStartToken">): boolean {
   if (status.pid === undefined || !isProcessAlive(status.pid)) return false;
   if (!status.processStartToken) return true;

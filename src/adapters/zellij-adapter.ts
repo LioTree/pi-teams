@@ -39,6 +39,10 @@ export class ZellijAdapter implements TerminalAdapter {
     return `zellij_${options.name}`;
   }
 
+  closesProcesses(): boolean {
+    return false;
+  }
+
   kill(_paneId: string): void {
     // Zellij uses --close-on-exit, so panes close automatically
     // when the process exits. No explicit kill needed.

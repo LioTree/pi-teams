@@ -10,6 +10,14 @@ import { classifyTeamWaitPeer, waitForTeam } from "../src/utils/team-wait";
 import { allocateSession, claimSession, findSessionMember, sessionIdentity, restoreTeamPanes } from "../src/utils/team-session";
 import { launchReservedMember } from "../src/utils/member-launch";
 import { isReloadedFor, readReloadReceipt, readReloadRequest, recordReloaded, reloadDue, requestTeamReload } from "../src/utils/team-reload";
+import {
+  parseModelRef,
+  parseThinkingLevel,
+  readModelChange,
+  readModelChangeResult,
+  recordModelChangeResult,
+  requestModelChange,
+} from "../src/utils/team-model";
 import { withLock } from "../src/utils/lock";
 import {
   acknowledgeAcceptedInspection,
@@ -31,6 +39,7 @@ import {
   resolveTeammateThinking,
 } from "../src/utils/agent-settings";
 import { getTerminalAdapter } from "../src/adapters/terminal-registry";
+import { terminalClosesProcesses } from "../src/utils/terminal-adapter";
 import { Iterm2Adapter } from "../src/adapters/iterm2-adapter";
 import * as predefined from "../src/utils/predefined-teams";
 import * as path from "node:path";
@@ -978,6 +987,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   }
 
   async function pollTeamCoordination(): Promise<void> {
+    await applyRequestedModelChange().catch(() => undefined);
     await deliverUnreadInbox();
     if (pendingInspectionRelease && !settlementActive && !sessionStopping) {
       // Retry metadata-only cleanup even while paused. This neither starts a
@@ -1028,6 +1038,55 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       try { recordReloaded(teamName, agentName, request.id); } catch {}
     }
     return reloadDue(request, EXTENSION_LOADED_AT) ? request : undefined;
+  }
+
+  let modelChangeInFlight = false;
+
+  /**
+   * Apply a lead-requested model switch inside this process. `pi.setModel`
+   * is host state: it does not start a turn and does not ask this session's
+   * model to do anything, so it still runs when that model has no quota.
+   * An in-flight turn keeps the old model until it ends. Pause is untouched.
+   */
+  async function applyRequestedModelChange(): Promise<void> {
+    if (!teamName || sessionStopping || modelChangeInFlight || typeof pi.setModel !== "function") return;
+    const request = readModelChange(teamName, agentName);
+    if (!request) return;
+    if (readModelChangeResult(teamName, agentName)?.requestId === request.id) return;
+    const parsed = parseModelRef(request.model);
+    const registry = sessionCtx?.modelRegistry;
+    const model = parsed && registry?.find ? registry.find(parsed.provider, parsed.id) : undefined;
+    if (!parsed || !model) {
+      const error = !parsed ? "model must be provider/id" : `unknown model ${request.model}`;
+      recordModelChangeResult(teamName, agentName, { requestId: request.id, ok: false, error });
+      sessionCtx?.ui?.notify?.(`Model change refused: ${error}`, "warning");
+      return;
+    }
+    modelChangeInFlight = true;
+    try {
+      const ok = await pi.setModel(model);
+      if (!ok) {
+        recordModelChangeResult(teamName, agentName, {
+          requestId: request.id, ok: false, error: "no authentication for this provider",
+        });
+        sessionCtx?.ui?.notify?.(`Model change refused: no authentication for ${request.model}`, "warning");
+        return;
+      }
+      if (request.thinking) pi.setThinkingLevel?.(request.thinking);
+      await teams.updateMember(teamName, agentName, {
+        model: request.model,
+        ...(request.thinking ? { thinking: request.thinking } : {}),
+      });
+      recordModelChangeResult(teamName, agentName, { requestId: request.id, ok: true });
+      sessionCtx?.ui?.notify?.(
+        `Model is now ${request.model}${request.thinking ? ` (${request.thinking})` : ""}. An in-flight turn keeps the previous model until it ends.`,
+        "info",
+      );
+    } catch {
+      // Host or roster write failed before a result was recorded. Retry next poll.
+    } finally {
+      modelChangeInFlight = false;
+    }
   }
 
   function dispatchRequestedReload() {
@@ -1313,6 +1372,48 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     },
   });
 
+  pi.registerCommand("team-model", {
+    description: "Switch a live teammate session to another model. The teammate extension applies it; the teammate model is not asked, so this works when that model has no quota. An in-flight turn keeps the old model until it ends. `/team-model status` reports results.",
+    handler: async (args, ctx) => {
+      if (sessionStopping) throw new Error("Session is detaching");
+      if (!teamName) throw new Error("This session is not attached to a team");
+      await assertLiveLead(teamName, "change a teammate model");
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const config = await teams.readConfig(teamName);
+      const teammates = config.members.filter(member => member.agentType !== "lead" && member.name !== "team-lead");
+      if (parts.length === 0 || parts[0] === "status") {
+        const lines = teammates.map(member => {
+          const request = readModelChange(teamName!, member.name);
+          const result = readModelChangeResult(teamName!, member.name);
+          if (!request) return `${member.name}: no request`;
+          if (result?.requestId !== request.id) return `${member.name}: pending ${request.model}`;
+          return result.ok
+            ? `${member.name}: ${request.model}${request.thinking ? ` (${request.thinking})` : ""}`
+            : `${member.name}: refused (${result.error ?? "failed"})`;
+        });
+        ctx.ui.notify(lines.join("\n") || "No teammates.", "info");
+        return;
+      }
+      const [name, spec, thinkingRaw, extra] = parts;
+      if (!spec || extra) throw new Error("Usage: /team-model <teammate> <provider/model> [thinking]");
+      const agent = paths.sanitizeName(name!);
+      const parsed = parseModelRef(spec);
+      if (!parsed) throw new Error("Model must be provider/id, for example xai/grok-4.7");
+      const thinking = parseThinkingLevel(thinkingRaw);
+      if (thinkingRaw && !thinking) {
+        throw new Error(`Thinking must be one of ${THINKING_LEVELS.join(", ")}`);
+      }
+      const member = teammates.find(item => item.name === agent);
+      if (!member) throw new Error(`No teammate named ${agent}`);
+      const model = `${parsed.provider}/${parsed.id}`;
+      const request = requestModelChange(teamName, agent, model, thinking);
+      ctx.ui.notify(
+        `Requested ${request.model}${request.thinking ? ` (${request.thinking})` : ""} for ${agent}. That session's extension applies it directly; the teammate model is not asked. An in-flight turn keeps the old model until it ends.`,
+        "info",
+      );
+    },
+  });
+
   pi.registerCommand("team-reload", {
     description: "Reload pi-teams code in every team member once it is idle (`/team-reload status` shows progress). Busy members finish their current run first.",
     handler: async (args, ctx) => {
@@ -1349,6 +1450,30 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       // Still active here means the host refused (e.g. a run started); the
       // poller retries. On success this closure is retired and must not be used.
       if (!sessionStopping) reloadingForRequest = undefined;
+    },
+  });
+
+  pi.registerCommand("team-close", {
+    description: "Close every teammate pane/window of this team in one action, keeping the team, tasks, and inbox for later recovery. Busy teammates are killed mid-run; their sessions stay resumable. Only this team's live lead can run it.",
+    handler: async (args, ctx) => {
+      if (sessionStopping) throw new Error("Session is detaching");
+      const requested = paths.sanitizeName(args.trim()) || teamName;
+      if (!requested) throw new Error("Not attached to a team; usage: /team-close <team>");
+      await assertLiveLead(requested, "close");
+      const lines = await closeTeammatePanes(requested);
+      // The lead session stays attached; the team goes dormant until the lead
+      // conversation is resumed and restoreTeamPanes relaunches the members.
+      ctx.ui.notify([`Team ${requested} panes closed (data preserved):`, ...lines].join("\n"), "info");
+    },
+  });
+
+  pi.registerCommand("team-shutdown", {
+    description: "Shut down this team: close all teammate panes/windows and delete roster, tasks, and inbox data. Pi conversation history is preserved. Irreversible. Only this team's live lead can run it.",
+    handler: async (args, ctx) => {
+      const requested = paths.sanitizeName(args.trim()) || teamName;
+      if (!requested) throw new Error("Not attached to a team; usage: /team-shutdown <team>");
+      const result = await shutdownTeam(requested, ctx);
+      ctx.ui.notify(result.text, "info");
     },
   });
 
@@ -1615,19 +1740,115 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     }));
   });
 
-  async function killTeammate(teamName: string, member: Member) {
-    if (member.name === "team-lead") return;
+  /** Only the lead conversation that currently owns this team's runtime lease. */
+  async function assertLiveLead(requested: string, action: "close" | "shut down" | "change a teammate model"): Promise<void> {
+    if (isTeammate) {
+      throw new Error(action === "close"
+        ? "Only the team lead can close team panes"
+        : action === "shut down"
+          ? "Only the team lead can shut down an entire team"
+          : "Only the team lead can change a teammate model");
+    }
+    const owned = !!teamName && teamName === requested && !!identity
+      && identity.id && identity.file;
+    const status = owned ? await runtime.readRuntimeStatus(requested, "team-lead") : null;
+    const config = owned ? await teams.readConfig(requested).catch(() => null) : null;
+    const lead = config?.members.find(member => member.agentType === "lead" || member.name === "team-lead");
+    const sameConversation = !!lead?.session && lead.session.id === identity?.id && lead.session.file === identity?.file;
+    const liveLease = !!status && status.instanceId === runtimeInstanceId && !status.detached
+      && status.activity !== "stopped" && runtime.isRuntimeProcessAlive(status)
+      && status.sessionId === identity?.id && status.sessionFile === identity?.file;
+    if (!owned || !sameConversation || !liveLease) {
+      throw new Error(`Only the live lead of ${requested} can ${action} it`);
+    }
+  }
 
-    const runtimeStatus = await runtime.readRuntimeStatus(teamName, member.name);
+  function requireCloseableTerminal(action: "close" | "shut down"): void {
+    if (terminalClosesProcesses(terminal)) return;
+    const which = terminal?.name === "zellij" ? "Zellij" : "Windows Terminal";
+    throw new Error(`${which} cannot close teammate panes, so /team-${action === "close" ? "close" : "shutdown"} did not change this team. No member was marked stopped.`);
+  }
+
+  /** Fail a launch that has not registered yet. Pane and window ids come from this locked record, not an earlier snapshot. */
+  async function invalidatePendingLaunch(team: string, memberName: string, action: "close" | "shut down"): Promise<{ cancelled: boolean; pane?: string; windowId?: string }> {
+    const configFile = paths.configPath(team);
+    return withLock(configFile, async () => {
+      const config = JSON.parse(fs.readFileSync(configFile, "utf8")) as { members: Member[] };
+      const member = config.members.find(item => item.name === memberName);
+      const phase = member?.recovery?.phase;
+      if (!member?.recovery || phase === "attached" || phase === "failed") return { cancelled: false };
+      // A launch can appear after the preflight. Refuse before the durable failure write.
+      if (!terminalClosesProcesses(terminal)) requireCloseableTerminal(action);
+      const pane = phase === "launched" && member.tmuxPaneId ? member.tmuxPaneId : undefined;
+      const windowId = phase === "launched" && member.windowId ? member.windowId : undefined;
+      member.recovery.phase = "failed";
+      member.recovery.error = "closed before the restored session registered";
+      atomicWriteJsonSync(configFile, config);
+      return { cancelled: true, pane, windowId };
+    });
+  }
+
+  async function memberIsRunning(team: string, member: Member): Promise<boolean> {
+    const status = await runtime.readRuntimeStatus(team, member.name);
+    return !!status && !status.detached && status.activity !== "stopped"
+      && runtime.isRuntimeProcessAlive(status);
+  }
+
+  /** Close live teammates and cancel pane launches that have not registered. Lead pane stays. */
+  async function closeTeammatePanes(team: string, action: "close" | "shut down" = "close"): Promise<string[]> {
+    const config = await teams.readConfig(team);
+    const teammates = config.members.filter(member => member.agentType !== "lead" && member.name !== "team-lead");
+    let needsTerminal = false;
+    for (const member of teammates) {
+      const phase = member.recovery?.phase;
+      const pending = !!phase && phase !== "attached" && phase !== "failed";
+      if (pending || await memberIsRunning(team, member)) { needsTerminal = true; break; }
+    }
+    if (needsTerminal) requireCloseableTerminal(action);
+    const lines: string[] = [];
+    for (const member of teammates) {
+      const fresh = (await teams.readConfig(team)).members.find(item => item.name === member.name) ?? member;
+      const phase = fresh.recovery?.phase;
+      const pendingNow = !!phase && phase !== "attached" && phase !== "failed";
+      if ((pendingNow || await memberIsRunning(team, fresh)) && !terminalClosesProcesses(terminal)) {
+        requireCloseableTerminal(action);
+      }
+      const pending = await invalidatePendingLaunch(team, member.name, action);
+      if (pending.cancelled) {
+        if (terminal) {
+          if (pending.windowId) terminal.killWindow(pending.windowId);
+          if (pending.pane) terminal.kill(pending.pane);
+        }
+        lines.push(`${member.name}: closed`);
+        continue;
+      }
+      const current = (await teams.readConfig(team)).members.find(item => item.name === member.name) ?? fresh;
+      if (!(await memberIsRunning(team, current))) {
+        lines.push(`${current.name}: not running`);
+        continue;
+      }
+      if (!terminalClosesProcesses(terminal)) requireCloseableTerminal(action);
+      const outcome = await killTeammate(team, current);
+      lines.push(`${current.name}: ${outcome === "closed" ? "closed" : "lease changed"}`);
+    }
+    return lines;
+  }
+
+  async function killTeammate(teamName: string, member: Member): Promise<"closed" | "lease-changed"> {
+    if (member.name === "team-lead") return "closed";
+
+    let runtimeStatus = await runtime.readRuntimeStatus(teamName, member.name);
     if (runtimeStatus?.instanceId) {
-      await runtime.replaceRuntimeInstance(teamName, member.name, runtimeStatus.instanceId, undefined, {
+      const replaced = await runtime.replaceRuntimeInstance(teamName, member.name, runtimeStatus.instanceId, undefined, {
         activity: "stopped",
         lastHeartbeatAt: Date.now(),
-      }).catch(() => undefined);
+      });
+      if (!replaced) return "lease-changed";
+      runtimeStatus = replaced;
     } else {
-      await runtime.setRuntimeActivity(teamName, member.name, "stopped", {
+      runtimeStatus = await runtime.setRuntimeActivity(teamName, member.name, "stopped", {
         lastHeartbeatAt: Date.now(),
-      }).catch(() => undefined);
+      });
     }
 
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
@@ -1635,16 +1856,14 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       try {
         const pid = fs.readFileSync(pidFile, "utf-8").trim();
         const parsedPid = parseInt(pid, 10);
-        if (
-          runtimeStatus?.pid === parsedPid &&
-          runtimeStatus.processStartToken !== undefined &&
-          runtime.isRuntimeProcessAlive(runtimeStatus)
-        ) {
+        // Signal only when the current start token was read and matches.
+        // An unreadable token must not kill whatever now owns this PID.
+        if (runtimeStatus?.pid === parsedPid && runtime.hasConfirmedProcessIdentity(runtimeStatus)) {
           process.kill(parsedPid, "SIGKILL");
         }
         fs.unlinkSync(pidFile);
-      } catch (e) {
-        // ignore
+      } catch {
+        // A pid-file read failure skips the signal. The pane close below still runs.
       }
     }
 
@@ -1655,7 +1874,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     if (member.tmuxPaneId && terminal) {
       terminal.kill(member.tmuxPaneId);
     }
-
+    return "closed";
   }
 
   function isMemberAlive(team: string, member: Member, runtimeStatus?: runtime.AgentRuntimeStatus | null): boolean {
@@ -1917,7 +2136,10 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       }
 
       if (member && reuse === "replace") {
-        await killTeammate(safeTeamName, member);
+        const outcome = await killTeammate(safeTeamName, member);
+        if (outcome === "lease-changed") {
+          throw new Error(`Teammate ${safeName} lease changed during replacement; the original member was left in place and was not replaced.`);
+        }
         await teams.removeMember(safeTeamName, safeName);
         member = undefined;
         teamConfig = await teams.readConfig(safeTeamName);
@@ -2368,50 +2590,50 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     },
   });
 
+  // Shared by the team_shutdown tool and the /team-shutdown user command.
+  async function shutdownTeam(shuttingDownTeamName: string, ctx: any): Promise<{ text: string; cleanedSessions: number }> {
+    try {
+      await assertLiveLead(shuttingDownTeamName, "shut down");
+      const closed = await closeTeammatePanes(shuttingDownTeamName, "shut down");
+      if (teamName === shuttingDownTeamName) {
+        await runtime.updateRuntimeStatusForInstance(shuttingDownTeamName, agentName, runtimeInstanceId, {
+          activity: "stopped",
+          lastHeartbeatAt: Date.now(),
+        }).catch(() => undefined);
+      }
+      if (teamName === shuttingDownTeamName) {
+        stopInboxPolling();
+        teamName = null;
+        ctx.ui.setStatus("pi-teams", undefined);
+      }
+      const dir = paths.teamDir(shuttingDownTeamName);
+      const tasksDir = paths.taskDir(shuttingDownTeamName);
+      if (fs.existsSync(tasksDir)) fs.rmSync(tasksDir, { recursive: true });
+      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
+
+      // Clean up orphaned agent session folders (older than 1 hour)
+      const cleanedSessions = cleanupAgentSessionFolders(60 * 60 * 1000);
+
+      const text = `Team ${shuttingDownTeamName} shut down. ${closed.join("; ")}.${cleanedSessions > 0 ? ` Cleaned up ${cleanedSessions} orphaned agent session folder(s).` : ""}`;
+      return { text, cleanedSessions };
+    } catch (e) {
+      throw new Error(`Failed to shutdown team: ${e}`);
+    }
+  }
+
   pi.registerTool({
     name: "team_shutdown",
     label: "Shutdown Team",
-    description: "Shutdown the entire team and close all panes/windows.",
+    description: "Shut down the team this lead session owns: close teammate panes, then delete roster, tasks, and inbox. Refuses any other team.",
     parameters: Type.Object({
       team_name: Type.String(),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      if (isTeammate) throw new Error("Only the team lead can shut down an entire team");
-      const shuttingDownTeamName = params.team_name;
-      try {
-        const config = await teams.readConfig(shuttingDownTeamName);
-        if (teamName === shuttingDownTeamName) {
-          await runtime.updateRuntimeStatusForInstance(shuttingDownTeamName, agentName, runtimeInstanceId, {
-            activity: "stopped",
-            lastHeartbeatAt: Date.now(),
-          }).catch(() => undefined);
-        }
-        for (const member of config.members) {
-          await killTeammate(shuttingDownTeamName, member);
-        }
-        if (teamName === shuttingDownTeamName) {
-          stopInboxPolling();
-          teamName = null;
-          ctx.ui.setStatus("pi-teams", undefined);
-        }
-        const dir = paths.teamDir(shuttingDownTeamName);
-        const tasksDir = paths.taskDir(shuttingDownTeamName);
-        if (fs.existsSync(tasksDir)) fs.rmSync(tasksDir, { recursive: true });
-        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
-
-        // Clean up orphaned agent session folders (older than 1 hour)
-        const cleanedSessions = cleanupAgentSessionFolders(60 * 60 * 1000);
-
-        return {
-          content: [{
-            type: "text",
-            text: `Team ${shuttingDownTeamName} shut down.${cleanedSessions > 0 ? ` Cleaned up ${cleanedSessions} orphaned agent session folder(s).` : ""}`
-          }],
-          details: { cleanedSessions }
-        };
-      } catch (e) {
-        throw new Error(`Failed to shutdown team: ${e}`);
-      }
+      const result = await shutdownTeam(params.team_name, ctx);
+      return {
+        content: [{ type: "text", text: result.text }],
+        details: { cleanedSessions: result.cleanedSessions }
+      };
     },
   });
 
@@ -2512,7 +2734,10 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       // Persist removal before fallible process cleanup, so recovery can never
       // race a shutdown approval into resurrecting the same roster entry.
       await teams.removeMember(params.team_name, params.agent_name);
-      await killTeammate(params.team_name, member);
+      const outcome = await killTeammate(params.team_name, member);
+      if (outcome === "lease-changed") {
+        throw new Error(`Teammate ${params.agent_name} was removed from the team, but its process lease changed before it could be stopped.`);
+      }
       return {
         content: [{ type: "text", text: `Teammate ${params.agent_name} has been shut down.` }],
         details: {},

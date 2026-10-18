@@ -12,7 +12,7 @@ vi.mock("../utils/terminal-adapter", () => ({
 
 // Import after mock
 import { execCommand } from "../utils/terminal-adapter";
-import { WindowsAdapter } from "./windows-adapter";
+import { parseWindowsList, selectWindowsTarget, WindowsAdapter } from "./windows-adapter";
 
 const mockExecCommand = vi.mocked(execCommand);
 const execResult = (stdout = "", status: number | null = 0) => ({ stdout, stderr: "", status });
@@ -32,6 +32,7 @@ describe("WindowsAdapter", () => {
     delete process.env.TMUX;
     delete process.env.ZELLIJ;
     delete process.env.WEZTERM_PANE;
+    delete process.env.WT_SESSION;
 
     Object.defineProperty(process, "platform", {
       value: originalPlatform,
@@ -87,6 +88,56 @@ describe("WindowsAdapter", () => {
       process.env.WEZTERM_PANE = "123";
 
       expect(adapter.detect()).toBe(false);
+    });
+  });
+
+  describe("window target", () => {
+    it("parses flat pane rows and nested windows", () => {
+      expect(parseWindowsList('[{"window":2,"pid":9},{"window":2,"pid":8},{"window":1,"pid":4}]'))
+        .toEqual([
+          { id: "2", panes: [{ pid: 9 }, { pid: 8 }] },
+          { id: "1", panes: [{ pid: 4 }] },
+        ]);
+      expect(parseWindowsList(JSON.stringify({
+        windows: [{ id: "lead-window", tabs: [{ panes: [{ pid: 4 }, { pid: 5 }] }] }],
+      }))).toEqual([{ id: "lead-window", pid: undefined, panes: [{ pid: 4 }, { pid: 5 }] }]);
+    });
+
+    it("targets the lead session or the window that owns this pid, not the first window", () => {
+      const windows = parseWindowsList(JSON.stringify([
+        { window: 1, pid: 10 },
+        { window: 2, pid: 20 },
+        { window: 2, pid: 21 },
+      ]));
+      expect(selectWindowsTarget(windows, { session: "{lead-session}", pid: 20 }).windowId).toBe("{lead-session}");
+      expect(selectWindowsTarget(windows, { pid: 21 })).toEqual({
+        windowId: "2",
+        panes: [{ pid: 20 }, { pid: 21 }],
+      });
+      expect(selectWindowsTarget([], { pid: 1 }).windowId).toBe("0");
+    });
+
+    it("passes the lead window to wt split-pane", () => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      process.env.WT_SESSION = "{lead-session}";
+      mockExecCommand.mockReturnValueOnce(execResult("wt"));
+      mockExecCommand.mockReturnValueOnce(execResult("found"));
+      mockExecCommand.mockReturnValueOnce(execResult(JSON.stringify([
+        { window: 1, pid: 10 },
+        { window: 2, pid: 20 },
+      ])));
+      mockExecCommand.mockReturnValueOnce(execResult());
+
+      adapter.spawn({
+        name: "peer",
+        cwd: "/test/path",
+        command: "pi",
+        env: { PI_TEAM_NAME: "team1" },
+      });
+
+      const split = mockExecCommand.mock.calls.find(call => call[1]?.includes("split-pane"));
+      expect(split?.[1]?.slice(0, 3)).toEqual(["-w", "{lead-session}", "split-pane"]);
+      delete process.env.WT_SESSION;
     });
   });
 

@@ -185,11 +185,21 @@ Missing/corrupt session files and unmapped legacy members are reported without d
 
 See [session recovery design and limits](docs/design/team-session-recovery.md).
 
+## Changing a live teammate's model
+
+`/team-model <teammate> <provider/model> [thinking]` asks that teammate's extension to switch the session. The teammate model is not asked, so this still works when that model has no quota. The current turn keeps the old model until it ends; the command does not abort it or resume a paused session. `/team-model status` shows pending, applied, and refused requests. Reusing a teammate with `delegate_task` does not change its live model.
+
 ## Reloading the Whole Team
 
 After updating pi-teams (or any extension) on disk, run `/team-reload` once in the lead session instead of typing `/reload` in every pane. Each live member reloads itself as soon as it is safe: a busy teammate finishes its current run first and is never interrupted, and pending inbox delivery or an active `team_wait` also defers it. Interrupted sessions reload and stay paused. `/team-reload status` shows which members are `reloaded` or still `pending`, without sending a new request.
 
 Reload is not dispatch; it leaves tasks, mail, and work generations unchanged. It only loads code already on disk, so run `pi update`/`pi install` first. Sessions still running a pi-teams version without this feature need one manual `/reload`.
+
+## Closing teammate panes
+
+`/team-close` closes every live teammate pane in one step and leaves the team, tasks, and inbox in place. Only the live lead of that same team can run it; another Pi window, or the lead of a different team, cannot. The lead pane stays open. A teammate that is already stopped, detached, or dead is reported as `not running` and is not killed again. A restore that has not registered yet is cancelled, so that late process cannot join afterward. Busy teammates are stopped mid-run; their Pi sessions remain resumable. Panes come back when you resume the original lead conversation, or immediately with `/team-resume <team>`.
+
+`/team-shutdown` is that same close, then dissolution: roster, tasks, and inbox are deleted. It follows the same lead check and the same skip rules. Pi conversation history is kept for a manual `/resume`, without team reattachment. Windows Terminal and Zellij cannot close panes yet. When a teammate or a pending launch still needs closing, both commands refuse and leave every member as it was. A team that is already fully stopped can still be dissolved.
 
 ## 🏗️ Predefined Teams
 
