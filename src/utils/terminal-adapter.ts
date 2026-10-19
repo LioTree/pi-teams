@@ -7,6 +7,9 @@
 
 import { spawnSync } from "node:child_process";
 
+/** Result of a terminal close that reports whether the command succeeded. */
+export type TerminalCloseResult = "closed" | "absent" | "failed";
+
 /**
  * Options for spawning a new terminal pane or window
  */
@@ -57,10 +60,13 @@ export interface TerminalAdapter {
   /**
    * Kill/terminate a terminal pane.
    * Should be idempotent - no error if pane doesn't exist.
-   * 
+   *
+   * `failed` means the terminal refused the close. `absent` means the pane was
+   * already gone. `void` means this adapter does not report a command status.
+   *
    * @param paneId - The pane ID returned from spawn()
    */
-  kill(paneId: string): void;
+  kill(paneId: string): void | TerminalCloseResult;
 
   /**
    * Whether kill/killWindow actually stop the pane or its process.
@@ -124,7 +130,7 @@ export interface TerminalAdapter {
    * 
    * @param windowId - The window ID returned from spawnWindow()
    */
-  killWindow(windowId: string): void;
+  killWindow(windowId: string): void | TerminalCloseResult;
 
   /**
    * Check if a window is still alive/active.

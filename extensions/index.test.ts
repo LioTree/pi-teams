@@ -96,6 +96,7 @@ function registerExtension() {
       return vi.fn();
     }),
     registerTool,
+    registerCommand: vi.fn(),
   };
 
   // The real factory registers everything; the stub only records registrations.
@@ -170,62 +171,15 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("registered teammate shutdown tool", () => {
-  it.each([true, false])("prepares a bridge before killing the PID and supports older adapters (hook: %s)", async hasHook => {
-    const prepareShutdown = vi.fn();
-    const terminal = { kill: vi.fn(), ...(hasHook ? { prepareShutdown } : {}) };
-    mocks.getTerminalAdapter.mockReturnValue(terminal);
-    mocks.readConfig.mockResolvedValue(teamConfig({ ...baseMember, tmuxPaneId: "windows_test_handle" }));
-    mocks.readRuntimeStatus.mockResolvedValue({ instanceId: "test-instance", pid: 424242, processStartToken: "test-token" });
-    mocks.replaceRuntimeInstance.mockResolvedValue({ pid: 424242, processStartToken: "test-token", activity: "stopped" });
-    mocks.isRuntimeProcessAlive.mockReturnValue(true);
-    mocks.hasConfirmedProcessIdentity.mockReturnValue(true);
-    mocks.existsSync.mockReturnValue(true);
-    mocks.readFileSync.mockReturnValue("424242");
-    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
+describe("registered close and resume tools", () => {
+  it("exposes reversible close and resume instead of destructive shutdown tools", () => {
     const registerTool = vi.fn();
-    extension({ on: vi.fn(), registerTool } as unknown as ExtensionAPI);
-    const tool = registerTool.mock.calls.find(([tool]) => tool.name === "process_shutdown_approved")![0];
-    await tool.execute("shutdown-test", { team_name: teamName, agent_name: teammateName }, undefined, undefined, {});
-
-    expect(kill).toHaveBeenCalledWith(424242, "SIGKILL");
-    if (hasHook) {
-      expect(prepareShutdown).toHaveBeenCalledWith("windows_test_handle");
-      expect(prepareShutdown.mock.invocationCallOrder[0]).toBeLessThan(kill.mock.invocationCallOrder[0]);
-    } else {
-      expect(prepareShutdown).not.toHaveBeenCalled();
-    }
-    expect(terminal.kill).toHaveBeenCalledWith("windows_test_handle");
-    expect(mocks.removeMember).toHaveBeenCalledWith(teamName, teammateName);
-  });
-
-  it.each(["lost-lease", "unconfirmed-pid", "marker-error"])("does not mask the %s shutdown boundary", async boundary => {
-    const prepareShutdown = vi.fn();
-    if (boundary === "marker-error") prepareShutdown.mockImplementation(() => { throw new Error("marker denied"); });
-    const terminal = { kill: vi.fn(), prepareShutdown };
-    mocks.getTerminalAdapter.mockReturnValue(terminal);
-    mocks.readConfig.mockResolvedValue(teamConfig({ ...baseMember, tmuxPaneId: "windows_test_handle" }));
-    mocks.readRuntimeStatus.mockResolvedValue({ instanceId: "test-instance", pid: 424242, processStartToken: "test-token" });
-    mocks.replaceRuntimeInstance.mockResolvedValue(boundary === "lost-lease" ? null
-      : { pid: 424242, processStartToken: "test-token", activity: "stopped" });
-    mocks.hasConfirmedProcessIdentity.mockReturnValue(boundary !== "unconfirmed-pid");
-    mocks.existsSync.mockReturnValue(true);
-    mocks.readFileSync.mockReturnValue("424242");
-    const kill = vi.spyOn(process, "kill").mockReturnValue(true);
-    const registerTool = vi.fn();
-    extension({ on: vi.fn(), registerTool } as unknown as ExtensionAPI);
-    const tool = registerTool.mock.calls.find(([tool]) => tool.name === "process_shutdown_approved")![0];
-    const result = tool.execute("shutdown-test", { team_name: teamName, agent_name: teammateName }, undefined, undefined, {});
-
-    if (boundary === "unconfirmed-pid") {
-      await result;
-      expect(terminal.kill).toHaveBeenCalledWith("windows_test_handle");
-    } else {
-      await expect(result).rejects.toThrow(boundary === "lost-lease" ? "process lease changed" : "marker denied");
-      expect(terminal.kill).not.toHaveBeenCalled();
-    }
-    expect(kill).not.toHaveBeenCalledWith(424242, "SIGKILL");
-    if (boundary !== "marker-error") expect(prepareShutdown).not.toHaveBeenCalled();
+    extension({ on: vi.fn(), registerTool, registerCommand: vi.fn() } as unknown as ExtensionAPI);
+    const names = registerTool.mock.calls.map(([tool]) => tool.name);
+    expect(names).toContain("team_close");
+    expect(names).toContain("team_resume");
+    expect(names).not.toContain("process_shutdown_approved");
+    expect(names).not.toContain("team_shutdown");
   });
 });
 

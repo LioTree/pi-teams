@@ -238,6 +238,16 @@ describe("TmuxAdapter", () => {
     expect(mockExecCommand.mock.calls.some((call: any[]) => call[1][0] === "split-window")).toBe(false);
   });
 
+  it("reports a refused kill-pane instead of ignoring the status", () => {
+    mockExecCommand.mockReturnValue({ stdout: "", stderr: "kill-pane refused", status: 1 });
+    expect(adapter.kill("%99")).toBe("failed");
+  });
+
+  it("treats a missing pane as already closed", () => {
+    mockExecCommand.mockReturnValue({ stdout: "", stderr: "can't find pane: %99", status: 1 });
+    expect(adapter.kill("%99")).toBe("absent");
+  });
+
   it("should target the current pane when setting the title", () => {
     mockExecCommand.mockReturnValue({ stdout: "", stderr: "", status: 0 });
 

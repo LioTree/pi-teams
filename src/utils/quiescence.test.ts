@@ -364,6 +364,36 @@ describe("team quiescence watermark", () => {
     expect(await leadUnread()).toHaveLength(1);
     expect(first.id).toBe("fixed-id");
 
+    const inboxDir = path.join(teamRoot(), "inboxes");
+    fs.rmSync(inboxDir, { recursive: true, force: true });
+    const refused = await appendMessageOnce(teamName, leadName, {
+      id: "refused-id",
+      from: "a",
+      text: "no",
+      timestamp: new Date(0).toISOString(),
+      read: false,
+    }, () => false);
+    expect(refused).toBeNull();
+    expect(fs.existsSync(inboxDir)).toBe(false);
+
+    let checks = 0;
+    const flipped = await appendMessageOnce(teamName, leadName, {
+      id: "flip-id",
+      from: "a",
+      text: "late",
+      timestamp: new Date(0).toISOString(),
+      read: false,
+    }, () => {
+      checks += 1;
+      return checks === 1;
+    });
+    expect(flipped).toBeNull();
+    const inboxFile = path.join(inboxDir, "team-lead.json");
+    if (fs.existsSync(inboxFile)) {
+      const msgs = JSON.parse(fs.readFileSync(inboxFile, "utf8")) as { id?: string }[];
+      expect(msgs.some(item => item.id === "flip-id")).toBe(false);
+    }
+
     fs.writeFileSync(path.join(teamRoot(), "quiescence.json"), "{not json");
     await expect(openFormalGeneration(teamName)).rejects.toThrow();
   });

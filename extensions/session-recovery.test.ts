@@ -206,6 +206,34 @@ describe("session attachment and restoration lifecycle", () => {
     expect((await runtime.readRuntimeStatus(team, "team-lead"))?.sessionId).toBe(leadIdentity.id);
   });
 
+  it("team_create during an in-flight turn lets the following team_wait enter waiting", async () => {
+    const freshIdentity = allocateSession(team, root);
+    const owner = make(freshIdentity);
+    await owner.emit("session_start");
+    await owner.emit("agent_start");
+    await owner.tools.get("team_create").execute("create", { team_name: "mid-turn" }, undefined, undefined, owner.ctx);
+    expect((await runtime.readRuntimeStatus("mid-turn", "team-lead"))?.activity).toBe("running");
+    await runtime.setRuntimeActivity("mid-turn", "team-lead", "idle");
+    const controller = new AbortController();
+    const pending = owner.tools.get("team_wait").execute("wait", {
+      team_name: "mid-turn",
+    }, controller.signal, undefined, owner.ctx);
+    const rejected = pending.then(() => {
+      throw new Error("team_wait resolved");
+    }, (error: unknown) => error);
+    const started = Date.now();
+    while ((await runtime.readRuntimeStatus("mid-turn", "team-lead"))?.activity !== "waiting") {
+      if (Date.now() - started > 2000) throw new Error("team_wait did not enter waiting");
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    controller.abort();
+    await expect(rejected).resolves.toMatchObject({ name: "AbortError" });
+    await runtime.setRuntimeActivity("mid-turn", "team-lead", "stopped");
+    await expect(owner.tools.get("team_wait").execute("again", {
+      team_name: "mid-turn",
+    }, undefined, undefined, owner.ctx)).rejects.toThrow("cannot enter team_wait from activity stopped");
+  }, 10_000);
+
   it("formal team/delegate entrypoints persist actual lead and preallocated worker session identities", async () => {
     const freshIdentity = allocateSession(team, root);
     const owner = make(freshIdentity); await owner.emit("session_start");
@@ -342,7 +370,7 @@ describe("session attachment and restoration lifecycle", () => {
     fs.writeFileSync(path.join(paths.taskDir(team), "1.json"), '{"id":"1","status":"in_progress","owner":"peer"}');
     await mail("peer");
     const before = fs.readFileSync(peerIdentity.file);
-    await owner.tools.get("team_shutdown").execute("dissolve", { team_name: team }, undefined, undefined, owner.ctx);
+    await owner.commands.get("team-shutdown").handler("confirm", owner.ctx);
     expect(fs.existsSync(paths.teamDir(team))).toBe(false);
     expect(fs.existsSync(paths.taskDir(team))).toBe(false);
     expect(fs.existsSync(paths.inboxPath(team, "peer"))).toBe(false);

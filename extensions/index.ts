@@ -426,12 +426,18 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   let teamName: string | null | undefined = envTeamName;
   let identity: ReturnType<typeof sessionIdentity>;
   let recoveryOutcomes: Awaited<ReturnType<typeof restoreTeamPanes>> = [];
+  // /team-resume <team> <member> claims first, then must not reopen every peer.
+  let suppressAutomaticRestore = false;
 
   const terminal = getTerminalAdapter();
 
   let inboxPollingStarted = false;
   let inboxDeliveryInFlight = false;
   let inboxPollingTimer: ReturnType<typeof setInterval> | undefined;
+  // In-flight unexpected-stop reports. Confirmed deletion drains this chain
+  // and refuses their writes so a late inbox mkdir cannot recreate the team.
+  let stopReportTail: Promise<void> = Promise.resolve();
+  let dissolvingTeam: string | null = null;
   let sessionCtx: any = null;
   let agentLoopActive = false;
   // Set synchronously on an aborted settlement so an in-flight poll cannot
@@ -972,6 +978,9 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       await admitQuiescenceInspection(teamName, { isMemberAlive }).catch(() => undefined);
     }
     dispatchRequestedReload();
+    if (!isTeammate && teamName && !sessionStopping) {
+      await reportUnexpectedStops(teamName).catch(() => undefined);
+    }
   }
 
   // A reload replaces this closure, so it must wait until no in-memory duty
@@ -1286,7 +1295,10 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       } else ctx.ui.setStatus("pi-teams", `Lead @ ${teamName}`);
       // A same-process reload has no lost panes to restore, and peers may be
       // mid-reload themselves. `/team-resume` remains the explicit retry.
-      if (!isTeammate && event.reason !== "reload") {
+      // A named /team-resume suppresses this pass and restores only that member.
+      const skipRestore = suppressAutomaticRestore;
+      suppressAutomaticRestore = false;
+      if (!isTeammate && event.reason !== "reload" && !skipRestore) {
         recoveryOutcomes = await restoreTeamPanes({ team: teamName, leaderInstanceId: runtimeInstanceId,
           terminal, piBinary: getPiLaunchCommand(), anchorPaneId: process.env.TMUX_PANE,
           current: () => !sessionStopping });
@@ -1311,28 +1323,45 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   }
 
   pi.registerCommand("team-resume", {
-    description: "Attach this exact saved Pi conversation, explicitly associate an unmapped dead legacy lead, or retry its missing tmux panes. Never forces a live owner.",
+    description: "Reopen missing roster sessions for this lead: /team-resume <team> [member]. Omitting the member reopens every missing teammate. Never forces a live owner, never starts a new conversation, and never replays tasks.",
     handler: async (args, ctx) => {
-      const requested = paths.sanitizeName(args.trim());
-      if (!requested) throw new Error("Usage: /team-resume <team>");
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const requested = paths.sanitizeName(parts[0] ?? "");
+      const member = parts[1] ? paths.sanitizeName(parts[1]) : undefined;
+      if (!requested || parts.length > 2) throw new Error("Usage: /team-resume <team> [member]");
       if (sessionStopping) throw new Error("Session is detaching");
       const actual = sessionIdentity(ctx);
       if (!actual) throw new Error("Persistent Pi session required");
       if (teamName && (teamName !== requested || isTeammate)) throw new Error("Already attached to another team/member");
-      if (!teamName) {
+      const wasAttached = !!teamName;
+      if (!wasAttached) {
         const saved = findSessionMember(actual);
         if (saved && (saved.teamName !== requested || saved.member.agentType !== "lead")) throw new Error("This conversation is already bound to another team/member");
-        await claimSession({ team: requested, agent: "team-lead", identity: actual,
-          instanceId: runtimeInstanceId, pid: process.pid, processStartToken, manualAssociation: true,
-          paneId: process.env.TMUX_PANE, current: () => !sessionStopping });
-        // Now metadata has an exact mapping; use the normal attachment path.
-        await attachSession({ reason: "resume" }, ctx);
-      } else {
-        recoveryOutcomes = await restoreTeamPanes({ team: requested, leaderInstanceId: runtimeInstanceId,
-          terminal, piBinary: getPiLaunchCommand(), anchorPaneId: process.env.TMUX_PANE,
-          current: () => !sessionStopping });
-        if (!sessionStopping) ctx.ui.notify(recoveryOutcomes.map(item => `${item.name}: ${item.status}${item.note ? ` — ${item.note}` : ""}`).join("\n") || "No missing roster members.", "info");
+        if (member) suppressAutomaticRestore = true;
+        try {
+          await claimSession({ team: requested, agent: "team-lead", identity: actual,
+            instanceId: runtimeInstanceId, pid: process.pid, processStartToken, manualAssociation: true,
+            paneId: process.env.TMUX_PANE, current: () => !sessionStopping });
+          // Now metadata has an exact mapping; use the normal attachment path.
+          await attachSession({ reason: "resume" }, ctx);
+        } finally {
+          suppressAutomaticRestore = false;
+        }
       }
+      if (teamName !== requested) return;
+      // A fresh attach with no member already restored every missing peer.
+      if (!member && !wasAttached) return;
+      if (member) {
+        const config = await teams.readConfig(requested);
+        if (!config.members.some(item => item.name === member && item.agentType !== "lead" && item.name !== "team-lead")) {
+          throw new Error(`No teammate named ${member}`);
+        }
+      }
+      recoveryOutcomes = await restoreTeamPanes({ team: requested, leaderInstanceId: runtimeInstanceId,
+        terminal, piBinary: getPiLaunchCommand(), anchorPaneId: process.env.TMUX_PANE,
+        members: member ? [member] : undefined,
+        current: () => !sessionStopping });
+      if (!sessionStopping) ctx.ui.notify(recoveryOutcomes.map(item => `${item.name}: ${item.status}${item.note ? ` — ${item.note}` : ""}`).join("\n") || "No missing roster members.", "info");
     },
   });
 
@@ -1360,21 +1389,59 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       }
       const [name, spec, thinkingRaw, extra] = parts;
       if (!spec || extra) throw new Error("Usage: /team-model <teammate> <provider/model> [thinking]");
-      const agent = paths.sanitizeName(name!);
-      const parsed = parseModelRef(spec);
-      if (!parsed) throw new Error("Model must be provider/id, for example xai/grok-4.7");
-      const thinking = parseThinkingLevel(thinkingRaw);
-      if (thinkingRaw && !thinking) {
-        throw new Error(`Thinking must be one of ${THINKING_LEVELS.join(", ")}`);
-      }
-      const member = teammates.find(item => item.name === agent);
-      if (!member) throw new Error(`No teammate named ${agent}`);
-      const model = `${parsed.provider}/${parsed.id}`;
-      const request = requestModelChange(teamName, agent, model, thinking);
+      const { agent, request } = await submitTeammateModelChange(teamName, name!, spec, thinkingRaw);
       ctx.ui.notify(
         `Requested ${request.model}${request.thinking ? ` (${request.thinking})` : ""} for ${agent}. That session's extension applies it directly; the teammate model is not asked. An in-flight turn keeps the old model until it ends.`,
         "info",
       );
+    },
+  });
+
+  async function submitTeammateModelChange(team: string, name: string, spec: string, thinkingRaw?: string) {
+    await assertLiveLead(team, "change a teammate model");
+    const agent = paths.sanitizeName(name);
+    const parsed = parseModelRef(spec);
+    if (!parsed) throw new Error("Model must be provider/id, for example xai/grok-4.7");
+    const thinking = parseThinkingLevel(thinkingRaw);
+    if (thinkingRaw && !thinking) throw new Error(`Thinking must be one of ${THINKING_LEVELS.join(", ")}`);
+    const config = await teams.readConfig(team);
+    if (!config.members.some(member => member.name === agent && member.agentType !== "lead" && member.name !== "team-lead")) {
+      throw new Error(`No teammate named ${agent}`);
+    }
+    return { agent, request: requestModelChange(team, agent, `${parsed.provider}/${parsed.id}`, thinking) };
+  }
+
+  pi.registerTool({
+    name: "team_set_model",
+    label: "Set Teammate Model",
+    description: "Change a teammate's model through its extension, without asking or running the teammate model. Works even when its old model has no quota; interrupted sessions stay paused. Only the target team's live lead may call this. Supplying model queues a request and returns pending, NOT proof of success. Omit model to query the latest request: pending, applied, refused, or no_request. Check applied before claiming success; do not resubmit just to poll. Not dispatch: does not open a work generation. In-flight turns keep their old model.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      agent_name: Type.String(),
+      model: Type.Optional(Type.String({ description: "Override as provider/model. Omit to query status without sending another request." })),
+      thinking: Type.Optional(Type.Union(THINKING_LEVELS.map(level => Type.Literal(level)))),
+    }),
+    async execute(_toolCallId, params) {
+      await assertLiveLead(params.team_name, "change a teammate model");
+      if (!params.model && params.thinking) throw new Error("thinking requires model");
+      const config = await teams.readConfig(params.team_name);
+      const agent = paths.sanitizeName(params.agent_name);
+      if (!config.members.some(member => member.name === agent && member.agentType !== "lead" && member.name !== "team-lead")) {
+        throw new Error(`No teammate named ${agent}`);
+      }
+      const submitted = params.model
+        ? await submitTeammateModelChange(params.team_name, agent, params.model, params.thinking)
+        : undefined;
+      const request = submitted?.request ?? readModelChange(params.team_name, agent);
+      const result = readModelChangeResult(params.team_name, agent);
+      const status = submitted ? "pending" : !request ? "no_request"
+        : result?.requestId !== request.id ? "pending" : result.ok ? "applied" : "refused";
+      const details = {
+        team_name: params.team_name, agent_name: agent, status,
+        request_id: request?.id, model: request?.model, thinking: request?.thinking,
+        ...(status === "refused" ? { error: result?.error } : {}),
+      };
+      return { content: [{ type: "text" as const, text: JSON.stringify(details) }], details };
     },
   });
 
@@ -1418,25 +1485,19 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   });
 
   pi.registerCommand("team-close", {
-    description: "Close every teammate pane/window of this team in one action, keeping the team, tasks, and inbox for later recovery. Busy teammates are killed mid-run; their sessions stay resumable. Only this team's live lead can run it.",
+    description: "Close one teammate pane, or every teammate pane. /team-close <member> leaves the lead attached. /team-close (or /team-close <team>) closes every teammate and then exits this lead Pi back to its shell when every pane that needed closing actually closed. Membership, tasks, inbox, and original sessions stay. Busy runs are killed. Only this team's live lead can run it.",
     handler: async (args, ctx) => {
       if (sessionStopping) throw new Error("Session is detaching");
-      const requested = paths.sanitizeName(args.trim()) || teamName;
-      if (!requested) throw new Error("Not attached to a team; usage: /team-close <team>");
-      await assertLiveLead(requested, "close");
-      const lines = await closeTeammatePanes(requested);
-      // The lead session stays attached; the team goes dormant until the lead
-      // conversation is resumed and restoreTeamPanes relaunches the members.
-      ctx.ui.notify([`Team ${requested} panes closed (data preserved):`, ...lines].join("\n"), "info");
+      const target = await resolveCloseTarget(args);
+      await performClose(target.team, target.member, ctx);
     },
   });
 
   pi.registerCommand("team-shutdown", {
-    description: "Shut down this team: close all teammate panes/windows and delete roster, tasks, and inbox data. Pi conversation history is preserved. Irreversible. Only this team's live lead can run it.",
+    description: "Delete this saved team after every required teammate close succeeds. Requires the word confirm: /team-shutdown confirm. A lease change or a refused terminal close leaves the team in place. Pi conversation history stays, but a successful deletion removes the roster and cannot be restored. Only this team's live lead can run it. This is not how you finish work.",
     handler: async (args, ctx) => {
-      const requested = paths.sanitizeName(args.trim()) || teamName;
-      if (!requested) throw new Error("Not attached to a team; usage: /team-shutdown <team>");
-      const result = await shutdownTeam(requested, ctx);
+      const target = resolveShutdownTarget(args);
+      const result = await shutdownTeam(target, ctx);
       ctx.ui.notify(result.text, "info");
     },
   });
@@ -1705,13 +1766,15 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   });
 
   /** Only the lead conversation that currently owns this team's runtime lease. */
-  async function assertLiveLead(requested: string, action: "close" | "shut down" | "change a teammate model"): Promise<void> {
+  async function assertLiveLead(requested: string, action: "close" | "shut down" | "resume" | "change a teammate model"): Promise<void> {
     if (isTeammate) {
       throw new Error(action === "close"
         ? "Only the team lead can close team panes"
         : action === "shut down"
           ? "Only the team lead can shut down an entire team"
-          : "Only the team lead can change a teammate model");
+          : action === "resume"
+            ? "Only the team lead can resume team panes"
+            : "Only the team lead can change a teammate model");
     }
     const owned = !!teamName && teamName === requested && !!identity
       && identity.id && identity.file;
@@ -1734,7 +1797,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   }
 
   /** Fail a launch that has not registered yet. Pane and window ids come from this locked record, not an earlier snapshot. */
-  async function invalidatePendingLaunch(team: string, memberName: string, action: "close" | "shut down"): Promise<{ cancelled: boolean; pane?: string; windowId?: string }> {
+  async function invalidatePendingLaunch(team: string, memberName: string, action: "close" | "shut down"): Promise<{ cancelled: boolean; pane?: string; windowId?: string; phase?: "reserved" | "launched" }> {
     const configFile = paths.configPath(team);
     return withLock(configFile, async () => {
       const config = JSON.parse(fs.readFileSync(configFile, "utf8")) as { members: Member[] };
@@ -1748,7 +1811,22 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       member.recovery.phase = "failed";
       member.recovery.error = "closed before the restored session registered";
       atomicWriteJsonSync(configFile, config);
-      return { cancelled: true, pane, windowId };
+      return { cancelled: true, pane, windowId, phase };
+    });
+  }
+
+  /** Put a pending launch back when the terminal close did not succeed, so a later close can retry. */
+  async function restorePendingLaunch(team: string, memberName: string, phase: "reserved" | "launched"): Promise<void> {
+    const configFile = paths.configPath(team);
+    await withLock(configFile, async () => {
+      if (!fs.existsSync(configFile)) return;
+      const config = JSON.parse(fs.readFileSync(configFile, "utf8")) as { members: Member[] };
+      const member = config.members.find(item => item.name === memberName);
+      if (member?.recovery?.phase !== "failed") return;
+      if (member.recovery.error !== "closed before the restored session registered") return;
+      member.recovery.phase = phase;
+      delete member.recovery.error;
+      atomicWriteJsonSync(configFile, config);
     });
   }
 
@@ -1758,10 +1836,259 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       && runtime.isRuntimeProcessAlive(status);
   }
 
+  function stopNoticePath(team: string): string {
+    return path.join(paths.teamDir(team), "stop-notices.json");
+  }
+
+  function teamAcceptsWrites(team: string): boolean {
+    return dissolvingTeam !== team && fs.existsSync(paths.configPath(team));
+  }
+
+  async function updateStopNotices(team: string, update: (state: { expected: string[]; notified: string[] }) => void): Promise<void> {
+    const file = stopNoticePath(team);
+    await withLock(file, async () => {
+      if (!teamAcceptsWrites(team)) return;
+      let state = { expected: [] as string[], notified: [] as string[] };
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+        state = {
+          expected: Array.isArray(parsed.expected) ? parsed.expected.filter((id: unknown) => typeof id === "string") : [],
+          notified: Array.isArray(parsed.notified) ? parsed.notified.filter((id: unknown) => typeof id === "string") : [],
+        };
+      } catch {
+        // First notice for this team.
+      }
+      if (!teamAcceptsWrites(team)) return;
+      update(state);
+      state.expected = state.expected.slice(-200);
+      state.notified = state.notified.slice(-200);
+      atomicWriteJsonSync(file, state);
+    });
+  }
+
+  async function expectStop(team: string, instanceId: string): Promise<void> {
+    await updateStopNotices(team, state => {
+      if (!state.expected.includes(instanceId)) state.expected.push(instanceId);
+    });
+  }
+
+  async function clearExpectedStop(team: string, instanceId: string): Promise<void> {
+    await updateStopNotices(team, state => {
+      state.expected = state.expected.filter(id => id !== instanceId);
+    });
+  }
+
+  async function markStopKnown(team: string, instanceId: string): Promise<void> {
+    await updateStopNotices(team, state => {
+      state.expected = state.expected.filter(id => id !== instanceId);
+      if (!state.notified.includes(instanceId)) state.notified.push(instanceId);
+    });
+  }
+
+  /** One ordinary inbox note when a known instance stops or its tmux pane disappears. Command closes are expected, not this path. */
+  async function reportUnexpectedStops(team: string): Promise<void> {
+    const previous = stopReportTail;
+    let releaseTail: () => void = () => {};
+    stopReportTail = new Promise<void>(resolve => { releaseTail = resolve; });
+    try {
+      await previous;
+      if (!teamAcceptsWrites(team)) return;
+      await deliverUnexpectedStopNotices(team);
+    } finally {
+      releaseTail();
+    }
+  }
+
+  async function drainStopReports(): Promise<void> {
+    let pending = stopReportTail;
+    for (;;) {
+      await pending;
+      if (stopReportTail === pending) return;
+      pending = stopReportTail;
+    }
+  }
+
+  async function deliverUnexpectedStopNotices(team: string): Promise<void> {
+    const config = await teams.readConfig(team).catch(() => null);
+    if (!config || !teamAcceptsWrites(team)) return;
+    const losses: { id: string; text: string }[] = [];
+    for (const member of config.members) {
+      if (member.agentType === "lead" || member.name === "team-lead") continue;
+      const status = await runtime.readRuntimeStatus(team, member.name);
+      if (!status?.instanceId || status.reloading) continue;
+      const processAlive = !status.detached && status.activity !== "stopped" && runtime.isRuntimeProcessAlive(status);
+      const paneChecked = !!(member.tmuxPaneId && terminal);
+      const paneMissing = paneChecked && !terminal!.isAlive(member.tmuxPaneId!);
+      const confirmedDead = status.detached === true || status.activity === "stopped" || !runtime.isRuntimeProcessAlive(status);
+      if (processAlive && !paneMissing) continue;
+      if (!confirmedDead && !paneMissing) continue;
+      const text = paneMissing && processAlive
+        ? `${member.name} pane is missing; the process is still recorded as alive. The session stays on the roster and is not restarted.`
+        : paneMissing
+          ? `${member.name} stopped and its pane is missing. The session stays on the roster. Tasks are unchanged and it is not restarted.`
+          : paneChecked
+            ? `${member.name} stopped. The session stays on the roster. Tasks are unchanged and it is not restarted.`
+            : `${member.name} stopped. The session stays on the roster. Tasks are unchanged and it is not restarted. Its pane was not checked.`;
+      losses.push({ id: status.instanceId, text });
+    }
+    if (losses.length === 0 || !teamAcceptsWrites(team)) return;
+    const file = stopNoticePath(team);
+    const claimed: { id: string; text: string }[] = [];
+    await withLock(file, async () => {
+      if (!teamAcceptsWrites(team)) return;
+      let current = { expected: [] as string[], notified: [] as string[] };
+      try {
+        const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+        current = {
+          expected: Array.isArray(parsed.expected) ? parsed.expected.filter((id: unknown) => typeof id === "string") : [],
+          notified: Array.isArray(parsed.notified) ? parsed.notified.filter((id: unknown) => typeof id === "string") : [],
+        };
+      } catch {
+        // First notice for this team.
+      }
+      if (!teamAcceptsWrites(team)) return;
+      for (const loss of losses) {
+        if (current.expected.includes(loss.id) || current.notified.includes(loss.id)) continue;
+        current.notified.push(loss.id);
+        claimed.push(loss);
+      }
+      if (claimed.length === 0) return;
+      current.notified = current.notified.slice(-200);
+      atomicWriteJsonSync(file, current);
+    });
+    const delivered: string[] = [];
+    try {
+      for (const loss of claimed) {
+        if (!teamAcceptsWrites(team)) break;
+        const stored = await messaging.appendMessageOnce(team, "team-lead", {
+          id: `stop:${loss.id}`,
+          from: "pi-teams",
+          text: loss.text,
+          timestamp: messaging.nowIso(),
+          read: false,
+          summary: loss.text.slice(0, 80),
+        }, () => teamAcceptsWrites(team));
+        if (!stored) {
+          if (!teamAcceptsWrites(team)) break;
+          throw new Error(`stop notice for ${loss.id} was not stored`);
+        }
+        delivered.push(loss.id);
+      }
+    } catch (error) {
+      const failed = claimed.filter(loss => !delivered.includes(loss.id)).map(loss => loss.id);
+      if (failed.length > 0 && teamAcceptsWrites(team)) {
+        await withLock(file, async () => {
+          if (!teamAcceptsWrites(team)) return;
+          let current = { expected: [] as string[], notified: [] as string[] };
+          try {
+            const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+            current = {
+              expected: Array.isArray(parsed.expected) ? parsed.expected.filter((id: unknown) => typeof id === "string") : [],
+              notified: Array.isArray(parsed.notified) ? parsed.notified.filter((id: unknown) => typeof id === "string") : [],
+            };
+          } catch {
+            return;
+          }
+          const failedIds = new Set(failed);
+          current.notified = current.notified.filter(id => !failedIds.has(id));
+          if (!teamAcceptsWrites(team)) return;
+          atomicWriteJsonSync(file, current);
+        }).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  async function resolveCloseTarget(args: string): Promise<{ team: string; member?: string }> {
+    const token = paths.sanitizeName(args.trim());
+    if (!token) {
+      if (!teamName) throw new Error("Not attached to a team; usage: /team-close [teammate]");
+      return { team: teamName };
+    }
+    if (teamName) {
+      const config = await teams.readConfig(teamName).catch(() => null);
+      const member = config?.members.find(item => item.name === token && item.agentType !== "lead" && item.name !== "team-lead");
+      if (member) return { team: teamName, member: member.name };
+    }
+    return { team: token };
+  }
+
+  function resolveShutdownTarget(args: string): string {
+    const parts = args.trim().split(/\s+/).filter(Boolean);
+    if (parts.at(-1) !== "confirm") {
+      throw new Error("Refusing to delete the team without confirmation. Usage: /team-shutdown confirm");
+    }
+    const name = parts.length === 1 ? teamName : paths.sanitizeName(parts[0] ?? "");
+    if (!name || parts.length > 2) throw new Error("Usage: /team-shutdown confirm");
+    return name;
+  }
+
+  function closeStillOpen(lines: string[]): string[] {
+    return lines.filter(line => line.endsWith(": lease changed") || line.endsWith(": close failed"));
+  }
+
+  async function performClose(team: string, member: string | undefined, ctx: { ui: { notify: (message: string, type?: "info" | "warning" | "error") => void }; shutdown: () => void }): Promise<string[]> {
+    await assertLiveLead(team, "close");
+    const lines = await closeTeammatePanes(team, "close", member);
+    const unfinished = closeStillOpen(lines);
+    if (member) {
+      ctx.ui.notify([
+        `Teammate ${member} close result (membership preserved):`,
+        ...lines,
+        "The lead stays attached. Reopen this member later with /team-resume.",
+      ].join("\n"), "info");
+      return lines;
+    }
+    if (unfinished.length > 0) {
+      const reasons = [
+        unfinished.some(line => line.endsWith(": lease changed"))
+          ? "A teammate pane was not closed because its runtime lease changed."
+          : "",
+        unfinished.some(line => line.endsWith(": close failed"))
+          ? "A teammate pane was not closed because the terminal close failed."
+          : "",
+        "Lead Pi will not exit.",
+      ].filter(Boolean);
+      ctx.ui.notify([
+        `Team ${team} was not fully closed; the lead stays attached:`,
+        ...lines,
+        ...reasons,
+      ].join("\n"), "info");
+      return lines;
+    }
+    ctx.ui.notify([
+      `Team ${team} teammate panes closed (data preserved):`,
+      ...lines,
+      "Lead Pi will exit to its shell; the lead pane stays.",
+    ].join("\n"), "info");
+    if (sessionStopping) throw new Error("Lead Pi could not exit because the session is already detaching");
+    ctx.shutdown();
+    return lines;
+  }
+
+  async function performResume(team: string, member: string | undefined): Promise<string> {
+    await assertLiveLead(team, "resume");
+    if (member) {
+      const config = await teams.readConfig(team);
+      if (!config.members.some(item => item.name === member && item.agentType !== "lead" && item.name !== "team-lead")) {
+        throw new Error(`No teammate named ${member}`);
+      }
+    }
+    recoveryOutcomes = await restoreTeamPanes({ team, leaderInstanceId: runtimeInstanceId,
+      terminal, piBinary: getPiLaunchCommand(), anchorPaneId: process.env.TMUX_PANE,
+      members: member ? [member] : undefined,
+      current: () => !sessionStopping });
+    return recoveryOutcomes.map(item => `${item.name}: ${item.status}${item.note ? ` — ${item.note}` : ""}`).join("\n") || "No missing roster members.";
+  }
+
   /** Close live teammates and cancel pane launches that have not registered. Lead pane stays. */
-  async function closeTeammatePanes(team: string, action: "close" | "shut down" = "close"): Promise<string[]> {
+  async function closeTeammatePanes(team: string, action: "close" | "shut down" = "close", only?: string): Promise<string[]> {
     const config = await teams.readConfig(team);
-    const teammates = config.members.filter(member => member.agentType !== "lead" && member.name !== "team-lead");
+    let teammates = config.members.filter(member => member.agentType !== "lead" && member.name !== "team-lead");
+    if (only) {
+      teammates = teammates.filter(member => member.name === only);
+      if (teammates.length === 0) throw new Error(`No teammate named ${only}`);
+    }
     let needsTerminal = false;
     for (const member of teammates) {
       const phase = member.recovery?.phase;
@@ -1774,34 +2101,48 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       const fresh = (await teams.readConfig(team)).members.find(item => item.name === member.name) ?? member;
       const phase = fresh.recovery?.phase;
       const pendingNow = !!phase && phase !== "attached" && phase !== "failed";
-      if ((pendingNow || await memberIsRunning(team, fresh)) && !terminalClosesProcesses(terminal)) {
+      const runningNow = await memberIsRunning(team, fresh);
+      if ((pendingNow || runningNow) && !terminalClosesProcesses(terminal)) {
         requireCloseableTerminal(action);
       }
+      const prior = await runtime.readRuntimeStatus(team, member.name);
+      const instanceId = prior?.instanceId;
+      if (instanceId && (pendingNow || runningNow)) await expectStop(team, instanceId);
       const pending = await invalidatePendingLaunch(team, member.name, action);
       if (pending.cancelled) {
+        let failed = false;
         if (terminal) {
-          if (pending.windowId) terminal.killWindow(pending.windowId);
-          if (pending.pane) terminal.kill(pending.pane);
+          if (pending.windowId && terminal.killWindow(pending.windowId) === "failed") failed = true;
+          if (pending.pane && terminal.kill(pending.pane) === "failed") failed = true;
         }
-        lines.push(`${member.name}: closed`);
+        if (failed) {
+          if (pending.phase) await restorePendingLaunch(team, member.name, pending.phase);
+          if (instanceId) await clearExpectedStop(team, instanceId);
+          lines.push(`${member.name}: close failed`);
+        } else {
+          lines.push(`${member.name}: closed`);
+        }
         continue;
       }
       const current = (await teams.readConfig(team)).members.find(item => item.name === member.name) ?? fresh;
       if (!(await memberIsRunning(team, current))) {
+        if (instanceId) await markStopKnown(team, instanceId);
         lines.push(`${current.name}: not running`);
         continue;
       }
       if (!terminalClosesProcesses(terminal)) requireCloseableTerminal(action);
       const outcome = await killTeammate(team, current);
-      lines.push(`${current.name}: ${outcome === "closed" ? "closed" : "lease changed"}`);
+      if (outcome !== "closed" && instanceId) await clearExpectedStop(team, instanceId);
+      lines.push(`${current.name}: ${outcome === "closed" ? "closed" : outcome === "lease-changed" ? "lease changed" : "close failed"}`);
     }
     return lines;
   }
 
-  async function killTeammate(teamName: string, member: Member): Promise<"closed" | "lease-changed"> {
+  async function killTeammate(teamName: string, member: Member): Promise<"closed" | "lease-changed" | "close-failed"> {
     if (member.name === "team-lead") return "closed";
 
-    let runtimeStatus = await runtime.readRuntimeStatus(teamName, member.name);
+    const prior = await runtime.readRuntimeStatus(teamName, member.name);
+    let runtimeStatus = prior;
     if (runtimeStatus?.instanceId) {
       const replaced = await runtime.replaceRuntimeInstance(teamName, member.name, runtimeStatus.instanceId, undefined, {
         activity: "stopped",
@@ -1815,37 +2156,63 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       });
     }
 
-    const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
-    if (fs.existsSync(pidFile)) {
-      let parsedPid: number | undefined;
-      try {
-        parsedPid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
-      } catch {
-        // A pid-file read failure skips the signal. The pane close below still runs.
+    const restorePriorRuntime = async () => {
+      if (!prior) return;
+      if (prior.instanceId) {
+        // The stopped write cleared instanceId. undefined matches that released lease.
+        await runtime.replaceRuntimeInstance(teamName, member.name, undefined, prior.instanceId, {
+          activity: prior.activity,
+          activityChangedAt: prior.activityChangedAt,
+          detached: prior.detached ?? false,
+          paused: prior.paused ?? false,
+          lastHeartbeatAt: prior.lastHeartbeatAt ?? Date.now(),
+        });
+      } else {
+        await runtime.setRuntimeActivity(teamName, member.name, prior.activity, {
+          activityChangedAt: prior.activityChangedAt,
+          detached: prior.detached ?? false,
+          paused: prior.paused ?? false,
+          lastHeartbeatAt: prior.lastHeartbeatAt ?? Date.now(),
+        });
       }
-      // Only a successful lease transition and a confirmed process identity may
-      // authorize an intentional-stop marker. Do not mark unrelated processes or
-      // swallow marker errors as if this shutdown succeeded.
-      if (parsedPid !== undefined && runtimeStatus?.pid === parsedPid && runtime.hasConfirmedProcessIdentity(runtimeStatus)) {
-        if (member.windowId) terminal?.prepareShutdown?.(member.windowId);
-        if (member.tmuxPaneId) terminal?.prepareShutdown?.(member.tmuxPaneId);
+    };
+
+    try {
+      const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
+      if (fs.existsSync(pidFile)) {
+        let parsedPid: number | undefined;
         try {
-          process.kill(parsedPid, "SIGKILL");
+          parsedPid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
         } catch {
-          // The process may have exited after the identity check.
+          // A pid-file read failure skips the signal. The pane close below still runs.
         }
+        // Only a successful lease transition and a confirmed process identity may
+        // authorize an intentional-stop marker. Do not mark unrelated processes or
+        // swallow marker errors as if this shutdown succeeded.
+        if (parsedPid !== undefined && runtimeStatus?.pid === parsedPid && runtime.hasConfirmedProcessIdentity(runtimeStatus)) {
+          if (member.windowId) terminal?.prepareShutdown?.(member.windowId);
+          if (member.tmuxPaneId) terminal?.prepareShutdown?.(member.tmuxPaneId);
+          try {
+            process.kill(parsedPid, "SIGKILL");
+          } catch {
+            // The process may have exited after the identity check.
+          }
+        }
+        fs.rmSync(pidFile, { force: true });
       }
-      fs.rmSync(pidFile, { force: true });
-    }
 
-    if (member.windowId && terminal) {
-      terminal.killWindow(member.windowId);
+      let failed = false;
+      if (member.windowId && terminal && terminal.killWindow(member.windowId) === "failed") failed = true;
+      if (member.tmuxPaneId && terminal && terminal.kill(member.tmuxPaneId) === "failed") failed = true;
+      if (failed) {
+        await restorePriorRuntime();
+        return "close-failed";
+      }
+      return "closed";
+    } catch (error) {
+      await restorePriorRuntime().catch(() => undefined);
+      throw error;
     }
-
-    if (member.tmuxPaneId && terminal) {
-      terminal.kill(member.tmuxPaneId);
-    }
-    return "closed";
   }
 
   function isMemberAlive(team: string, member: Member, runtimeStatus?: runtime.AgentRuntimeStatus | null): boolean {
@@ -2011,6 +2378,21 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     ].filter(Boolean).join("\n");
   }
 
+  // team_create and a mid-turn attach happen after agent_start, which returned
+  // early because this process was not on a team yet. The claim records idle.
+  // Repair that to running while this turn is still in progress.
+  async function publishInFlightTurn(): Promise<void> {
+    if (!teamName || !agentLoopActive || locallyInterrupted || sessionStopping) return;
+    await runtime.updateRuntimeStatusForInstance(teamName, agentName, runtimeInstanceId, {
+      activity: "running",
+      paused: false,
+      pid: process.pid,
+      processStartToken,
+      lastHeartbeatAt: Date.now(),
+      lastError: undefined,
+    }, ["idle", "starting", "queued"]);
+  }
+
   async function attachCreatedTeam(name: string, ctx: any): Promise<void> {
     identity = sessionIdentity(ctx) ?? identity;
     if (!identity) throw new Error("A persistent Pi session is required to create a recoverable team");
@@ -2020,6 +2402,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     if (sessionStopping) throw new Error("Session changed while creating the team");
     teamName = name;
     startInboxPolling();
+    await publishInFlightTurn();
   }
 
   // Tools
@@ -2410,9 +2793,13 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
         processStartToken,
         lastHeartbeatAt: Date.now(),
         lastError: undefined,
-      }, "running");
+      }, ["running", "idle"]);
       if (!enteredWait) {
-        throw new Error(`Agent ${agentName} no longer owns the active runtime lease for team ${safeTeamName}`);
+        const current = await runtime.readRuntimeStatus(safeTeamName, agentName);
+        if (!current || current.instanceId !== runtimeInstanceId) {
+          throw new Error(`Agent ${agentName} no longer owns the active runtime lease for team ${safeTeamName}`);
+        }
+        throw new Error(`Agent ${agentName} cannot enter team_wait from activity ${current.activity}`);
       }
 
       try {
@@ -2561,22 +2948,26 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     },
   });
 
-  // Shared by the team_shutdown tool and the /team-shutdown user command.
+  // User command only. The model has no tool that deletes a team.
   async function shutdownTeam(shuttingDownTeamName: string, ctx: any): Promise<{ text: string; cleanedSessions: number }> {
     try {
       await assertLiveLead(shuttingDownTeamName, "shut down");
       const closed = await closeTeammatePanes(shuttingDownTeamName, "shut down");
+      const unfinished = closeStillOpen(closed);
+      if (unfinished.length > 0) {
+        throw new Error(`Team ${shuttingDownTeamName} was not deleted because a teammate pane stayed open: ${closed.join("; ")}`);
+      }
+      dissolvingTeam = shuttingDownTeamName;
       if (teamName === shuttingDownTeamName) {
         await runtime.updateRuntimeStatusForInstance(shuttingDownTeamName, agentName, runtimeInstanceId, {
           activity: "stopped",
           lastHeartbeatAt: Date.now(),
         }).catch(() => undefined);
-      }
-      if (teamName === shuttingDownTeamName) {
         stopInboxPolling();
         teamName = null;
         ctx.ui.setStatus("pi-teams", undefined);
       }
+      await drainStopReports();
       const dir = paths.teamDir(shuttingDownTeamName);
       const tasksDir = paths.taskDir(shuttingDownTeamName);
       if (fs.existsSync(tasksDir)) fs.rmSync(tasksDir, { recursive: true });
@@ -2591,22 +2982,6 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       throw new Error(`Failed to shutdown team: ${e}`);
     }
   }
-
-  pi.registerTool({
-    name: "team_shutdown",
-    label: "Shutdown Team",
-    description: "Shut down the team this lead session owns: close teammate panes, then delete roster, tasks, and inbox. Refuses any other team.",
-    parameters: Type.Object({
-      team_name: Type.String(),
-    }),
-    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const result = await shutdownTeam(params.team_name, ctx);
-      return {
-        content: [{ type: "text", text: result.text }],
-        details: { cleanedSessions: result.cleanedSessions }
-      };
-    },
-  });
 
   pi.registerTool({
     name: "cleanup_agent_sessions",
@@ -2690,28 +3065,37 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   });
 
   pi.registerTool({
-    name: "process_shutdown_approved",
-    label: "Process Shutdown Approved",
-    description: "Process a teammate's shutdown.",
+    name: "team_close",
+    label: "Close Teammate Panes",
+    description: "Close one teammate pane, or every teammate pane, without removing anyone from the roster. Pass agent_name for one member; the lead stays. Omit agent_name to close every teammate and then exit this lead Pi back to its shell when every required pane actually closed. Use only when the user explicitly asks to close panes. Do not call this because a task finished or a member is idle. Closing does not complete tasks and does not delete the team.",
     parameters: Type.Object({
       team_name: Type.String(),
-      agent_name: Type.String(),
+      agent_name: Type.Optional(Type.String()),
     }),
-    async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const config = await teams.readConfig(params.team_name);
-      const member = config.members.find(m => m.name === params.agent_name);
-      if (!member) throw new Error(`Teammate ${params.agent_name} not found`);
-
-      // Persist removal before fallible process cleanup, so recovery can never
-      // race a shutdown approval into resurrecting the same roster entry.
-      await teams.removeMember(params.team_name, params.agent_name);
-      const outcome = await killTeammate(params.team_name, member);
-      if (outcome === "lease-changed") {
-        throw new Error(`Teammate ${params.agent_name} was removed from the team, but its process lease changed before it could be stopped.`);
-      }
+    async execute(_toolCallId, params: any, _signal, _onUpdate, ctx) {
+      const member = params.agent_name ? paths.sanitizeName(params.agent_name) : undefined;
+      const lines = await performClose(params.team_name, member || undefined, ctx);
       return {
-        content: [{ type: "text", text: `Teammate ${params.agent_name} has been shut down.` }],
-        details: {},
+        content: [{ type: "text", text: lines.join("\n") }],
+        details: { lines },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "team_resume",
+    label: "Resume Teammate Panes",
+    description: "Reopen missing roster sessions for this lead. Pass agent_name to reopen one teammate; omit it to reopen every missing teammate. Uses the original Pi session, does not start a replacement conversation, and does not replay tasks. Use only when the user explicitly asks to reopen panes.",
+    parameters: Type.Object({
+      team_name: Type.String(),
+      agent_name: Type.Optional(Type.String()),
+    }),
+    async execute(_toolCallId, params: any) {
+      const member = params.agent_name ? paths.sanitizeName(params.agent_name) : undefined;
+      const text = await performResume(params.team_name, member || undefined);
+      return {
+        content: [{ type: "text", text }],
+        details: { recovery: recoveryOutcomes },
       };
     },
   });

@@ -37,13 +37,31 @@ export async function appendMessageOnce(
   teamName: string,
   agentName: string,
   message: InboxMessage,
-): Promise<InboxMessage> {
+): Promise<InboxMessage>;
+export async function appendMessageOnce(
+  teamName: string,
+  agentName: string,
+  message: InboxMessage,
+  commit: () => boolean,
+): Promise<InboxMessage | null>;
+export async function appendMessageOnce(
+  teamName: string,
+  agentName: string,
+  message: InboxMessage,
+  commit?: () => boolean,
+): Promise<InboxMessage | null> {
   if (!hasUsableId(message)) throw new Error("appendMessageOnce requires a message id");
   const p = inboxPath(teamName, agentName);
   const dir = path.dirname(p);
+  // The lock file lives beside the inbox, so the directory has to exist first.
+  // Check and create with no await between them. A refused commit, including
+  // one that loses to confirmed deletion, must not recreate teams/<team>/inboxes.
+  if (commit && !commit()) return null;
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 
   return await withLock(p, async () => {
+    if (commit && !commit()) return null;
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     let msgs: InboxMessage[] = [];
     if (fs.existsSync(p)) msgs = JSON.parse(fs.readFileSync(p, "utf-8"));
     ensureMessageIds(msgs);

@@ -600,7 +600,8 @@ describe("registered team quiescence fallback", () => {
 
   it("does not expose teammate control-mode API or residue", () => {
     const lead = loadExtension("team-lead");
-    expect([...lead.tools.keys()].filter(name => /mode|takeover|flush|handback/i.test(name))).toEqual([]);
+    // Model switching is not the removed user/team control-mode feature.
+    expect([...lead.tools.keys()].filter(name => /(?:^|_)mode(?:_|$)|takeover|flush|handback/i.test(name))).toEqual([]);
     const source = fs.readFileSync(path.resolve("extensions/index.ts"), "utf-8");
     expect(source).not.toMatch(/\bcontrolMode\b|\bteam-mode\b|\bcontrol-state\b|\btakeover\b/i);
   });

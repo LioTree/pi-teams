@@ -18,9 +18,9 @@ Coordinate multiple agents working on a project using shared task lists and mess
 4.  **Communicate**: Use `team_message`.
 5.  **Monitor**: Use `team_status` for the full board, or `check_teammate` for one teammate.
 6.  **Wait after delegation**: `delegate_task` returns immediately. When you have delegated all current work, call `team_wait({ team_name })` so you do not duplicate a teammate's assignment. Omit `timeout_seconds` for an indefinite wait.
-7.  **Cleanup**:
-    *   `process_shutdown_approved`: Orderly removal of a teammate after they've finished.
-    *   `team_shutdown`: Remove a team and all its associated data.
+7.  **Close only when the user asks**:
+    *   `team_close`: Close one teammate pane, or every teammate pane. Membership and the original session stay. Do not call this because work finished.
+    *   `team_resume`: Reopen one missing roster session, or every missing one. This is not a new assignment.
 
 ## Teammate Instructions
 
@@ -39,7 +39,7 @@ When you are spawned as a teammate:
 - **Frequent Communication**: Send short summaries of your work back to `team-lead` frequently.
 - **Context Matters**: When you finish a task, send a message explaining your results and any new files you created.
 - **Independence**: If you get stuck, try to solve it yourself first, but don't hesitate to ask `team-lead` for clarification.
-- **Orderly Shutdown**: When you've finished all your work and have no more instructions, notify the lead and wait for shutdown approval.
+- **Stay available**: When you finish, report the result and remain idle. Do not ask to be removed from the team.
 
 ## Best Practices for Team Leads
 
@@ -56,7 +56,7 @@ When you are spawned as a teammate:
 
 Resume the original Pi conversation, not a new/forked/cloned chat: exact session ID/file identifies the team member. Original lead attachment recovers the inbox and makes one bounded tmux pass to restore missing roster peers with their original sessions/model/thinking, retaining live peers. Recovery is not dispatch and never replays tasks or continuation prompts; interrupted work stays paused.
 
-Quitting or losing a terminal leaves roster intent; only explicit removal or destructive `team_shutdown` prevents restoration. This deletes team/task/mail metadata, not Pi conversation history: manual `/resume` remains possible without restoring removed membership. Missing/corrupt/unmapped sessions remain blocked with data preserved. `/team-resume <team>` can explicitly associate an unmapped dead legacy lead or retry panes for the current lead; it cannot force a live owner or guess chat files. Other adapters retain lead inbox recovery but not automatic pane restoration. Restoring context does not roll back background tools or side effects.
+Quitting or losing a terminal leaves roster intent. Closing a pane does not remove it. Only the user's confirmed `/team-shutdown confirm` deletes the team index; chat history remains for a manual `/resume` without restoring that team. Missing/corrupt/unmapped sessions remain blocked with data preserved. `/team-resume <team> [member]` reopens one missing member or every missing member for the original lead. It cannot force a live owner or guess chat files. Other adapters retain lead inbox recovery but not automatic pane restoration. Restoring context does not roll back background tools or side effects.
 
 ## Changing a Teammate Model
 
@@ -68,7 +68,7 @@ Quitting or losing a terminal leaves roster intent; only explicit removal or des
 
 ## Closing Panes
 
-`/team-close` closes live teammate panes only. Roster, tasks, and inbox stay, so the next original-lead attach restores the panes. `/team-shutdown` does that close and then deletes team metadata; Pi chat history remains for manual `/resume` without membership. Only the live lead of that team can run either command. Windows Terminal and Zellij cannot close panes. When a teammate or pending launch still needs closing, the commands refuse rather than marking members stopped; an already stopped team can still be dissolved. Neither command is a work dispatch. Do not treat a closed pane as task completion.
+`/team-close <member>` closes that one pane and leaves the lead attached. `/team-close` closes every live teammate pane, then exits the lead Pi back to its shell. The lead pane stays. If a runtime lease changes, or the terminal refuses a close, and a pane stays open, the lead Pi does not exit and confirmed deletion does not remove the team. Roster, tasks, and inbox stay. Reopening the original lead conversation restores every missing roster member, including one closed earlier. `/team-resume <team> [member]` does the same for one member or all missing members and does not replay tasks. `/team-shutdown confirm` is the only deletion: it closes panes and then deletes the team index. The model has no delete-team tool. Windows Terminal and Zellij cannot close panes. When a teammate or pending launch still needs closing, the commands refuse rather than marking members stopped; an already stopped team can still be deleted with `confirm`. Neither command is a work dispatch. Do not treat a closed pane as task completion. An unexpected process stop or a confirmed missing tmux pane sends the lead one inbox notice. A close you requested does not send that notice again.
 
 ## Team Quiescence Fallback
 

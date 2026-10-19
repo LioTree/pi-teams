@@ -63,17 +63,30 @@ check_teammate({ team_name: "my-team", agent_name: "security-bot" })
 
 ---
 
-### process_shutdown_approved
+### team_close
 
-Initiate orderly shutdown for a finished teammate. The roster entry is removed before process cleanup. If that cleanup loses the runtime lease, the tool reports the lease change and does not claim the process was stopped; the removal stays.
+Close one teammate pane, or every teammate pane, without removing membership. Call it only when the user asks. Finished work is not a reason to close anyone.
 
 **Parameters**:
 - `team_name` (required): Name of the team
-- `agent_name` (required): Name of the teammate to shut down
+- `agent_name` (optional): One teammate. Omit it to close every teammate and then exit the lead Pi back to its shell when every required pane actually closed.
 
 **Example**:
 ```javascript
-process_shutdown_approved({ team_name: "my-team", agent_name: "security-bot" })
+team_close({ team_name: "my-team", agent_name: "security-bot" })
+```
+
+### team_resume
+
+Reopen a missing original session for someone still on the roster. This does not create a new conversation and does not replay tasks.
+
+**Parameters**:
+- `team_name` (required): Name of the team
+- `agent_name` (optional): One teammate. Omit it to reopen every missing teammate.
+
+**Example**:
+```javascript
+team_resume({ team_name: "my-team", agent_name: "security-bot" })
 ```
 
 ---
@@ -244,6 +257,8 @@ team_wait({ team_name: "my-team" })
 team_wait({ team_name: "my-team", timeout_seconds: 600 })
 ```
 
+Creating a team during the current turn records the lead as `running`, so the following `team_wait` can enter `waiting`. A stale `idle` record from that claim is also accepted. If this session still owns the runtime lease but the activity cannot start a wait, the error names that activity.
+
 Leads should call this after delegation instead of continuing the delegated work. After a return, perform coordination only; if peers remain active, call it again. A teammate should use it only for a real dependency, after sending the dependency request with `team_message`; ordinary idle inbox delivery does not require `team_wait`.
 
 ## Automated Behavior
@@ -326,13 +341,15 @@ Teams bind each member to its actual Pi session ID and canonical absolute file. 
 
 On original lead attachment, one bounded tmux pass restores missing roster peers using their original `--session` file/cwd/agent directory/trust override, without model/thinking defaults, assignment replay, or synthetic continuation. Existing live processes are retained even if their pane ID is stale. Recovery does not dispatch work or change tasks/mail/generations. Interrupted state and known unknown-acceptance diagnostics survive startup; they do not become proof of acceptance or an automatic resume.
 
-Roster membership is recovery intent, including manual quit/Ctrl+D/terminal loss. Only explicit removal or destructive `team_shutdown` prevents restoration. Worker chats are allocated in Pi's persistent session storage outside team/task directories; dissolution removes roster/tasks/inbox, not conversation history. Manual `/resume` does not recreate removed membership. Session context restoration does not roll back background tools or external effects. Missing/corrupt/unconfirmed files and unmapped legacy peers are individually blocked with data preserved. Other adapters recover the lead inbox but report missing-pane restoration unsupported.
+Roster membership is recovery intent, including manual quit/Ctrl+D/terminal loss and a closed pane. Only `/team-shutdown confirm` deletes the team index and prevents restoration. Worker chats are allocated in Pi's persistent session storage outside team/task directories; confirmed deletion removes roster/tasks/inbox, not conversation history. Manual `/resume` does not recreate a deleted team. Session context restoration does not roll back background tools or external effects. Missing/corrupt/unconfirmed files and unmapped legacy peers are individually blocked with data preserved. Other adapters recover the lead inbox but report missing-pane restoration unsupported.
 
 `/team-resume <team>` explicitly associates an unmapped legacy lead only after both old runtime/advisory process authority are gone; an existing mapping must match this exact conversation. It never forces a live owner or searches chat files. A currently attached lead can use the command for a bounded pane retry. Unknown launch outcomes remain reserved and blocked unless an exact tmux nonce reconciles them; no automatic respawn loop runs.
 
 See [the design](design/team-session-recovery.md) for migration, partial-failure, restart, and exactly-once limits.
 
 ## Changing a teammate model
+
+The lead can call `team_set_model` with `team_name`, `agent_name`, `model` (`provider/model`), and optional `thinking`. This uses the same extension control channel as the manual command below. Submitting returns `pending`, not success. Call the tool again **without `model` or `thinking`** to query the latest request without resubmitting: `no_request`, `pending`, `applied`, or `refused` (with error). Confirm `applied` before reporting success. Changing a model does not require a response from the teammate model, reopen a work generation, or resume an interrupted session.
 
 `/team-model <teammate> <provider/model> [thinking]` is lead-only and uses the same live-lead lease check as close. It writes `model-change/<teammate>.json`. The target session's coordination poller calls `pi.setModel` (and `setThinkingLevel` only when a level was given) on the model found in that session's registry. No inbox message is sent and the teammate model does not run. A busy session is switched immediately for its next turn; the in-flight turn keeps the previous model. `interrupted` stays paused. Success updates the roster model hint. A missing model or `setModel` returning false (no provider authentication) writes a terminal refusal. A thrown host error retries on the next poll. The command does not open a work generation. `/team-model status` reads the result files.
 
@@ -350,9 +367,9 @@ After reload, the new code sees a request older than its load time and writes `r
 
 ## Closing panes
 
-`/team-close [team]` closes every non-lead member that is still a live, attached process, but only when this session is that team's live lead: the saved lead session and the current runtime lease, including its instance id, must both match. Another team, an unattached session, a teammate, and a stale lead instance are refused. The command and the `team_shutdown` tool share that check. It marks the runtime `stopped` only after that lease compare-and-swap commits; a lost compare does not kill the pane and is reported `lease changed`. `delegate_task` with `reuse: "replace"` stops on that result and does not delete the member or spawn a replacement. `process_shutdown_approved` still removes the roster entry first; if the following cleanup loses the lease, it reports that the process was not stopped. `SIGKILL` is sent only when the pid file matches and the current process start token was read and equals the stored token. An unreadable token skips the signal. The terminal adapter then kills the pane and any separate window. Members that are already `stopped`, `detached`, or whose process is dead are reported `not running` and are not killed again. A recovery record still in `reserved` or `launched` is marked `failed` before any late child can claim it. The pane id and window id are taken from that locked record: a window-only launch is closed with `killWindow` even when it has no pane id. Roster, tasks, inbox, and Pi session files are untouched. The lead session stays attached and is not stopped. Closing does not restore panes in the same process; the next original-lead `session_start`, or `/team-resume <team>`, runs the normal bounded restore. Busy work is killed mid-run. This is not a work dispatch and does not complete tasks.
+`/team-close [member]` closes one teammate when the argument names a member of the attached team. The lead stays attached. `/team-close` or `/team-close <team>` closes every non-lead member that is still a live, attached process, but only when this session is that team's live lead: the saved lead session and the current runtime lease, including its instance id, must both match. Another team, an unattached session, a teammate, and a stale lead instance are refused. `team_close` uses the same check. It marks the runtime `stopped` only after that lease compare-and-swap commits; a lost compare does not kill the pane and is reported `lease changed`. `delegate_task` with `reuse: "replace"` stops on that result and does not delete the member or spawn a replacement. There is no model tool that removes a member because work finished. `SIGKILL` is sent only when the pid file matches and the current process start token was read and equals the stored token. An unreadable token skips the signal. The terminal adapter then kills the pane and any separate window. A tmux kill that exits nonzero, and does not say the pane is already gone, is `close failed`: the runtime lease is restored so a later close can retry, and that result does not count as closed. Members that are already `stopped`, `detached`, or whose process is dead are reported `not running` and are not killed again. A recovery record still in `reserved` or `launched` is marked `failed` before any late child can claim it. The pane id and window id are taken from that locked record: a window-only launch is closed with `killWindow` even when it has no pane id. Roster, tasks, inbox, and Pi session files are untouched. After every teammate pane that needed closing is actually closed, and only for a whole-team close, the lead Pi is requested to exit back to its shell. A `lease changed` or `close failed` result, or a single-member close, leaves the lead attached. The lead pane is not closed. The exit request is asynchronous and is not itself proof that the shell prompt has returned. The next original-lead `session_start`, or `/team-resume <team> [member]`, reopens missing original sessions, including members closed individually. Busy work is killed mid-run. This is not a work dispatch and does not complete tasks. A commanded close is recorded as expected. A later poll that sees a known runtime instance stop, or a tmux pane that is actually gone, writes one lead inbox notice for that instance. A later failure while sending another member's notice does not send the stored notice again. A notice write that starts after confirmed deletion begins does not recreate the team directory. Reloading members are skipped. The notice does not reopen the pane, complete a task, or open a work generation.
 
-`/team-shutdown [team]` is the user-facing form of the `team_shutdown` tool and uses the same close, including the skip and pending-launch rules, then deletes the team directory and task directory. Pi conversation files outside those directories remain. If this session is attached to the named team, it stops inbox polling and clears its team attachment after the close. Windows Terminal and Zellij adapters do not close processes. When any teammate or pending launch still needs a close, both commands throw before changing runtime records or deleting team data, including when that need appears after the first look. A team whose teammates are already stopped, detached, or dead, with no pending launch, can still be closed or dissolved. With no argument, both commands use the attached team name.
+`/team-shutdown confirm`, or `/team-shutdown <team> confirm`, uses the same close, including the skip and pending-launch rules, then deletes the team directory and task directory only when every required close succeeded. A `lease changed` or `close failed` result throws before the lead is detached and before either directory is removed. Without the final word `confirm` it throws before any close or deletion. Pi conversation files outside those directories remain. If this session is attached to the named team, it stops inbox polling and clears its team attachment after the close. The model has no `team_shutdown` tool. Windows Terminal and Zellij adapters do not close processes. When any teammate or pending launch still needs a close, both commands throw before changing runtime records or deleting team data, including when that need appears after the first look. A team whose teammates are already stopped, detached, or dead, with no pending launch, can still be closed or deleted with `confirm`. With no team argument, both commands use the attached team name.
 
 ## Team Quiescence Fallback
 

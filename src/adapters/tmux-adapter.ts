@@ -116,16 +116,26 @@ export class TmuxAdapter implements TerminalAdapter {
     return rows.find(([, value]) => value === token)?.[0];
   }
 
-  kill(paneId: string): void {
+  kill(paneId: string): "closed" | "absent" | "failed" {
     if (!paneId || paneId.startsWith("iterm_") || paneId.startsWith("zellij_")) {
-      return; // Not a tmux pane
+      return "absent";
     }
-    
-    try {
-      execCommand("tmux", ["kill-pane", "-t", paneId.trim()]);
-    } catch {
-      // Ignore errors - pane may already be dead
+    const result = execCommand("tmux", ["kill-pane", "-t", paneId.trim()]);
+    if (result.status === 0) return "closed";
+    const detail = `${result.stderr}\n${result.stdout}`.toLowerCase();
+    if (
+      detail.includes("can't find pane")
+      || detail.includes("can't find window")
+      || detail.includes("can't find session")
+      || detail.includes("no such pane")
+      || detail.includes("no such window")
+      || detail.includes("no such session")
+      || detail.includes("session not found")
+      || detail.includes("no current session")
+    ) {
+      return "absent";
     }
+    return "failed";
   }
 
   isAlive(paneId: string): boolean {

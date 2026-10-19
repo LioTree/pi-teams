@@ -615,8 +615,24 @@ describe("registered team_wait and messaging tools", () => {
         });
       }
       const result = await pending;
-      expect(result.details.outcome).toBe("no_active_agents");
       expect(result.details.members.find((peer: { name: string }) => peer.name === workerName).progressCapable).toBe(false);
+      const delivered = result.details.outcome === "message"
+        ? result.details.messages.map((message: { text: string }) => message.text).join("\n")
+        : "";
+      if (result.details.outcome === "message") {
+        expect(delivered).toContain("not restarted");
+      } else {
+        expect(result.details.outcome).toBe("no_active_agents");
+        const startedNotice = Date.now();
+        let notice = "";
+        while (Date.now() - startedNotice < 3000) {
+          notice = (await messaging.readInbox(teamName, "team-lead")).map(message => message.text).join("\n");
+          if (notice.includes("not restarted")) break;
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        expect(notice).toContain("not restarted");
+      }
+      await messaging.readInbox(teamName, "team-lead");
     }
   }, 15000);
 

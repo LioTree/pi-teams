@@ -131,6 +131,39 @@ describe("lead-directed teammate model change", () => {
     expect(lead.ctx.ui.notify.mock.calls.at(-1)[0]).toContain("refused");
   }, 10_000);
 
+  it("the leader tool submits pending then queries applied without another model request", async () => {
+    const lead = make(leadIdentity);
+    const peer = make(peerIdentity);
+    await lead.emit("session_start"); await peer.emit("session_start"); await drain();
+    const tool = lead.tools.get("team_set_model");
+    const before = await readQuiescenceState(team);
+    expect((await tool.execute("none", { team_name: team, agent_name: "peer" })).details.status).toBe("no_request");
+    const submitted = await tool.execute("set", { team_name: team, agent_name: "peer", model: "xai/grok-4.7", thinking: "xhigh" });
+    expect(submitted.details.status).toBe("pending");
+    await nextPoll(); await drain();
+    const queried = await tool.execute("query", { team_name: team, agent_name: "peer" });
+    expect(queried.details).toMatchObject({ status: "applied", request_id: submitted.details.request_id });
+    expect(peer.setModel).toHaveBeenCalledTimes(1);
+    expect(peer.sent).toEqual([]);
+    expect((await readQuiescenceState(team)).generation).toBe(before.generation);
+  }, 10_000);
+
+  it("the tool reports refusal and enforces lead ownership and valid inputs", async () => {
+    const lead = make(leadIdentity);
+    const peer = make(peerIdentity, { setModel: vi.fn(async () => false) });
+    await lead.emit("session_start"); await peer.emit("session_start"); await drain();
+    const tool = lead.tools.get("team_set_model");
+    const params = { team_name: team, agent_name: "peer" };
+    await expect(peer.tools.get("team_set_model").execute("bad", { ...params, model: "xai/grok-4.7" })).rejects.toThrow("Only the team lead");
+    await expect(tool.execute("bad-team", { ...params, team_name: "other" })).rejects.toThrow();
+    await expect(tool.execute("bad-agent", { ...params, agent_name: "team-lead", model: "xai/grok-4.7" })).rejects.toThrow("No teammate");
+    await expect(tool.execute("bad-model", { ...params, model: "bare" })).rejects.toThrow("provider/id");
+    await expect(tool.execute("bad-thinking", { ...params, thinking: "high" })).rejects.toThrow("thinking requires model");
+    await tool.execute("set", { ...params, model: "xai/grok-4.7" });
+    await nextPoll(); await drain();
+    expect((await tool.execute("query", params)).details).toMatchObject({ status: "refused", error: "no authentication for this provider" });
+  }, 10_000);
+
   it("a teammate cannot change models", async () => {
     const peer = make(peerIdentity);
     await peer.emit("session_start");

@@ -231,7 +231,7 @@ export async function updateRuntimeStatusForInstance(
 export async function replaceRuntimeInstance(
   teamName: string,
   agentName: string,
-  expectedInstanceId: string,
+  expectedInstanceId: string | undefined,
   nextInstanceId: string | undefined,
   updates: Partial<AgentRuntimeStatus>,
   expectedActivity?: AgentActivity | readonly AgentActivity[],

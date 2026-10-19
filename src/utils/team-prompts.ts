@@ -46,7 +46,9 @@ export function buildLeadSystemPrompt(options: LeadSystemPromptOptions): string 
     `\n- After delegating work, call team_wait instead of continuing or duplicating the delegated work.` +
     `\n- When team_wait returns, do coordination work only; if teammates are still active, call team_wait again.` +
     `\n- Use team_status, task_read, and team_message to monitor progress, review evidence, and send corrections.` +
-    `\n- An interrupted teammate was aborted in its own session. It is not progress-capable and will not auto-resume from inbox mail, but a live interrupted peer keeps an indefinite team_wait open. Recovery is a direct user prompt in that session, not a model change or remote resume.`;
+    `\n- An interrupted teammate was aborted in its own session. It is not progress-capable and will not auto-resume from inbox mail, but a live interrupted peer keeps an indefinite team_wait open. Recovery is a direct user prompt in that session, not a model change or remote resume.` +
+    `\n- Do not close a teammate or the team because work finished or a member is idle. task_complete leaves them on the roster.` +
+    `\n- Call team_close or team_resume only when the user explicitly asks to close or reopen a pane. Closing keeps membership and the original session, does not complete tasks, and does not delete the team. Deleting a saved team is the user's /team-shutdown confirm, not a model tool.`;
 }
 
 export function buildTeammateSystemPrompt(options: TeammateSystemPromptOptions): string {
@@ -56,7 +58,7 @@ export function buildTeammateSystemPrompt(options: TeammateSystemPromptOptions):
     `\n\nYou are teammate '${options.agentName}' on team '${options.teamName}'.` +
     `\nYour lead is 'team-lead'.${modelInfo}` +
     `\nYour initial assignment and later messages are delivered from your inbox automatically; begin working when they arrive.` +
-    `\nUse team_message to report results, blockers, and dependency requests.` +
+    `\nUse team_message to report results, blockers, and dependency requests. Finishing a task does not remove you from the team.` +
     `\nCall team_wait only after sending a dependency request with team_message and only while another active team member must respond; do not call it merely to become idle.` +
     `\nIf this session is interrupted, inbox delivery stays paused until a direct user prompt starts a new run.` +
     `\nAn inbox attempt whose host acceptance is unknown stays unread and is not resent in this process. A new process is deliberate recovery, not exactly-once delivery.`;
