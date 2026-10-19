@@ -30,7 +30,7 @@ import {
 import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-file";
 import { resolveAgentRole } from "../src/utils/agent-role";
 import { applyTeamSystemPrompt, buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
-import { buildPiCommand, shellArgument } from "../src/utils/pi-command";
+import { buildPiCommand, getPiLaunchCommand } from "../src/utils/pi-command";
 import { Member, THINKING_LEVELS } from "../src/utils/models";
 import {
   type AgentSettings,
@@ -52,42 +52,6 @@ import { spawnSync } from "node:child_process";
 // currently running was read from disk.
 const EXTENSION_LOADED_AT = Date.now();
 const RELOAD_SELF_COMMAND = "team-reload-self";
-
-/**
- * Build the command used to relaunch pi for teammate processes.
- *
- * There are three common cases:
- * - npm/node install: pi runs as `node .../dist/cli.js`
- * - standalone compiled binary: process.execPath is the actual `pi` executable
- * - shim-based installs (e.g. Volta): process.execPath is `node` and argv[1]
- *   may be a shim path, so the safest relaunch command is plain `pi`
- */
-function getPiLaunchCommand(): string {
-  const argv1 = process.argv[1];
-  const execPath = process.execPath;
-
-  // Regular Node install: relaunch the actual CLI script with node.
-  if (argv1) {
-    const ext = path.extname(argv1).toLowerCase();
-    const looksLikeScript = [".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"].includes(ext)
-      || /(?:^|[/\\])dist[/\\]cli\.js$/i.test(argv1);
-
-    if (looksLikeScript) {
-      return `node ${shellArgument(argv1)}`;
-    }
-  }
-
-  // Standalone binary install: execPath is the pi executable itself.
-  if (execPath) {
-    const base = path.basename(execPath).toLowerCase();
-    if (base !== "node" && base !== "node.exe" && base !== "bun" && base !== "bun.exe") {
-      return shellArgument(execPath);
-    }
-  }
-
-  // Shim-based installs (like Volta) are safest to relaunch through PATH.
-  return "pi";
-}
 
 // Cache for available models
 let availableModelsCache: Array<{ provider: string; model: string }> | null = null;
@@ -1853,18 +1817,25 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
 
     const pidFile = path.join(paths.teamDir(teamName), `${member.name}.pid`);
     if (fs.existsSync(pidFile)) {
+      let parsedPid: number | undefined;
       try {
-        const pid = fs.readFileSync(pidFile, "utf-8").trim();
-        const parsedPid = parseInt(pid, 10);
-        // Signal only when the current start token was read and matches.
-        // An unreadable token must not kill whatever now owns this PID.
-        if (runtimeStatus?.pid === parsedPid && runtime.hasConfirmedProcessIdentity(runtimeStatus)) {
-          process.kill(parsedPid, "SIGKILL");
-        }
-        fs.unlinkSync(pidFile);
+        parsedPid = parseInt(fs.readFileSync(pidFile, "utf-8").trim(), 10);
       } catch {
         // A pid-file read failure skips the signal. The pane close below still runs.
       }
+      // Only a successful lease transition and a confirmed process identity may
+      // authorize an intentional-stop marker. Do not mark unrelated processes or
+      // swallow marker errors as if this shutdown succeeded.
+      if (parsedPid !== undefined && runtimeStatus?.pid === parsedPid && runtime.hasConfirmedProcessIdentity(runtimeStatus)) {
+        if (member.windowId) terminal?.prepareShutdown?.(member.windowId);
+        if (member.tmuxPaneId) terminal?.prepareShutdown?.(member.tmuxPaneId);
+        try {
+          process.kill(parsedPid, "SIGKILL");
+        } catch {
+          // The process may have exited after the identity check.
+        }
+      }
+      fs.rmSync(pidFile, { force: true });
     }
 
     if (member.windowId && terminal) {

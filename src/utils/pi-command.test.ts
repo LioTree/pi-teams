@@ -1,5 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { buildPiCommand, getProjectTrustArg, shellArgument } from "./pi-command";
+import { buildPiCommand, getPiLaunchCommand, getProjectTrustArg, shellArgument } from "./pi-command";
+
+describe("Pi launch command", () => {
+  it("reuses the exact Node binary and CLI script on Nix/WSL", () => {
+    expect(getPiLaunchCommand("/home/user/pi/dist/cli.js", "/nix/store/node/bin/node", "linux"))
+      .toBe("'/nix/store/node/bin/node' '/home/user/pi/dist/cli.js'");
+  });
+
+  it("quotes POSIX paths containing spaces, apostrophes and dollar signs", () => {
+    expect(getPiLaunchCommand("/tmp/it's $pi/cli.js", "/opt/node runtime/node", "linux"))
+      .toBe("'/opt/node runtime/node' '/tmp/it'\\''s $pi/cli.js'");
+  });
+
+  it("uses PowerShell's call operator and literal Windows path quoting", () => {
+    expect(getPiLaunchCommand("C:\\O'Brien\\pi\\cli.js", "C:\\Program Files\\nodejs\\node.exe", "win32"))
+      .toBe("& 'C:\\Program Files\\nodejs\\node.exe' 'C:\\O''Brien\\pi\\cli.js'");
+  });
+
+  it.each(["linux", "win32"] as const)("supports standalone binaries on %s", platform => {
+    const binary = platform === "win32" ? "C:\\Program Files\\pi.exe" : "/opt/pi binary";
+    expect(getPiLaunchCommand("/$bunfs/root/pi", binary, platform))
+      .toBe(`${platform === "win32" ? "& " : ""}'${binary}'`);
+  });
+
+  it.each(["/usr/bin/node", "/usr/bin/bun"])("falls back to PATH for %s shim installs", binary => {
+    expect(getPiLaunchCommand("/volta/bin/pi", binary, "linux")).toBe("pi");
+  });
+});
 
 describe("Pi teammate command", () => {
   it("inherits the lead's approve override", () => {

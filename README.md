@@ -383,14 +383,15 @@ wezterm  # Start WezTerm
 pi       # Start pi inside WezTerm
 ```
 
-### Option 5: Windows Terminal (Windows)
+### Option 5: Windows Terminal (Windows and WSL)
 
-**Windows Terminal** is the modern, feature-rich terminal emulator for Windows 10/11. It supports both **Panes** and **Separate OS Windows**.
+**Windows Terminal** is the modern, feature-rich terminal emulator for Windows 10/11. It supports both **Panes** and **Separate OS Windows**, including Linux teammates inside WSL without tmux.
 
 **Requirements:**
 - Windows 10 (version 19041 or later) or Windows 11
 - Windows Terminal installed (available from Microsoft Store or winget)
-- PowerShell 5.1 or later (pwsh.exe)
+- For native Windows: Windows PowerShell 5.1 (`powershell.exe`) or PowerShell 7+ (`pwsh.exe`)
+- For WSL: Windows interop and Windows PATH integration enabled, with `wt.exe` accessible from the Linux shell
 
 Install Windows Terminal:
 - **Microsoft Store**: Search for "Windows Terminal" and install
@@ -413,7 +414,28 @@ Or start pi directly from Windows Terminal with new window:
 wt -- pwsh -c "pi"
 ```
 
-**Note:** On Windows, pi-teams uses PowerShell for command execution. Make sure `pi` is in your PATH. If you installed pi via npm and Node.js, verify both are accessible from PowerShell.
+**Note:** On native Windows, pi-teams uses PowerShell for command execution. Make sure `pi` is in your PATH. If you installed pi via npm and Node.js, verify both are accessible from PowerShell.
+
+#### WSL (no tmux required)
+
+Open a WSL profile in Windows Terminal, then start Pi normally:
+
+```bash
+cd /path/to/project
+command -v wt.exe  # Must resolve through Windows PATH integration
+pi
+```
+
+pi-teams detects Windows Terminal when both `WT_SESSION` and `WSL_DISTRO_NAME` are present. New panes and separate windows run `wsl.exe` with the **same distribution and Linux user**. The launcher restores the requested working directory, `PI_*` variables and the lead's `PATH`, and reuses the exact Node executable for Node-based installs (including NixOS store paths). WSL teammates never run in Windows PowerShell. Standalone Pi installs need a Linux `node` executable in the lead's PATH for the launch bridge.
+
+No additional team settings are required. Pane mode is the default; `separate_windows: true` opens each teammate in a separate Windows Terminal window. Existing tmux, Zellij, cmux and WezTerm sessions retain priority over Windows Terminal.
+
+**Windows Terminal limitations:**
+- Pane spawning targets the most recently active Terminal window/tab (`-w 0`). Keep the lead's tab active when spawning; the CLI cannot reliably identify the lead's current pane.
+- The first teammate splits vertically; subsequent teammates split the focused pane horizontally. Automatic tmux-style layout balancing is not available.
+- The CLI does not expose pane enumeration or arbitrary pane/window termination. WSL teammate health uses the existing runtime PID/start-token and heartbeat mechanism. Where a confirmed process stop is authorized, the adapter marks the launch bridge so it exits with code 0; real failures retain nonzero exit codes. Windows Terminal's `closeOnExit` setting still controls the UI: `graceful`/`always` can close intentionally stopped panes, while `never` keeps them open. pi-teams does not change your Terminal settings. This bridge does not make bulk close reliable: `/team-close`, `/team-shutdown` and `team_shutdown` still refuse if any member or pending launch needs closing. With all members already stopped and no pending launch, dissolution remains allowed.
+- Pane spawning uses `-w 0`, Windows Terminal's current/recent-window target. It does not prove exact lead-window selection when multiple Terminal windows are open; `WT_SESSION` is not used as a window ID. Automatic restoration of missing teammate panes remains tmux-only; the WSL launcher does not extend session recovery to Windows Terminal.
+- Window/pane titles are set at creation. Other windows cannot be renamed remotely through the CLI.
 
 ## 📜 Credits & Attribution
 
