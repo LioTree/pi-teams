@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 - Document the user-level magic-context subprocess extension isolation setting.
 
 ### Fixed
+- **Quiet tmux pane checks**: Manually closing a teammate pane no longer floods the terminal with `can't find pane` errors. Liveness checks capture command stderr and verify the exact pane ID; roster retention and session recovery behavior are unchanged.
 - **Close must finish before exit or deletion**: `/team-shutdown confirm` leaves the team in place when a pane lease changes or the terminal refuses the close, and does not detach the lead. A refused tmux `kill-pane` is `close failed` and restores that member's runtime lease. An unexpected-stop notice is stored once per instance, and a notice still in flight when deletion begins cannot recreate the team directory.
 - **team_wait right after team_create**: a team created during the current turn records the lead as `running` instead of leaving the claim's `idle`. `team_wait` can also enter from that stale `idle`. A wait that this session still owns but cannot start names the current activity instead of reporting a lost runtime lease.
 - **Windows Terminal CLI compatibility**: Integrate the upstream WSL launch bridge, encoded PowerShell payloads, `-w 0 split-pane`, decimal split sizes and `-w -1 new-tab` windows. Remove `wt list` and the incorrect use of `WT_SESSION` as a window ID. WSL children preserve the lead's distribution, user, PATH and Node runtime; registered session restoration still uses the exact saved session file.

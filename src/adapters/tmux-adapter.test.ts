@@ -248,6 +248,38 @@ describe("TmuxAdapter", () => {
     expect(adapter.kill("%99")).toBe("absent");
   });
 
+  it("checks the exact pane instead of the containing session", () => {
+    mockExecCommand.mockReturnValue({ stdout: "%99\n", stderr: "", status: 0 });
+    expect(adapter.isAlive("%99")).toBe(true);
+    expect(mockExecCommand).toHaveBeenCalledWith("tmux", ["display-message", "-p", "-t", "%99", "#{pane_id}"]);
+
+    mockExecCommand.mockReturnValue({ stdout: "%16\n", stderr: "", status: 0 });
+    expect(adapter.isAlive("%99")).toBe(false);
+  });
+
+  it("quietly handles repeated checks of a manually closed pane", () => {
+    mockExecCommand.mockReturnValue({ stdout: "", stderr: "can't find pane: %99", status: 1 });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      expect(adapter.isAlive("%99")).toBe(false);
+    }
+    expect(mockExecCommand).toHaveBeenCalledTimes(5);
+    expect(mockExecCommand.mock.calls.every((call: any[]) => call[1][0] === "display-message")).toBe(true);
+  });
+
+  it("treats failed or unavailable pane probes as not alive", () => {
+    mockExecCommand.mockReturnValue({ stdout: "%99", stderr: "probe failed", status: 1 });
+    expect(adapter.isAlive("%99")).toBe(false);
+    mockExecCommand.mockImplementation(() => { throw new Error("tmux unavailable"); });
+    expect(adapter.isAlive("%99")).toBe(false);
+  });
+
+  it("does not probe empty or other-adapter pane IDs", () => {
+    for (const paneId of ["", "iterm_123", "zellij_123"]) {
+      expect(adapter.isAlive(paneId)).toBe(false);
+    }
+    expect(mockExecCommand).not.toHaveBeenCalled();
+  });
+
   it("should target the current pane when setting the title", () => {
     mockExecCommand.mockReturnValue({ stdout: "", stderr: "", status: 0 });
 

@@ -4,7 +4,6 @@
  * Implements the TerminalAdapter interface for tmux terminal multiplexer.
  */
 
-import { execSync } from "node:child_process";
 import { TerminalAdapter, SpawnOptions, execCommand } from "../utils/terminal-adapter";
 
 export class TmuxAdapter implements TerminalAdapter {
@@ -143,12 +142,7 @@ export class TmuxAdapter implements TerminalAdapter {
       return false; // Not a tmux pane
     }
 
-    try {
-      execSync(`tmux has-session -t ${paneId}`);
-      return true;
-    } catch {
-      return false;
-    }
+    return this.isPaneUsable(paneId);
   }
 
   setTitle(title: string): void {
