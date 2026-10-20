@@ -83,6 +83,15 @@ describe("buildLeadSystemPrompt", () => {
     expect(prompt).not.toContain("event=");
   });
 
+  it.each([undefined, "refactor-squad"])("preserves teammate defaults for lead team %s unless the user requests an override", (teamName) => {
+    const prompt = buildLeadSystemPrompt({ baseSystemPrompt: "Base.", teamName });
+    expect(prompt).toContain("Respect configured teammate model and thinking defaults");
+    expect(prompt).toContain("Omit model, thinking, and default_model");
+    expect(prompt).toContain("unless the user explicitly requests the corresponding override");
+    expect(prompt).toContain("never choose overrides based on task difficulty");
+    expect(prompt).toContain("not from your own current model or thinking level");
+  });
+
   it("tells a lead without a current team to create one when coordination is useful", () => {
     const prompt = buildLeadSystemPrompt({ baseSystemPrompt: "Base system prompt." });
     expect(prompt).toContain("Create a team with team_create");

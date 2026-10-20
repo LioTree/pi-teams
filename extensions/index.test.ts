@@ -183,6 +183,46 @@ describe("registered close and resume tools", () => {
   });
 });
 
+describe("registered teammate default guidance", () => {
+  function registeredTools() {
+    const registerTool = vi.fn();
+    extension({ on: vi.fn(), registerTool, registerCommand: vi.fn() } as unknown as ExtensionAPI);
+    return new Map(registerTool.mock.calls.map(([tool]) => [tool.name, tool]));
+  }
+
+  it.each(["team_create", "delegate_task", "create_predefined_team"])("documents omission and user-requested overrides on %s", (name) => {
+    const tool = registeredTools().get(name);
+    expect(tool.description).toMatch(/[Oo]mit/);
+    expect(tool.description).toContain("configured teammate defaults");
+    expect(tool.description).toContain("user explicitly requests");
+    expect(tool.description).toContain("task difficulty");
+  });
+
+  it("explains both delegate overrides without hiding them or making them required", () => {
+    const tool = registeredTools().get("delegate_task");
+    for (const name of ["model", "thinking"]) {
+      const parameter = tool.parameters.properties[name];
+      expect(parameter.description).toContain("Omit to use");
+      expect(parameter.description).toContain("user explicitly requests");
+      expect(parameter.description).toContain("not based on task difficulty");
+      expect(parameter.description).toContain("Does not change a live reused teammate");
+      expect(tool.parameters.required).not.toContain(name);
+    }
+    expect(tool.parameters.properties.model.description).toContain("team defaultModel");
+    expect(tool.parameters.properties.model.description).toContain("teammateDefaultModel");
+    expect(tool.parameters.properties.thinking.description).toContain("teammateDefaultThinkingLevel");
+  });
+
+  it.each(["team_create", "create_predefined_team"])("does not leave %s default_model as an undocumented bypass", (name) => {
+    const tool = registeredTools().get(name);
+    const parameter = tool.parameters.properties.default_model;
+    expect(parameter.description).toContain("Omit to");
+    expect(parameter.description).toContain("user explicitly requests");
+    expect(parameter.description).toContain("not based on task difficulty");
+    expect(tool.parameters.required).not.toContain("default_model");
+  });
+});
+
 describe("before_agent_start registered by the extension factory", () => {
   it.each([
     ["team-lead", `You are the team lead for team '${teamName}'.`],
@@ -199,7 +239,11 @@ describe("before_agent_start registered by the extension factory", () => {
       const originalBase = event.systemPrompt;
       const result = await run(event);
 
-      expectModernRole(event, result, roleLine);
+      const section = expectModernRole(event, result, roleLine);
+      if (agentName === "team-lead") {
+        expect(section).toContain("Omit model, thinking, and default_model");
+        expect(section).toContain("unless the user explicitly requests the corresponding override");
+      }
       expect(event.systemPromptOptions.sections).toEqual({
         ...originalSections,
         pi_teams: expect.any(String),
@@ -249,6 +293,7 @@ describe("before_agent_start registered by the extension factory", () => {
       const event = modernEvent(turn);
       const section = expectModernRole(event, await run(event), "You are the pi-teams team lead.");
       expect(section).toContain("Create a team with team_create");
+      expect(section).toContain("Omit model, thinking, and default_model");
       expect(event.systemPromptOptions.sections.magic_context).toBe(`Magic Context supplied for turn ${turn}`);
     }
     // Identity lookup belongs to session_start, not factory/PID discovery.
@@ -274,6 +319,10 @@ describe("before_agent_start registered by the extension factory", () => {
       const result = await run(event);
       expect(result?.systemPrompt?.startsWith(base)).toBe(true);
       expect(result?.systemPrompt).toContain(roleLine);
+      if (agentName === "team-lead") {
+        expect(result?.systemPrompt).toContain("Omit model, thinking, and default_model");
+        expect(result?.systemPrompt).toContain("unless the user explicitly requests the corresponding override");
+      }
       expect(result?.systemPrompt?.split(roleLine)).toHaveLength(2);
       expect(result?.systemPrompt?.split(base)).toHaveLength(2);
       expect(event.systemPrompt).toBe(base);

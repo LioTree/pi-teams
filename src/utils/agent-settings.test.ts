@@ -153,6 +153,12 @@ describe("resolveTeammateModel priority", () => {
 });
 
 describe("resolveTeammateThinking", () => {
+  it("keeps max defaults when omitted while honoring a user-requested lower override", () => {
+    const settings = { teammateDefaultThinkingLevel: "max" };
+    expect(resolveTeammateThinking({ settings })).toBe("max");
+    expect(resolveTeammateThinking({ settings, explicitThinking: "high" })).toBe("high");
+  });
+
   it("prefers explicit thinking", () => {
     expect(resolveTeammateThinking({
       explicitThinking: "max",

@@ -2409,11 +2409,11 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   pi.registerTool({
     name: "team_create",
     label: "Create Team",
-    description: "Create a new agent team.",
+    description: "Create a new agent team. Omit default_model to preserve configured teammate defaults; supply it only when the user explicitly requests a team-wide model override, never based on task difficulty.",
     parameters: Type.Object({
       team_name: Type.String(),
       description: Type.Optional(Type.String()),
-      default_model: Type.Optional(Type.String()),
+      default_model: Type.Optional(Type.String({ description: "Optional team-wide model override (provider/model). Omit to use configured teammate defaults. Supply only when the user explicitly requests this override, not based on task difficulty." })),
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
@@ -2439,7 +2439,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   pi.registerTool({
     name: "delegate_task",
     label: "Delegate Task",
-    description: "Create a task, assign it to a teammate, and spawn or reuse that teammate as needed. This is the formal dispatch boundary: it arms the team quiescence fallback for new or follow-up work.",
+    description: "Create a task, assign it to a teammate, and spawn or reuse that teammate as needed. This is the formal dispatch boundary: it arms the team quiescence fallback for new or follow-up work. For new teammates, omit model and thinking to use configured teammate defaults. Supply either only when the user explicitly requests that override; never choose overrides based on task difficulty. Reusing a live teammate does not change its model or thinking.",
     parameters: Type.Object({
       team_name: Type.String(),
       teammate_name: Type.String(),
@@ -2447,8 +2447,8 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       task_subject: Type.String(),
       task_description: Type.String(),
       prompt: Type.Optional(Type.String({ description: "Additional teammate instructions for this task." })),
-      model: Type.Optional(Type.String()),
-      thinking: Type.Optional(StringEnum([...THINKING_LEVELS])),
+      model: Type.Optional(Type.String({ description: "Optional model override (provider/model) for a new teammate. Omit to use the team defaultModel, then settings teammateDefaultProvider/teammateDefaultModel. Supply only when the user explicitly requests a model override, not based on task difficulty. Does not change a live reused teammate." })),
+      thinking: Type.Optional(StringEnum([...THINKING_LEVELS], { description: "Optional thinking-level override for a new teammate. Omit to use settings teammateDefaultThinkingLevel. Supply only when the user explicitly requests a thinking override, not based on task difficulty. Does not change a live reused teammate." })),
       reuse: Type.Optional(StringEnum(["existing", "replace", "error"])),
       separate_window: Type.Optional(Type.Boolean({ default: false })),
     }),
@@ -3160,12 +3160,12 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   pi.registerTool({
     name: "create_predefined_team",
     label: "Create Predefined Team",
-    description: "Create a team from a predefined team configuration. Spawns all agents defined in the team template from teams.yaml. Each agent is spawned with its predefined prompt, tools, and settings. Successful worker launches arm the team quiescence fallback.",
+    description: "Create a team from a predefined team configuration. Spawns all agents defined in the team template from teams.yaml. Each agent is spawned with its predefined prompt, tools, and settings. Successful worker launches arm the team quiescence fallback. Omit default_model to preserve template and configured teammate defaults; supply it only when the user explicitly requests an override, never based on task difficulty.",
     parameters: Type.Object({
       team_name: Type.String({ description: "Name for the new team instance" }),
       predefined_team: Type.String({ description: "Name of the predefined team template from teams.yaml" }),
       cwd: Type.String({ description: "Working directory for spawned agents" }),
-      default_model: Type.Optional(Type.String({ description: "Default model for agents without a specified model" })),
+      default_model: Type.Optional(Type.String({ description: "Optional model override (provider/model) for agents without a specified model. Omit to preserve template and configured teammate defaults. Supply only when the user explicitly requests this override, not based on task difficulty." })),
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
