@@ -30,7 +30,7 @@ function make(identity: TeamSession) {
     sendUserMessage: (text: string) => sent.push(text) } as any);
   const object = { handlers, tools, commands, sent, ctx, setIdle: (value: boolean) => { idle = value; },
     emit: (name: string, event: any = {}) => handlers.get(name)({ type: name, ...event }, ctx),
-    reloadCommands: () => sent.filter(text => text.startsWith("/team-reload-self ")) };
+    reloadCommands: () => sent.filter(text => text.startsWith("/team-reload __self ")) };
   loaded.push(object); return object;
 }
 async function drain() { for (let i = 0; i < 80; i++) await Promise.resolve(); }
@@ -59,20 +59,74 @@ afterEach(async () => {
 });
 
 describe("team-wide reload", () => {
-  it("lead request reloads an idle peer through its own command, once", async () => {
+  it("registers only the public reload command, without a helper command or completion", () => {
+    const peer = make(peerIdentity);
+    expect([...peer.commands.keys()].filter(name => name.startsWith("team-reload"))).toEqual(["team-reload"]);
+    expect(peer.commands.has("team-reload-self")).toBe(false);
+    expect(peer.commands.get("team-reload").description).not.toContain("__self");
+    expect(peer.commands.get("team-reload").getArgumentCompletions).toBeUndefined();
+  });
+
+  it("lead request reloads an idle peer through the public command's internal branch, once", async () => {
     const lead = make(leadIdentity); await lead.emit("session_start", { reason: "startup" });
     const peer = make(peerIdentity); await peer.emit("session_start", { reason: "startup" }); await drain();
     await lead.commands.get("team-reload").handler("", lead.ctx);
     const request = readReloadRequest(team)!;
     await nextPoll(); await drain();
-    expect(peer.reloadCommands()).toEqual([`/team-reload-self ${request.id}`]);
-    await peer.commands.get("team-reload-self").handler(request.id, peer.ctx);
+    expect(peer.reloadCommands()).toEqual([`/team-reload __self ${request.id}`]);
+    await peer.commands.get("team-reload").handler(`__self ${request.id}`, peer.ctx);
     expect(peer.ctx.reload).toHaveBeenCalledTimes(1);
     // A stale or mismatched dispatch does nothing.
-    await peer.commands.get("team-reload-self").handler("other", peer.ctx);
+    await peer.commands.get("team-reload").handler("__self other", peer.ctx);
     expect(peer.ctx.reload).toHaveBeenCalledTimes(1);
     await peer.emit("session_shutdown", { reason: "reload" });
-    expect(lead.reloadCommands()).toEqual([`/team-reload-self ${request.id}`]);
+    expect(lead.reloadCommands()).toEqual([`/team-reload __self ${request.id}`]);
+  }, 10_000);
+
+  it("ignores internal dispatches with no request, a wrong ID, or extra arguments", async () => {
+    const lead = make(leadIdentity); await lead.emit("session_start");
+    const peer = make(peerIdentity); await peer.emit("session_start"); await drain();
+    await peer.commands.get("team-reload").handler("__self missing", peer.ctx);
+    expect(readReloadRequest(team)).toBeUndefined();
+    await lead.commands.get("team-reload").handler("", lead.ctx);
+    const request = readReloadRequest(team)!;
+    for (const args of ["__self", "__self other", `__self ${request.id} extra`]) {
+      await peer.commands.get("team-reload").handler(args, peer.ctx);
+      await lead.commands.get("team-reload").handler(args, lead.ctx);
+    }
+    expect(peer.ctx.reload).not.toHaveBeenCalled();
+    expect(lead.ctx.reload).not.toHaveBeenCalled();
+    expect(readReloadRequest(team)).toEqual(request);
+  });
+
+  it("rejects a superseded internal request and accepts only the current request", async () => {
+    const lead = make(leadIdentity); await lead.emit("session_start");
+    const peer = make(peerIdentity); await peer.emit("session_start"); await drain();
+    await lead.commands.get("team-reload").handler("", lead.ctx);
+    const oldRequest = readReloadRequest(team)!;
+    await lead.commands.get("team-reload").handler("", lead.ctx);
+    const current = readReloadRequest(team)!;
+    expect(current.id).not.toBe(oldRequest.id);
+    await peer.commands.get("team-reload").handler(`__self ${oldRequest.id}`, peer.ctx);
+    expect(peer.ctx.reload).not.toHaveBeenCalled();
+    await peer.commands.get("team-reload").handler(`__self ${current.id}`, peer.ctx);
+    expect(peer.ctx.reload).toHaveBeenCalledTimes(1);
+    expect(readReloadRequest(team)).toEqual(current);
+  });
+
+  it("rechecks safety if a run starts after an internal dispatch was sent", async () => {
+    const lead = make(leadIdentity); await lead.emit("session_start");
+    const peer = make(peerIdentity); await peer.emit("session_start"); await drain();
+    await lead.commands.get("team-reload").handler("", lead.ctx);
+    const request = readReloadRequest(team)!;
+    await nextPoll(); await drain();
+    expect(peer.reloadCommands()).toHaveLength(1);
+    peer.setIdle(false); await peer.emit("agent_start");
+    await peer.commands.get("team-reload").handler(`__self ${request.id}`, peer.ctx);
+    expect(peer.ctx.reload).not.toHaveBeenCalled();
+    peer.setIdle(true); await peer.emit("agent_settled", { aborted: false });
+    await peer.commands.get("team-reload").handler(`__self ${request.id}`, peer.ctx);
+    expect(peer.ctx.reload).toHaveBeenCalledTimes(1);
   }, 10_000);
 
   it("a busy peer waits until its run finishes", async () => {
@@ -94,8 +148,8 @@ describe("team-wide reload", () => {
     await lead.commands.get("team-reload").handler("", lead.ctx);
     await nextPoll(); await drain();
     const request = readReloadRequest(team)!;
-    expect(peer.reloadCommands()).toEqual([`/team-reload-self ${request.id}`]);
-    await peer.commands.get("team-reload-self").handler(request.id, peer.ctx);
+    expect(peer.reloadCommands()).toEqual([`/team-reload __self ${request.id}`]);
+    await peer.commands.get("team-reload").handler(`__self ${request.id}`, peer.ctx);
     await peer.emit("session_shutdown", { reason: "reload" });
     const reloaded = make(peerIdentity); await reloaded.emit("session_start", { reason: "reload" }); await drain();
     expect(await runtime.readRuntimeStatus(team, "peer")).toMatchObject({ activity: "interrupted", paused: true });

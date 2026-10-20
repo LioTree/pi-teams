@@ -51,7 +51,8 @@ import { spawnSync } from "node:child_process";
 // Pi reloads extensions without a module cache, so this marks when the code
 // currently running was read from disk.
 const EXTENSION_LOADED_AT = Date.now();
-const RELOAD_SELF_COMMAND = "team-reload-self";
+// Internal argument to the existing command, not a separately registered slash command.
+const RELOAD_SELF_ACTION = "__self";
 
 // Cache for available models
 let availableModelsCache: Array<{ provider: string; model: string }> | null = null;
@@ -1067,9 +1068,9 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     const request = dueReloadRequest();
     if (!request || !reloadIsSafe()) return;
     reloadDispatchedAt = Date.now();
-    // Dispatched as this extension's own command: it reaches no model, starts no
-    // run, and does not resume an interrupted session.
-    pi.sendUserMessage(`/${RELOAD_SELF_COMMAND} ${request.id}`, { expandPromptTemplates: true });
+    // Use the existing command's internal branch so autocomplete exposes no
+    // helper command. This reaches no model and does not resume a paused run.
+    pi.sendUserMessage(`/team-reload ${RELOAD_SELF_ACTION} ${request.id}`, { expandPromptTemplates: true });
   }
 
   async function acknowledgeInspectionAfterSettlement(): Promise<void> {
@@ -1448,6 +1449,18 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   pi.registerCommand("team-reload", {
     description: "Reload pi-teams code in every team member once it is idle (`/team-reload status` shows progress). Busy members finish their current run first.",
     handler: async (args, ctx) => {
+      const [action, requestId, ...extra] = args.trim().split(/\s+/);
+      if (action === RELOAD_SELF_ACTION) {
+        reloadDispatchedAt = 0;
+        const request = dueReloadRequest();
+        if (!request || request.id !== requestId || extra.length || reloadingForRequest || !reloadIsSafe()) return;
+        reloadingForRequest = request.id;
+        await ctx.reload();
+        // If the host refused (e.g. a run started), leave this request retryable.
+        // On success the old closure is retired and must not be reused.
+        if (!sessionStopping) reloadingForRequest = undefined;
+        return;
+      }
       if (!teamName) throw new Error("This session is not attached to a team");
       if (isTeammate) throw new Error("Only the team lead can request a team reload");
       const team = teamName;
@@ -1467,20 +1480,6 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
         return `${member.name}: pending (${status?.reloading ? "reloading" : status?.activity ?? "not running"})`;
       }));
       ctx.ui.notify(lines.join("\n"), "info");
-    },
-  });
-
-  pi.registerCommand(RELOAD_SELF_COMMAND, {
-    description: "Internal: reload this member for a pending /team-reload request.",
-    handler: async (args, ctx) => {
-      reloadDispatchedAt = 0;
-      const request = dueReloadRequest();
-      if (!request || request.id !== args.trim() || reloadingForRequest || !reloadIsSafe()) return;
-      reloadingForRequest = request.id;
-      await ctx.reload();
-      // Still active here means the host refused (e.g. a run started); the
-      // poller retries. On success this closure is retired and must not be used.
-      if (!sessionStopping) reloadingForRequest = undefined;
     },
   });
 
