@@ -150,7 +150,7 @@ describe("session attachment and restoration lifecycle", () => {
     expect((await runtime.readRuntimeStatus(team, "team-lead"))?.detached).toBe(true);
     expect(lead.sent).toEqual([]);
     await expect(lead.tools.get("team_wait").execute("wait", { team_name: team }, new AbortController().signal, undefined, lead.ctx))
-      .rejects.toThrow("bound to team none");
+      .rejects.toThrow("No collaboration is attached to this session");
     const fresh = SessionManager.create(root, path.join(root, "new")); lead.ctx.sessionManager = fresh;
     await lead.emit("session_start", { reason: "new" }); expect(lead.sent).toEqual([]);
     lead.ctx.sessionManager = original;
@@ -384,7 +384,7 @@ describe("session attachment and restoration lifecycle", () => {
     const manual = make(peerIdentity); await manual.emit("session_start"); await drain();
     expect(manual.sent).toEqual([]);
     await expect(manual.tools.get("team_wait").execute("wait", { team_name: team }, undefined, undefined, manual.ctx))
-      .rejects.toThrow("bound to team none");
+      .rejects.toThrow("No collaboration is attached to this session");
   });
 
   it("actual AgentSessionRuntime new/fork/resume replaces identity without inheriting the team", async () => {

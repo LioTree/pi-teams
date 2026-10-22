@@ -580,18 +580,12 @@ describe("registered team quiescence fallback", () => {
       prompt: "do template work",
       filePath: "",
     }]);
-    vi.stubEnv("PI_TEAM_NAME", "");
-    // A predefined template launches into a new team name; the fixture config
-    // stands in for dispatch only and must not already exist.
-    fs.rmSync(path.join(root, "teams", teamName, "config.json"));
-
     const lead = loadExtension("team-lead");
     await startSession(lead);
     const result = await lead.tools.get("create_predefined_team")!.execute("template", {
-      team_name: teamName,
       predefined_team: "template",
       cwd: root,
-    }, undefined, undefined, { cwd: root });
+    }, undefined, undefined, lead.ctx);
 
     expect(result.details.results).toEqual([{ name: "template-worker", status: "spawned", error: undefined }]);
     expect(fakeTerminal.spawn).toHaveBeenCalledTimes(1);

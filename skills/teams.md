@@ -8,7 +8,7 @@ Coordinate multiple agents working on a project using shared task lists and mess
 
 ## Workflow
 
-1.  **Create a team**: Use `team_create(team_name="my-team")`.
+1.  **Use the current main Pi conversation**: no team creation, naming, or selection. The first `delegate_task` or `create_predefined_team` creates its internal collaboration record. Omit `team_name` on all session-scoped tools; existing records attach only to their exact original Pi sessions.
 2.  **Delegate work**: Prefer `delegate_task` to create a task, assign it, and spawn or reuse the teammate in one call.
 3.  **Manage tasks**: 
     *   `task_claim`: Claim unassigned work.
@@ -17,7 +17,7 @@ Coordinate multiple agents working on a project using shared task lists and mess
     *   `task_read`: Get full details of a specific task by ID.
 4.  **Communicate**: Use `team_message`.
 5.  **Monitor**: Use `team_status` for the full board, or `check_teammate` for one teammate.
-6.  **Wait after delegation**: `delegate_task` returns immediately. When you have delegated all current work, call `team_wait({ team_name })` so you do not duplicate a teammate's assignment. Omit `timeout_seconds` for an indefinite wait.
+6.  **Wait after delegation**: `delegate_task` returns immediately. When you have delegated all current work, call `team_wait({})` so you do not duplicate a teammate's assignment. Omit `timeout_seconds` for an indefinite wait.
 7.  **Close only when the user asks**:
     *   `team_close`: Close one teammate pane, or every teammate pane. Membership and the original session stay. Do not call this because work finished.
     *   `team_resume`: Reopen one missing roster session, or every missing one. This is not a new assignment.
@@ -30,7 +30,7 @@ When you are spawned as a teammate:
 - Use `team_message` to "team-lead" to report progress or ask questions.
 - Complete assigned tasks using `task_complete`.
 - Always send a message to "team-lead" when you complete work, get blocked, or need review.
-- If you encounter a real dependency on another member, send that member a `team_message` first, then call `team_wait({ team_name })` while the dependency is outstanding.
+- If you encounter a real dependency on another member, send that member a `team_message` first, then call `team_wait({})` while the dependency is outstanding.
 - Idle inbox delivery runs about once per second. Messages remain unread while you are busy; an active `team_wait` consumes them and resumes you. Interrupted sessions are not auto-resumed. An inbox attempt with unknown host acceptance stays single-flight and unread; it is not a confirmed failure and is not automatically resent.
 
 ## Best Practices for Teammates
@@ -46,7 +46,7 @@ When you are spawned as a teammate:
 - **Clear Assignments**: Use `delegate_task` for significant work items.
 - **Contextual Prompts**: Provide enough task context in `delegate_task` for the teammate to understand their boundaries.
 - **Task List Monitoring**: Regularly call `team_status` to see the status of all work.
-- **Delegate Then Wait**: After delegating, call `team_wait({ team_name })` so you pause until a message arrives or no teammate can make progress. Do not perform the teammate's assigned work.
+- **Delegate Then Wait**: After delegating, call `team_wait({})` so you pause until a message arrives or no teammate can make progress. Do not perform the teammate's assigned work.
 - **Coordinate, Then Wait Again**: When a wait returns, handle reports and blockers only. If teammates are still active, call `team_wait` again.
 - **Direct Feedback**: Use `team_message` to provide course corrections or new instructions to teammates.
 - **Formal Follow-ups**: Use `delegate_task` for new or follow-up teammate work. It is the dispatch boundary that arms the quiescence fallback. An ordinary `team_message` does not re-arm it, even if it says to continue.
@@ -56,7 +56,7 @@ When you are spawned as a teammate:
 
 Resume the original Pi conversation, not a new/forked/cloned chat: exact session ID/file identifies the team member. Original lead attachment recovers the inbox and makes one bounded tmux pass to restore missing roster peers with their original sessions/model/thinking, retaining live peers. Recovery is not dispatch and never replays tasks or continuation prompts; interrupted work stays paused.
 
-Quitting or losing a terminal leaves roster intent. Closing a pane does not remove it. Only the user's confirmed `/team-shutdown confirm` deletes the team index; chat history remains for a manual `/resume` without restoring that team. Missing/corrupt/unmapped sessions remain blocked with data preserved. `/team-resume <team> [member]` reopens one missing member or every missing member for the original lead. It cannot force a live owner or guess chat files. Other adapters retain lead inbox recovery but not automatic pane restoration. Restoring context does not roll back background tools or side effects.
+Quitting or losing a terminal leaves membership intact. Closing a pane does not remove it, but a confirmed tmux pane loss while the lead lives records keep-closed intent (manual closure and crash are not reliably distinguishable). Offline losses after lead exit do not change intent. Only the user's confirmed `/team-shutdown confirm` deletes the team index; chat history remains for a manual `/resume` without restoring that team. Missing/corrupt/unmapped sessions remain blocked with data preserved. `/team-resume [member]` explicitly reopens original sessions, including hidden members; legacy `<team> [member]` syntax is retained for the original lead. It cannot force a live owner or guess chat files. Other adapters retain lead inbox recovery but not automatic pane restoration. Restoring context does not roll back background tools or side effects.
 
 ## Changing a Teammate Model
 
@@ -68,7 +68,7 @@ Quitting or losing a terminal leaves roster intent. Closing a pane does not remo
 
 ## Closing Panes
 
-`/team-close <member>` closes that one pane and leaves the lead attached. `/team-close` closes every live teammate pane, then exits the lead Pi back to its shell. The lead pane stays. If a runtime lease changes, or the terminal refuses a close, and a pane stays open, the lead Pi does not exit and confirmed deletion does not remove the team. Roster, tasks, and inbox stay. Reopening the original lead conversation restores every missing roster member, including one closed earlier. `/team-resume <team> [member]` does the same for one member or all missing members and does not replay tasks. `/team-shutdown confirm` is the only deletion: it closes panes and then deletes the team index. The model has no delete-team tool. Windows Terminal and Zellij cannot close panes. When a teammate or pending launch still needs closing, the commands refuse rather than marking members stopped; an already stopped team can still be deleted with `confirm`. Neither command is a work dispatch. Do not treat a closed pane as task completion. An unexpected process stop or a confirmed missing tmux pane sends the lead one inbox notice. A close you requested does not send that notice again.
+`/team-close <member>` closes that one pane and leaves the lead attached. `/team-close` closes every live teammate pane, then exits the lead Pi back to its shell. The lead pane stays. If a runtime lease changes, or the terminal refuses a close, and a pane stays open, the lead Pi does not exit and confirmed deletion does not remove the team. Roster, tasks, and inbox stay. Reopening the original lead conversation restores only members whose window intent is open. Individually closed members stay closed. Whole `/team-close` preserves prior intent, including a final tmux snapshot for panes just closed manually. `/team-resume <member>` explicitly opens that original session; `/team-resume` explicitly opens all missing members, including hidden ones. A new `delegate_task` assignment also reopens an existing closed member. Ordinary messages, status, model changes, and reloads never open hidden panes. None of this replays historical tasks. `/team-shutdown confirm` is the only deletion: it closes panes and then deletes the team index. The model has no delete-team tool. Windows Terminal and Zellij cannot close panes. When a teammate or pending launch still needs closing, the commands refuse rather than marking members stopped; an already stopped team can still be deleted with `confirm`. Neither command is a work dispatch. Do not treat a closed pane as task completion. An unexpected process stop or a confirmed missing tmux pane sends the lead one inbox notice. A close you requested does not send that notice again.
 
 ## Team Quiescence Fallback
 
@@ -84,7 +84,7 @@ To re-arm the fallback after checked work, use `delegate_task` for the follow-up
 
 ## `team_wait` Result
 
-`team_wait({ team_name, timeout_seconds? })` is available to every member. It returns:
+`team_wait({ timeout_seconds? })` is available to every member. It returns:
 
 - `outcome: "message"` when the caller receives inbox messages
 - `outcome: "no_active_agents"` after repeated checks find no other progress-capable member and no live interrupted peer

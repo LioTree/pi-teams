@@ -137,6 +137,18 @@ export class TmuxAdapter implements TerminalAdapter {
     return "failed";
   }
 
+  panePresence(paneId: string): "present" | "missing" | "unknown" {
+    // Other adapters use synthetic IDs. Never treat one as a missing tmux pane.
+    if (!/^%\d+$/.test(paneId)) return "unknown";
+    try {
+      const result = execCommand("tmux", ["list-panes", "-a", "-F", "#{pane_id}"]);
+      if (result.status !== 0) return "unknown";
+      return result.stdout.trim().split(/\s+/).includes(paneId) ? "present" : "missing";
+    } catch {
+      return "unknown";
+    }
+  }
+
   isAlive(paneId: string): boolean {
     if (!paneId || paneId.startsWith("iterm_") || paneId.startsWith("zellij_")) {
       return false; // Not a tmux pane

@@ -1,4 +1,8 @@
-# Persistent team-session recovery
+# Main-session collaboration and persistent teammate recovery
+
+## Implicit entry
+
+First delegation/template dispatch automatically creates an opaque internal record bound to the main Pi session ID and canonical session file. No explicit team creation/name/selection is needed. Omitted `team_name` uses the attached collaboration; a different explicit name is refused. Legacy exact session bindings are reused without changing their ids or conversation paths. Same-directory sessions remain isolated.
 
 This design describes the recovery implementation, not an independent audit.
 
@@ -14,15 +18,15 @@ No unrelated chat files are searched. Team metadata is enumerated for exact bind
 
 ## Persistent roster intent
 
-Exiting Pi, Ctrl+D, `/quit`, SIGHUP, or a crash stops a process, not membership. Every member still in the roster remains recovery intent. Only explicit member removal (`process_shutdown_approved`/member removal), or destructive `team_shutdown`, suppresses restoration. Do not infer permanent removal from `stopped` or Pi's `session_shutdown(reason: "quit")`, which also covers terminal loss.
+Exiting Pi, Ctrl+D, `/quit`, SIGHUP, or a crash stops a process, not membership. Membership and pane intent are separate. `Member.windowIntent` stores open/closed state, a per-member epoch, timestamp, and reason; legacy absence means open. Individually closed members retain membership but are skipped by automatic recovery. Explicit `/team-resume [member]` or re-delegation clears closed intent and opens the original conversation. Whole `/team-close` preserves prior intent rather than marking everyone closed. Only user-confirmed `/team-shutdown confirm` deletes collaboration metadata. Do not infer permanent removal from `stopped` or Pi's `session_shutdown(reason: "quit")`, which also covers terminal loss.
 
 Pi session restoration is not filesystem/process rollback. Background shells, external services, and side effects may survive or have stopped independently. No history is re-executed to reconstruct them.
 
 ## Attachment and panes
 
-Resuming the original lead session without team environment hints looks up its exact binding, claims the dead/detached old authority, starts the inbox reader, and performs one bounded roster recovery pass. Live peers are retained even if their pane ID is stale or absent. A pane ID alone is not proof of member liveness.
+Resuming the original lead session without team environment hints looks up its exact binding, claims the dead/detached old authority, starts the inbox reader, and performs one bounded roster recovery pass. Live peers are retained even if their pane ID is stale or absent. A pane ID alone is not proof of member liveness. Explicit reopen of a still-live process without a verifiable pane is blocked, preserving closed intent instead of claiming success or duplicating the process.
 
-Missing roster peers with valid confirmed original sessions are opened in new **tmux panes**, anchored to the recovered lead's verified pane. Commands use `--session` with a safely quoted absolute path, the original cwd/agent directory/trust override, and **no spawn-time model or thinking override**. Pi restores actual model/thinking history, including the user's later changes. No assignments, continuation prompts, task transitions, or historical messages are synthesized. Recovery itself never opens a formal work generation.
+Missing roster peers with open window intent and valid confirmed original sessions are opened in new **tmux panes**, anchored to the recovered lead's verified pane. Commands use `--session` with a safely quoted absolute path, the original cwd/agent directory/trust override, and **no spawn-time model or thinking override**. Pi restores actual model/thinking history, including the user's later changes. No assignments, continuation prompts, task transitions, or historical messages are synthesized. Recovery itself never opens a formal work generation.
 
 `delegate_task(reuse: "existing")` on a dead member also preserves its original session rather than silently creating a replacement conversation. That call still creates a new formal assignment/generation; restoration alone does not. `reuse: "replace"` remains an explicit new-conversation operation.
 
@@ -30,11 +34,11 @@ Other adapters can attach the lead/inbox but automatic missing-pane restoration 
 
 ## Reservations and failures
 
-Both initial formal worker launches and pane recovery reserve a nonce in member metadata before launch, under the config lock. Recovery checks the leader runtime authority again under its runtime lock before launching; initial launches similarly fence the calling owner's lease. Config-to-runtime is the lock order; there is no runtime-to-config wait.
+Both initial formal worker launches and pane recovery reserve a nonce in member metadata before launch, under the config lock. A per-member window-operation lock serializes close and restore; inside it the lock order remains config then runtime. Recovery checks leader authority before changing closed intent and again under its runtime lock before launching; initial launches similarly fence the calling owner's lease. Config-to-runtime is the lock order; there is no runtime-to-config wait.
 
 A successful terminal launch records its actual pane ID; the child confirms the binding at Pi startup. A real post-launch config-write failure, or unknown launch result, retains the reservation, identity, task, and mailbox. Reconciliation finds only the matching tmux nonce and never blindly launches another process. Stale child nonces cannot attach over a newer reservation. A definite adapter pre-launch failure (`spawned: false`) is retryable. An unconfirmed launch without a verifiable pane is reported blocked for human investigation; no infinite restart loop is run.
 
-Missing cwd/session files, corrupt framing, missing legacy mappings, and per-member errors preserve roster/task/mail data and do not prevent a successfully claimed lead from reading its inbox or restoring other valid peers. A post-claim advisory PID-file/UI fault does not abandon the committed owner. Restoration outcomes say whether a pane was launched, is pending registration, was retained alive, or was blocked; they are not task success.
+Missing cwd/session files, corrupt framing, missing legacy mappings, and per-member errors preserve roster/task/mail data and do not prevent a successfully claimed lead from reading its inbox or restoring other valid peers. A post-claim advisory PID-file/UI fault does not abandon the committed owner. Restoration outcomes say whether a pane was launched, is pending registration, was retained alive, skipped because it is kept closed, or was blocked; they are not task success.
 
 ## Pauses, inbox evidence, and inspection watermark
 
@@ -57,10 +61,11 @@ Existing exact member bindings attach automatically. A live legacy reload may ba
 
 ## Operational limits
 
-- Recovery is on startup/reload or explicit bounded retry, not an LLM/polling restart monitor.
+- Recovery is on startup or explicit bounded retry, not an LLM/polling restart monitor. Same-process reload deliberately skips restoration.
+- While the lead lives, confirmed tmux pane loss records keep-closed intent. A successful pane listing establishes absence; failed queries and foreign-adapter IDs are unknown, not missing. A missing/unverifiable lead anchor suppresses member-specific inference. This reduces collective-loss races but is not an atomic transaction with the terminal. This cannot reliably distinguish manual closure from a crash. Whole close takes a final snapshot before its own removals and suppresses loss inference during the operation. Managed stopped records do not turn preserved open intent into hidden intent afterward. Once the lead stops, offline pane loss does not alter the last saved intent.
 - An unknown launch with no verifiable nonce is intentionally blocked, not retried automatically.
 - Paths are absolute and local; moving/deleting the original file, cwd, agent directory, or changing machines can require manual repair.
 - Multi-file commits are not a distributed transaction. Config binding precedes runtime admission; partial errors are visible and retry the same identity. The advisory lead PID record is not exclusive authority.
 - `team_shutdown` remains destructive to roster/task/mail metadata, not Pi conversation history. Fresh worker chats live in normal persistent Pi session storage, survive dissolution unchanged, and remain discoverable for manual `/resume`; deleted membership is not automatically reconstructed. Explicit member removal likewise leaves chat files intact. Known saved paths are honored, not retargeted or batch-migrated; the unreleased author's former team-local temporary fixtures are historical evidence only. This is not a suspension command.
-- Detaching tmux keeps processes alive. Closing a team-exclusive window/session may stop them while leaving roster intent; avoid closing shared project windows. No bulk-close/pause command is added.
+- Detaching tmux keeps processes alive. Closing a team-exclusive window/session may stop them while leaving roster intent; avoid closing shared project windows. Whole `/team-close` temporarily stops panes and exits the lead while retaining each prior window intent.
 - Verification uses isolated files, fake terminal adapters, two narrow subprocess claimants, and the installed Pi SDK with a fake successful stream. It does not invoke real Pi CLI/tmux, providers, or user chat files, and does not certify real TUI/multi-machine behavior.

@@ -67,8 +67,8 @@ describe("buildLeadSystemPrompt", () => {
     });
 
     expect(prompt).toContain("Base system prompt.");
-    expect(prompt).toContain("team lead");
-    expect(prompt).toContain("'refactor-squad'");
+    expect(prompt).toContain("lead for this main Pi conversation");
+    expect(prompt).not.toContain("'refactor-squad'");
     expect(prompt).toContain("delegate_task");
     expect(prompt).toContain("ordinary team_message does not open another inspection");
     expect(prompt).toContain("call team_wait");
@@ -92,9 +92,11 @@ describe("buildLeadSystemPrompt", () => {
     expect(prompt).toContain("not from your own current model or thinking level");
   });
 
-  it("tells a lead without a current team to create one when coordination is useful", () => {
+  it("starts collaboration through dispatch without explicit team creation", () => {
     const prompt = buildLeadSystemPrompt({ baseSystemPrompt: "Base system prompt." });
-    expect(prompt).toContain("Create a team with team_create");
+    expect(prompt).toContain("first delegate_task or create_predefined_team");
+    expect(prompt).toContain("Omit team_name everywhere");
+    expect(prompt).not.toContain("Create a team with team_create");
   });
 });
 

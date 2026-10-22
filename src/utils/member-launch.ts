@@ -7,6 +7,7 @@ import { readRuntimeStatusSync } from "./runtime";
 import { withLock } from "./lock";
 import { atomicWriteJsonSync } from "./atomic-file";
 import { sameSession } from "./team-session";
+import { windowIntentState } from "./window-intent";
 
 /** Keep membership/reservation stable across initial launch, including partial failures. */
 export async function launchReservedMember(input: {
@@ -24,6 +25,9 @@ export async function launchReservedMember(input: {
       const config = JSON.parse(fs.readFileSync(file, "utf8")) as TeamConfig;
       const member = config.members.find(item => item.name === input.agent);
       if (!input.current() || !member || !sameSession(member.session, input.session)) throw new Error("member/session launch was superseded");
+      if (windowIntentState(member) === "closed") {
+        throw new Error("member was closed by window intent; an explicit resume or delegation must reopen it");
+      }
       if (member.recovery && member.recovery.phase !== "failed") throw new Error("member already has a launch reservation; do not start a duplicate");
       const token = randomUUID();
       member.recovery = { token, ownerInstanceId: input.ownerInstanceId, phase: "reserved" };

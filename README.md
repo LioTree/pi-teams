@@ -45,10 +45,8 @@ Prompt composition and tool registration are tested with Pi `1.1.0` and magic-co
 ## 🚀 Quick Start
 
 ```bash
-# 1. Start a team (inside tmux, Zellij, or iTerm2)
-"Create a team named 'my-team' using 'gpt-4o'"
-
-# 2. Delegate tasks
+# 1. Open Pi inside tmux, Zellij, or iTerm2. No team setup is needed.
+# 2. Delegate tasks directly from the current main conversation
 "Delegate a task to security-bot: 'Audit auth endpoints'"
 "Delegate a task to frontend-dev using haiku: 'Review the dashboard UI'"
 
@@ -78,11 +76,12 @@ Prompt composition and tool registration are tested with Pi `1.1.0` and magic-co
 
 ## 💬 Key Examples
 
-### 1. Start a Team
-> **You:** "Create a team named 'my-app-audit' for reviewing the codebase."
+### 1. Start from Your Main Conversation
+> **You:** "Delegate a codebase audit to audit-bot."
 
-**Set a default model for the whole team:**
-> **You:** "Create a team named 'Research' and use 'gpt-4o' for everyone."
+The first delegation establishes collaboration for this exact Pi conversation. You do not create, name, or select a team. Another main conversation in the same directory has separate teammates, tasks, and messages. Existing saved collaborations still attach through their original Pi sessions.
+
+Configure teammate defaults below, or explicitly request a model for an individual delegation or template launch.
 
 **Configure teammate defaults in the Pi agent settings file (no TASK/prompt needed):**
 
@@ -103,8 +102,8 @@ By default this is `~/.pi/agent/settings.json`. When `PI_CODING_AGENT_DIR` is se
 - Teammate thinking priority is independent of the team model: explicit tool/agent thinking → `teammateDefaultThinkingLevel` → Pi's leader defaults.
 - `teammateDefaultModel` may be a full `provider/model` string; `teammateDefaultProvider` is only used when the model id has no `/`.
 
-**Start a team in "Separate Windows" mode:**
-> **You:** "Create a team named 'Dev' and open everyone in separate windows."
+**Delegate in "Separate Windows" mode:**
+> **You:** "Delegate the review to reviewer in a separate window."
 *(Supported in iTerm2 and WezTerm only)*
 
 ### 2. Delegate Work with Custom Settings
@@ -140,7 +139,7 @@ When you specify a model name without a provider (e.g., `gemini-2.5-flash`), pi-
 `delegate_task` returns immediately after assigning the work. The lead should then call:
 
 ```javascript
-team_wait({ team_name: "my-team" })
+team_wait({})
 ```
 
 Without `timeout_seconds`, this blocks indefinitely until an inbox message arrives or no other member can make progress. It returns an `outcome` of `message`, `no_active_agents`, or `timeout`. A live interrupted teammate cannot make progress and will not pick up mail on its own, but it keeps this indefinite wait open; do not treat that pause as `no_active_agents`. An explicit timeout still includes the paused time. After it returns, coordinate based on the result instead of performing the teammate's delegated work; if teammates are still active, wait again. Resume a paused teammate with a direct user prompt in that session. Changing its model does not resume it, and there is no remote resume API.
@@ -149,11 +148,10 @@ Teammates can use the same barrier for a real dependency. First send the request
 
 ```javascript
 team_message({
-  team_name: "my-team",
   to: "api-owner",
   content: "Please send me the finalized response schema."
 })
-team_wait({ team_name: "my-team" })
+team_wait({})
 ```
 
 Teammates do not call `team_wait` merely because they are idle; idle inbox delivery is automatic.
@@ -179,7 +177,7 @@ If you need to clean up agent sessions without shutting down a team, or want to 
 
 Resume the **original lead Pi conversation**. Its exact session ID/file reattaches the inbox; on tmux, missing roster teammates reopen their **original sessions** in new panes. Live peers are kept. Model/thinking history, tasks, and unread mail are preserved; recovery does not replay assignments, send a continuation prompt, or open a new work generation. Interrupted sessions stay paused until direct user input.
 
-Quitting Pi, losing a terminal, or closing a pane does not remove membership. Reopening the original lead conversation restores every missing roster member. `/team-shutdown confirm` is the only deletion of roster/tasks/mail; chats remain available for manual `/resume` without automatic team reattachment. Restoring context does not roll back background tools or filesystem effects.
+Quitting Pi, losing a terminal, or closing a pane does not remove membership. Reopening the original lead conversation restores only teammates whose saved window intent is open. Individually closed teammates stay closed. Whole `/team-close` preserves each teammate's prior intent. `/team-shutdown confirm` is the only deletion of roster/tasks/mail; chats remain available for manual `/resume` without automatic team reattachment. Restoring context does not roll back background tools or filesystem effects.
 
 Missing/corrupt session files and unmapped legacy members are reported without deletion or fresh-chat substitution. For a legacy lead with no saved binding and **no live old owner**, explicitly associate the current saved conversation with `/team-resume <team>`; a current lead may also use it for a bounded pane retry. New/forked/cloned conversations never inherit team ownership automatically. Automatic pane restoration currently requires tmux; other adapters can still recover the lead inbox.
 
@@ -199,7 +197,11 @@ Reload is not dispatch; it leaves tasks, mail, and work generations unchanged. I
 
 ## Closing teammate panes
 
-`/team-close <member>` closes that one pane and leaves the lead attached. `/team-close` closes every live teammate pane, then exits the lead Pi back to its shell. If a teammate's runtime lease changes during the close, or the terminal refuses the close, that pane stays open and the lead Pi does not exit. The lead pane stays, and the team, tasks, and inbox remain in place. Only the live lead of that same team can run it. A teammate that is already stopped, detached, or dead is reported as `not running` and is not killed again. A restore that has not registered yet is cancelled. Busy teammates are stopped mid-run; their Pi sessions remain resumable. Resume the original lead conversation, or use `/team-resume <team> [member]`, to reopen one member or every missing member. Individually closed members come back with the whole team because they are still on the roster.
+`/team-close <member>` closes that one pane and leaves the lead attached. `/team-close` closes every live teammate pane, then exits the lead Pi back to its shell. If a teammate's runtime lease changes during the close, or the terminal refuses the close, that pane stays open and the lead Pi does not exit. The lead pane stays, and the team, tasks, and inbox remain in place. Only the live lead of that same team can run it. A teammate that is already stopped, detached, or dead is reported as `not running` and is not killed again. A restore that has not registered yet is cancelled. Busy teammates are stopped mid-run; their Pi sessions remain resumable. Resume the original lead conversation to reopen only previously open members. `/team-resume <member>` explicitly opens that member's original conversation; `/team-resume` explicitly opens every missing member, including hidden ones. Re-delegating to a closed member also opens its original conversation. Ordinary messages, status checks, and reloads never open hidden panes.
+
+If an original process still lives without a verifiable pane, explicit reopen reports blocked and preserves its hidden state; it never duplicates that live conversation. Retry after the process exits.
+
+On tmux, a pane confirmed missing by a successful listing while the lead is alive is kept closed (manual closure and a crash cannot reliably be distinguished). Before whole `/team-close`, a final snapshot catches panes closed before the next poll. Example: A closed and B open → whole close → resume lead → only B reopens. If the lead itself exits, later offline pane losses do not change the last saved intent.
 
 `/team-shutdown confirm` is the explicit deletion of roster, tasks, and inbox after the same close, and only when every pane that needed closing actually closed. Without `confirm` it does nothing. The leader cannot call a delete-team tool. Pi conversation history is kept for a manual `/resume`, without team reattachment. Windows Terminal and Zellij cannot close panes yet. When a teammate or a pending launch still needs closing, both commands refuse and leave every member as it was. A team that is already fully stopped can still be deleted with `confirm`. If a teammate stops or its tmux pane disappears outside these commands, the lead gets one inbox notice.
 
@@ -279,16 +281,16 @@ You are a builder agent. Implement code following the plan provided. Write clean
 **List available agent definitions:**
 > **You:** "Show me all predefined agents."
 
-**Create a team from a template:**
-> **You:** "Create a team named 'my-project' from the 'plan-build' predefined team in the current directory."
+**Launch a collaboration template:**
+> **You:** "Start the 'plan-build' template in the current conversation."
 
 This single command:
-1. Creates the team
+1. Uses the current main conversation, creating its internal collaboration record if needed
 2. Spawns all agents defined in the template
 3. Each agent gets its predefined prompt, tools, model, and thinking settings
 
 **With options:**
-> **You:** "Create a team named 'big-team' from 'full' predefined team using 'gpt-4o' as default model and separate windows."
+> **You:** "Start the 'full' template using 'gpt-4o' as default model and separate windows."
 
 ---
 
@@ -307,15 +309,13 @@ CREATE → USE → SAVE → REUSE
 3. **Save** the team as a reusable template
 4. **Reuse** the template later (even on different projects)
 
-### List Runtime Teams
+### Save the Current Collaboration
 
-See which teams you have that can be saved:
-
-> **You:** "List all runtime teams."
+No runtime-team selection is needed: saving uses the current main conversation's teammates.
 
 ### Save a Team as a Template
 
-> **You:** "Save team 'my-modularization-team' as template 'code-modularization'"
+> **You:** "Save the current teammates as template 'code-modularization'"
 
 This creates:
 - Agent definition files in `~/.pi/agent/agents/` for each teammate
@@ -325,7 +325,7 @@ This creates:
 
 To save a template that's specific to the current project:
 
-> **You:** "Save team 'my-frontend-team' as template 'frontend-sprint' with scope 'project'"
+> **You:** "Save the current teammates as template 'frontend-sprint' with scope 'project'"
 
 This creates files in `.pi/agents/` and `.pi/teams.yaml` in the current project directory.
 
@@ -333,7 +333,7 @@ This creates files in `.pi/agents/` and `.pi/teams.yaml` in the current project 
 
 Once saved, use it just like any predefined team:
 
-> **You:** "Create a team named 'auth-refactor' from the 'code-modularization' template in the current directory"
+> **You:** "Start the 'code-modularization' template in the current conversation"
 
 ---
 

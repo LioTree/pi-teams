@@ -11,6 +11,25 @@ export interface TeamSession {
   trustArg?: "--approve" | "--no-approve";
 }
 
+export type WindowIntentState = "open" | "closed";
+
+/** Why the member's pane/window intent last changed. Never inferred from activity. */
+export type WindowIntentReason =
+  | "close-member"
+  | "close-team"
+  | "pane-missing"
+  | "resume"
+  | "delegate-reuse"
+  | "rollback";
+
+export interface MemberWindowIntent {
+  state: WindowIntentState;
+  /** Monotonic per member; makes intent writes and rollbacks compare-and-set. */
+  epoch: number;
+  changedAt: number;
+  reason: WindowIntentReason;
+}
+
 export interface Member {
   agentId: string;
   name: string;
@@ -29,6 +48,11 @@ export interface Member {
   backendType?: string;
   isActive?: boolean;
   session?: TeamSession;
+  /**
+   * Pane/window visibility is independent from membership and from runtime
+   * activity. Missing metadata on an older record means `open`.
+   */
+  windowIntent?: MemberWindowIntent;
   recovery?: {
     token: string;
     ownerInstanceId: string;
@@ -46,6 +70,8 @@ export interface TeamConfig {
   members: Member[];
   defaultModel?: string;
   separateWindows?: boolean;
+  /** Automatically created by the current main Pi session on first dispatch. */
+  internal?: boolean;
 }
 
 export interface TaskFile {

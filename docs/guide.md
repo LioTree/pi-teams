@@ -28,85 +28,41 @@ Then start pi:
 pi
 ```
 
-Create your first team:
+Delegate directly from your main conversation:
 
-> **You:** "Create a team named 'my-team'"
+> **You:** "Delegate authentication review to security-reviewer and query review to performance-reviewer, then wait for their reports."
 
-Set a default model for all teammates:
+No explicit team creation, naming, or selection is needed. The first delegation establishes this conversation's internal collaboration. Tools omit `team_name`; two main conversations in the same directory remain isolated. Existing saved records attach through their exact original Pi sessions.
 
-> **You:** "Create a team named 'Research' and use 'gpt-4o' for everyone"
+Configure `teammateDefaultProvider`, `teammateDefaultModel`, and `teammateDefaultThinkingLevel` in the actual Pi agent directory's `settings.json` for defaults. Explicit model/thinking overrides are used only when you request them. Reusing a member retains its conversation and current model settings.
 
 ---
 
 ## Common Workflows
 
-### 1. Code Review Team
+### Independent reviews
 
-> **You:** "Create a team named 'code-review' using 'gpt-4o'"
-> **You:** "Spawn a teammate named 'security-reviewer' to check for vulnerabilities"
-> **You:** "Spawn a teammate named 'performance-reviewer' using 'haiku' to check for optimization opportunities"
-> **You:** "Create a task for security-reviewer: 'Review the auth module for SQL injection risks' and set it to in_progress"
-> **You:** "Create a task for performance-reviewer: 'Analyze the database queries for N+1 issues' and set it to in_progress"
+> **You:** "Delegate security review to security-reviewer and performance review to performance-reviewer. Keep their findings independent."
 
-### 2. Long-Running Security Audit
+After delegation, the lead calls `team_wait({})` instead of duplicating assigned work. Without a timeout it waits for a report or until no other member can make progress. A live interrupted peer keeps an indefinite wait open; resume that peer with a direct prompt in its own conversation. Process reports, then wait again if work remains active.
 
-> **You:** "Create a team named 'security-audit'"
-> **You:** "Delegate authentication review to auth-auditor and session review to session-auditor"
-> **You:** "Wait for the security-audit team"
+### Testing with automated hooks
 
-Delegation returns immediately, so the final instruction should call `team_wait({ team_name: "security-audit" })`. With no timeout, the lead can remain blocked for as long as a live teammate is running. The wait returns when a message arrives or when no other member can make progress.
+Create `.pi/team-hooks/task_completed.sh` to run project tests. A failing hook prevents completion. Then:
 
-When it returns, the lead should process reports and coordinate follow-up work. It should not independently repeat the delegated audit. If teammates are still active, call `team_wait` again.
+> **You:** "Delegate payment-module unit tests to qa-bot."
 
-### 3. Testing with Automated Hooks
+### Dependency handoff
 
-Create a hook script at `.pi/team-hooks/task_completed.sh`:
+> **You:** "Delegate schema migration to db-migrator and API updates to api-updater."
 
-```bash
-#!/bin/bash
-# This script runs automatically when any task is completed
+If api-updater needs the final schema, it messages db-migrator and waits only while that dependency is outstanding. Idle inbox delivery is automatic; teammates do not wait merely to become idle.
 
-echo "Running post-task checks..."
-npm test
-if [ $? -ne 0 ]; then
-  echo "Tests failed! Please fix before marking task complete."
-  exit 1
-fi
+### Reusable roles
 
-npm run lint
-echo "All checks passed!"
-```
+> **You:** "Start the plan-build template in the current conversation."
 
-> **You:** "Create a team named 'test-team'"
-> **You:** "Spawn a teammate named 'qa-bot' to write tests"
-> **You:** "Create a task for qa-bot: 'Write unit tests for the payment module' and set it to in_progress"
-
-When qa-bot marks the task as completed, the hook automatically runs tests and linting.
-
-### 4. Coordinated Migration
-
-> **You:** "Create a team named 'migration-team'"
-> **You:** "Spawn a teammate named 'db-migrator' to handle database changes"
-> **You:** "Spawn a teammate named 'api-updater' using 'gpt-4o' to update API endpoints"
-> **You:** "Spawn a teammate named 'test-writer' to write tests for the migration"
-> **You:** "Create a task for db-migrator: 'Add new columns to the users table' and set it to in_progress"
-
-After db-migrator completes, broadcast the schema change:
-
-> **You:** "Broadcast to the team: 'New columns added to users table: phone, email_verified. Please update your code accordingly.'"
-
-If api-updater unexpectedly needs the exact schema before it can continue, it should send db-migrator a `team_message` and then call `team_wait`. It should not wait merely because it has no current work; idle inbox delivery is automatic.
-
-### 5. Mixed-Speed Team
-
-Use different models for cost optimization:
-
-> **You:** "Create a team named 'mixed-speed' using 'gpt-4o'"
-> **You:** "Spawn a teammate named 'architect' using 'gpt-4o' with 'xhigh' thinking level for design decisions"
-> **You:** "Spawn a teammate named 'implementer' using 'haiku' with 'low' thinking level for quick coding"
-> **You:** "Spawn a teammate named 'reviewer' using 'gpt-4o' with 'medium' thinking level for code reviews"
-
-Now you have expensive reasoning for design and reviews, but fast/cheap implementation.
+Use `create_predefined_team({ predefined_team: "plan-build", cwd: "/path/to/project" })`. No team name is required. Templates remain reusable across projects. Save current teammates with `save_team_as_template({ template_name: "review-workflow" })`.
 
 ---
 
@@ -236,7 +192,7 @@ spawn "test-writer" using "haiku" with "off" thinking
 Avoid splitting work with known blocking dependencies when independent tasks are available. If an unexpected dependency appears:
 
 1. Send the needed request to the responsible teammate with `team_message`.
-2. Call `team_wait({ team_name: "my-team" })` while that dependency is outstanding.
+2. Call `team_wait({})` while that dependency is outstanding.
 3. Resume on the reply. Treat `no_active_agents` as a blocker to report or reassign, not a reason to spin forever.
 
 This works for teammate-to-teammate dependencies as well as lead-to-teammate delegation.
@@ -301,9 +257,9 @@ The user aborted that session. Its tasks stay owned, its inbox stays unread, and
 
 ### Recovering after Pi or terminal exit
 
-Resume the original lead conversation. Exact Pi session identity reconnects its inbox and restores missing roster peers' original sessions in tmux panes, including panes closed earlier; live peers are retained. Manual quit, Ctrl+D, terminal loss, and pane close do not remove roster intent. Only `/team-shutdown confirm` deletes the team index. That deletion removes roster/tasks/inbox, not Pi chat history: original conversations remain available for manual `/resume` without automatic team reattachment. Recovery never replays assignments/continuation prompts or resumes interrupted work; restoring context does not roll back background tools or filesystem effects.
+Resume the original lead conversation. Exact Pi session identity reconnects its inbox and restores missing roster peers' original sessions in tmux panes, only when their saved window intent is open; individually closed panes stay hidden and live peers are retained. Manual quit, Ctrl+D, terminal loss, and pane close do not remove roster intent. Only `/team-shutdown confirm` deletes the team index. That deletion removes roster/tasks/inbox, not Pi chat history: original conversations remain available for manual `/resume` without automatic team reattachment. Recovery never replays assignments/continuation prompts or resumes interrupted work; restoring context does not roll back background tools or filesystem effects.
 
-Missing/corrupt/unmapped sessions are reported without deletion or fresh replacement. `/team-resume <team> [member]` reopens one missing member or every missing member. For an unmapped legacy lead whose old process is gone, `/team-resume <team>` explicitly associates this saved conversation. It never forces a live owner or guesses recent chat files. Automatic pane restoration is tmux-only; other adapters can recover the lead inbox. See [design and migration limits](design/team-session-recovery.md).
+Missing/corrupt/unmapped sessions are reported without deletion or fresh replacement. `/team-resume [member]` explicitly reopens original sessions, including hidden members. For an unmapped legacy lead whose old process is gone, `/team-resume <team>` explicitly associates this saved conversation. It never forces a live owner or guesses recent chat files. Automatic pane restoration is tmux-only; other adapters can recover the lead inbox. See [design and migration limits](design/team-session-recovery.md).
 
 ### Changing a teammate's model while it is live
 
@@ -311,11 +267,13 @@ Missing/corrupt/unmapped sessions are reported without deletion or fresh replace
 
 ### Reloading every teammate after an update
 
-Run `/team-reload` in the lead session. Every live member runs Pi's `/reload` on its own once it is safe: busy runs finish first, and pending inbox delivery, inspection bookkeeping, or an active `team_wait` defer it. Interrupted sessions reload and remain paused. A reloading member is never treated as stopped, so the lead does not reopen its pane; the lead's own reload also skips pane restoration (run `/team-resume <team>` to retry it). If a reload fails after starting, the member stays marked `reloading` in `/team-reload status` (shown as `pending (reloading)`) and in `team_status`/`check_teammate` with a frozen `reloadingSince` timestamp: fix the code on disk and reload that pane again to recover. Check progress with `/team-reload status`; a member is `reloaded` only when its newly loaded code has written a receipt. Install the update on disk first (`pi update`/`pi install`). Sessions running an older pi-teams without this command must be reloaded manually once.
+Run `/team-reload` in the lead session. Every live member runs Pi's `/reload` on its own once it is safe: busy runs finish first, and pending inbox delivery, inspection bookkeeping, or an active `team_wait` defer it. Interrupted sessions reload and remain paused. A reloading member is never treated as stopped, so the lead does not reopen its pane; the lead's own reload also skips pane restoration (run `/team-resume [member]` to retry it). If a reload fails after starting, the member stays marked `reloading` in `/team-reload status` (shown as `pending (reloading)`) and in `team_status`/`check_teammate` with a frozen `reloadingSince` timestamp: fix the code on disk and reload that pane again to recover. Check progress with `/team-reload status`; a member is `reloaded` only when its newly loaded code has written a receipt. Install the update on disk first (`pi update`/`pi install`). Sessions running an older pi-teams without this command must be reloaded manually once.
 
 ### Closing every teammate pane
 
-`/team-close worker` closes that one pane and leaves the lead attached. `/team-close` closes every live teammate pane, then exits the lead Pi back to its shell. If a teammate's runtime lease changes during the close, or the terminal refuses the close, that pane stays open and the lead Pi does not exit. The lead pane, team, tasks, and inbox stay. Only the Pi session that currently owns that team's lead lease can run it. Members that are already stopped, detached, or dead are listed as `not running` and are not killed again. A teammate pane that was launched for recovery but has not registered is closed, and that launch can no longer attach. A busy teammate is stopped mid-run; its Pi session remains resumable. Resume the original lead conversation, or run `/team-resume <team> [member]`, to open one pane or every missing pane. Someone closed earlier still comes back, because close does not remove them.
+`/team-close worker` closes that one pane and leaves the lead attached. `/team-close` closes every live teammate pane, then exits the lead Pi back to its shell. If a teammate's runtime lease changes during the close, or the terminal refuses the close, that pane stays open and the lead Pi does not exit. The lead pane, team, tasks, and inbox stay. Only the Pi session that currently owns that team's lead lease can run it. Members that are already stopped, detached, or dead are listed as `not running` and are not killed again. A teammate pane that was launched for recovery but has not registered is closed, and that launch can no longer attach. A busy teammate is stopped mid-run; its Pi session remains resumable. Resume the original lead conversation to restore only members with open window intent. An individually closed member stays hidden. `/team-resume <member>` explicitly opens that original conversation; `/team-resume` explicitly opens all missing members, including hidden ones. New delegation to an existing closed member also opens its original session. Ordinary mail, status, model changes, and reloads do not open hidden panes.
+
+Whole `/team-close` preserves prior window intent and takes a final tmux snapshot for manual closes not yet observed by the poller. A closed + B open → whole close → recover lead → only B opens. Confirmed tmux pane loss while the lead lives is treated as keep-closed (manual closure and crash cannot reliably be distinguished). Offline losses after lead exit do not change saved intent.
 
 `/team-shutdown confirm` performs that same close, then deletes roster, tasks, and inbox only when every pane that needed closing actually closed. Without `confirm` the command refuses before closing anyone. Conversation history stays in Pi's normal session storage for a manual `/resume`, without rejoining the team. The leader can call `team_close` and `team_resume` only when you ask; it has no tool that deletes the team because work finished. On Windows Terminal and Zellij the close is not implemented. If a teammate or a pending launch still needs closing, including one that appears after the first check, the command reports that and does not mark anyone stopped or delete the team. An already stopped team can still be deleted with `confirm`. If a process stops or a tmux pane disappears on its own, the lead receives one inbox notice and does not restart that member.
 
@@ -394,11 +352,10 @@ When one teammate cannot continue without a reply, use an explicit request follo
 
 ```javascript
 team_message({
-  team_name: "my-team",
   to: "backend-bot",
   content: "Please confirm the final /api/users response shape."
 })
-team_wait({ team_name: "my-team" })
+team_wait({})
 ```
 
 Ordinary idle teammates do not call `team_wait`; pi-teams delivers their unread messages automatically when their session is idle. Interrupted teammates are paused until a direct user prompt in that session; mail does not resume them.
@@ -411,7 +368,7 @@ To remove all team data:
 
 ```bash
 # Shut down team first
-> "Shut down the team named 'my-team'"
+> "Dissolve this conversation's collaboration with /team-shutdown confirm"
 
 # Then delete data directory
 rm -rf ~/.pi/teams/my-team/
@@ -420,4 +377,4 @@ rm -rf ~/.pi/messages/my-team/
 ```
 
 Or use the delete command:
-> **You:** "Delete the team named 'my-team'"
+> **You:** "Delete this conversation's collaboration data with /team-shutdown confirm"

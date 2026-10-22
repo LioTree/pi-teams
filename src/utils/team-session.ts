@@ -9,6 +9,8 @@ import type { Member, TeamConfig, TeamSession } from "./models";
 import * as runtime from "./runtime";
 import type { TerminalAdapter } from "./terminal-adapter";
 import { buildPiCommand, getProjectTrustArg } from "./pi-command";
+import { nextWindowIntent, windowIntentState } from "./window-intent";
+import { observeTmuxPane } from "./pane-observation";
 
 /** Canonicalize without requiring a not-yet-flushed Pi session file to exist. */
 export function canonicalSessionFile(file: string): string {
@@ -204,91 +206,134 @@ export async function claimSession(input: {
   });
 }
 
-export interface RecoveryOutcome { name: string; status: "alive" | "restored" | "pending" | "blocked"; note?: string }
+export interface RecoveryOutcome { name: string; status: "alive" | "restored" | "pending" | "skipped" | "blocked"; note?: string }
 
 /** One bounded pass. Restoration is NOT task dispatch and sends no model prompt. */
 export async function restoreTeamPanes(input: {
   team: string; leaderInstanceId: string; terminal: TerminalAdapter | null;
   piBinary: string; anchorPaneId?: string; members?: string[]; current?: () => boolean;
   alive?: typeof runtime.isRuntimeProcessAlive;
+  /** Explicit reopen: clear a keep-closed intent under the same lock as launch. */
+  reopen?: "resume" | "delegate-reuse";
 }): Promise<RecoveryOutcome[]> {
   const outcomes: RecoveryOutcome[] = [];
   const names = readConfig(input.team).members.filter(m => m.agentType !== "lead" && (!input.members || input.members.includes(m.name))).map(m => m.name);
   for (const name of names) {
     const configFile = paths.configPath(input.team);
     try {
-      const result = await withLock(configFile, async (): Promise<RecoveryOutcome> => {
-        const config = readConfig(input.team);
-        const member = config.members.find(m => m.name === name);
-        if (!member) return { name, status: "blocked", note: "member removed" };
-        const leader = await runtime.readRuntimeStatus(input.team, "team-lead");
-        if (input.current && !input.current() || leader?.instanceId !== input.leaderInstanceId || leader.detached || leader.activity === "stopped") {
-          return { name, status: "blocked", note: "lead authority lost" };
-        }
-        const status = await runtime.readRuntimeStatus(input.team, name);
-        if (!status) assertNoOrphanLivePid(input.team, member);
-        if (status && (input.alive ?? runtime.isRuntimeProcessAlive)(status) && !status.detached) {
-          if (member.session && (status.sessionId !== member.session.id || status.sessionFile !== member.session.file)) {
-            return { name, status: "blocked", note: "live process has unconfirmed/different session identity; retained, not duplicated" };
+      const result = await withLock(paths.configPath(input.team) + `.window-${paths.sanitizeName(name)}`, async () =>
+        await withLock(configFile, async (): Promise<RecoveryOutcome> => {
+          const config = readConfig(input.team);
+          const member = config.members.find(m => m.name === name);
+          if (!member) return { name, status: "blocked", note: "member removed" };
+          const leader = await runtime.readRuntimeStatus(input.team, "team-lead");
+          if (input.current && !input.current() || leader?.instanceId !== input.leaderInstanceId || leader.detached || leader.activity === "stopped") {
+            return { name, status: "blocked", note: "lead authority lost" };
           }
-          return { name, status: "alive", note: "live process retained (pane id alone is not identity)" };
-        }
-        if (!member.session) throw new Error("no saved Pi session mapping (legacy member preserved)");
-        validateSession(member.session);
-        if (!member.session.confirmed) throw new Error("original process never confirmed this session; no blank recovery launch");
-        if (input.terminal?.name !== "tmux") throw new Error("automatic pane restoration requires tmux; lead inbox remains attached");
-        if (input.current && !input.current()) throw new Error("session detached before reconciliation");
-        if (member.recovery && member.recovery.phase !== "attached") {
-          const pane = input.terminal.findRecoveryPane?.(member.recovery.token);
-          if (pane) {
-            member.tmuxPaneId = pane;
-            member.recovery.phase = "launched";
-            atomicWriteJsonSync(configFile, config);
-            return { name, status: "pending", note: "existing nonce-matched launch retained; waiting for session registration" };
-          }
-          if (member.recovery.phase !== "failed") return {
-            name, status: "blocked", note: "earlier launch outcome is unknown; refusing a duplicate (reload after child registers)",
+          const reopenIntent = async () => {
+            if (!input.reopen || windowIntentState(member) !== "closed") return;
+            // Revalidate at the write boundary, not just the asynchronous read.
+            await withLock(paths.runtimeStatusPath(input.team, "team-lead"), async () => {
+              const latest = runtime.readRuntimeStatusSync(input.team, "team-lead");
+              if ((input.current && !input.current()) || latest?.instanceId !== input.leaderInstanceId
+                || latest.detached || latest.activity === "stopped") throw new Error("lead authority lost before reopening");
+              member.windowIntent = nextWindowIntent(member.windowIntent, "open", input.reopen!);
+              atomicWriteJsonSync(configFile, config);
+            });
           };
-        }
-        if (input.current && !input.current()) throw new Error("session detached before launch");
-        const savedSession = member.session;
-        const terminal = input.terminal;
-        // Keep authority stable through the synchronous launch/commit. Lock
-        // ordering matches admission: config -> runtime; no runtime -> config.
-        return withLock(paths.runtimeStatusPath(input.team, "team-lead"), async () => {
-          const latestLead = runtime.readRuntimeStatusSync(input.team, "team-lead");
-          if (input.current && !input.current() || latestLead?.instanceId !== input.leaderInstanceId || latestLead.detached || latestLead.activity === "stopped") {
-            throw new Error("lead authority changed before launch");
+          if (!input.reopen && windowIntentState(member) === "closed") {
+            return { name, status: "skipped", note: "pane/window intent is closed; explicit /team-resume or delegate reuse reopens the original session" };
           }
-          const token = randomUUID();
-          member.recovery = { token, ownerInstanceId: input.leaderInstanceId, phase: "reserved" };
-          atomicWriteJsonSync(configFile, config);
-          try {
-            const env: Record<string, string> = {
-              ...process.env as Record<string, string>,
-              PI_TEAM_NAME: input.team, PI_AGENT_NAME: name, PI_TEAM_RECOVERY_TOKEN: token,
+          const status = await runtime.readRuntimeStatus(input.team, name);
+          if (!status) assertNoOrphanLivePid(input.team, member);
+          if (status && (input.alive ?? runtime.isRuntimeProcessAlive)(status) && !status.detached) {
+            if (member.session && (status.sessionId !== member.session.id || status.sessionFile !== member.session.file)) {
+              return { name, status: "blocked", note: "live process has unconfirmed/different session identity; retained, not duplicated" };
+            }
+            if (input.reopen) {
+              const panePresence = observeTmuxPane(input.terminal, member.tmuxPaneId, input.anchorPaneId);
+              if (panePresence !== "present"
+                && (windowIntentState(member) === "closed" || panePresence === "missing")) {
+                return { name, status: "blocked", note: "original process is still alive but its pane is missing or unverifiable; window intent unchanged, no duplicate session launched. Retry after that process exits." };
+              }
+            }
+            await reopenIntent();
+            return { name, status: "alive", note: "live original process and pane retained" };
+          }
+          if (!member.session) throw new Error("no saved Pi session mapping (legacy member preserved)");
+          validateSession(member.session);
+          if (!member.session.confirmed) throw new Error("original process never confirmed this session; no blank recovery launch");
+          if (input.terminal?.name !== "tmux") throw new Error("automatic pane restoration requires tmux; lead inbox remains attached");
+          if (input.current && !input.current()) throw new Error("session detached before reconciliation");
+          if (member.recovery && member.recovery.phase !== "attached") {
+            const pane = input.terminal.findRecoveryPane?.(member.recovery.token);
+            if (pane) {
+              await reopenIntent();
+              member.tmuxPaneId = pane;
+              member.recovery.phase = "launched";
+              atomicWriteJsonSync(configFile, config);
+              return { name, status: "pending", note: "existing nonce-matched launch retained; waiting for session registration" };
+            }
+            if (member.recovery.phase !== "failed") return {
+              name, status: "blocked", note: "earlier launch outcome is unknown; refusing a duplicate (reload after child registers)",
             };
-            delete env.PI_TEAM_HANDOFF_TOKEN;
-            delete env.PI_SESSION_ID;
-            delete env.PI_SESSION_FILE;
-            delete env.PI_MODEL;
-            if (savedSession.agentDir) env.PI_CODING_AGENT_DIR = savedSession.agentDir;
-            const pane = terminal.spawn({ name, cwd: savedSession.cwd,
-              command: buildPiCommand(input.piBinary, undefined, undefined, savedSession.trustArg ?? null, savedSession.file),
-              env, anchorPaneId: input.anchorPaneId, recoveryToken: token });
-            member.tmuxPaneId = pane;
-            member.recovery.phase = "launched";
-            atomicWriteJsonSync(configFile, config);
-            return { name, status: "restored", note: "pane launched for original session; registration pending, no task replay or model override" };
-          } catch (error) {
-            member.recovery.error = error instanceof Error ? error.message : String(error);
-            // Only a terminal adapter's definite pre-launch rejection permits retry.
-            if ((error as { spawned?: boolean }).spawned === false) member.recovery.phase = "failed";
-            atomicWriteJsonSync(configFile, config);
-            throw error;
           }
-        });
-      });
+          if (input.current && !input.current()) throw new Error("session detached before launch");
+          const savedSession = member.session;
+          const terminal = input.terminal;
+          // Keep authority stable through the synchronous launch/commit. Lock
+          // ordering matches admission: config -> runtime; no runtime -> config.
+          return withLock(paths.runtimeStatusPath(input.team, "team-lead"), async () => {
+            const latestLead = runtime.readRuntimeStatusSync(input.team, "team-lead");
+            if (input.current && !input.current() || latestLead?.instanceId !== input.leaderInstanceId || latestLead.detached || latestLead.activity === "stopped") {
+              throw new Error("lead authority changed before launch");
+            }
+            // A close could not have run while this config lock is held, but an
+            // explicit open intent must still be current at the launch commit.
+            const latestConfig = readConfig(input.team);
+            const latestMember = latestConfig.members.find(item => item.name === name);
+            if (!latestMember || (!input.reopen && windowIntentState(latestMember) === "closed")) {
+              return { name, status: "skipped", note: "pane/window intent closed before launch; original session not started" };
+            }
+            const previousIntent = member.windowIntent;
+            if (input.reopen && windowIntentState(member) === "closed") {
+              member.windowIntent = nextWindowIntent(member.windowIntent, "open", input.reopen);
+            }
+            const token = randomUUID();
+            member.recovery = { token, ownerInstanceId: input.leaderInstanceId, phase: "reserved" };
+            atomicWriteJsonSync(configFile, config);
+            try {
+              const env: Record<string, string> = {
+                ...process.env as Record<string, string>,
+                PI_TEAM_NAME: input.team, PI_AGENT_NAME: name, PI_TEAM_RECOVERY_TOKEN: token,
+              };
+              delete env.PI_TEAM_HANDOFF_TOKEN;
+              delete env.PI_SESSION_ID;
+              delete env.PI_SESSION_FILE;
+              delete env.PI_MODEL;
+              if (savedSession.agentDir) env.PI_CODING_AGENT_DIR = savedSession.agentDir;
+              const pane = terminal.spawn({ name, cwd: savedSession.cwd,
+                command: buildPiCommand(input.piBinary, undefined, undefined, savedSession.trustArg ?? null, savedSession.file),
+                env, anchorPaneId: input.anchorPaneId, recoveryToken: token });
+              member.tmuxPaneId = pane;
+              member.recovery.phase = "launched";
+              atomicWriteJsonSync(configFile, config);
+              return { name, status: "restored", note: "pane launched for original session; registration pending, no task replay or model override" };
+            } catch (error) {
+              member.recovery.error = error instanceof Error ? error.message : String(error);
+              // Only a terminal adapter's definite pre-launch rejection permits retry.
+              if ((error as { spawned?: boolean }).spawned === false) {
+                member.recovery.phase = "failed";
+                if (previousIntent?.state === "closed") {
+                  member.windowIntent = nextWindowIntent(member.windowIntent, "closed", "rollback");
+                }
+              }
+              atomicWriteJsonSync(configFile, config);
+              throw error;
+            }
+          });
+        })
+      );
       outcomes.push(result);
     } catch (error) {
       outcomes.push({ name, status: "blocked", note: error instanceof Error ? error.message : String(error) });

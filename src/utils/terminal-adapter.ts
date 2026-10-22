@@ -9,6 +9,7 @@ import { spawnSync } from "node:child_process";
 
 /** Result of a terminal close that reports whether the command succeeded. */
 export type TerminalCloseResult = "closed" | "absent" | "failed";
+export type PanePresence = "present" | "missing" | "unknown";
 
 /**
  * Options for spawning a new terminal pane or window
@@ -88,6 +89,9 @@ export interface TerminalAdapter {
    * @returns true if pane exists and is active
    */
   isAlive(paneId: string): boolean;
+
+  /** A failed terminal query is unknown, not proof that a pane disappeared. */
+  panePresence?(paneId: string): PanePresence;
 
   /**
    * Set the title of the current terminal pane/window.

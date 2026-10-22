@@ -225,8 +225,8 @@ describe("registered teammate default guidance", () => {
 
 describe("before_agent_start registered by the extension factory", () => {
   it.each([
-    ["team-lead", `You are the team lead for team '${teamName}'.`],
-    [teammateName, `You are teammate '${teammateName}' on team '${teamName}'.`],
+    ["team-lead", "You are the pi-teams lead for this main Pi conversation."],
+    [teammateName, `You are teammate '${teammateName}' working with the original main Pi conversation.`],
   ])("refreshes %s guidance on two independent modern runs without masking other sections", async (agentName, roleLine) => {
     vi.stubEnv("PI_AGENT_NAME", agentName);
     const run = registerExtension();
@@ -261,7 +261,7 @@ describe("before_agent_start registered by the extension factory", () => {
       .mockResolvedValueOnce(teamConfig(updatedMember))
       .mockResolvedValueOnce(teamConfig(updatedMember));
     const run = registerExtension();
-    const roleLine = `You are teammate '${teammateName}' on team '${teamName}'.`;
+    const roleLine = `You are teammate '${teammateName}' working with the original main Pi conversation.`;
     const first = modernEvent(1);
     const firstSection = expectModernRole(first, await run(first), roleLine);
     expect(firstSection).toContain("model: test/model-first with thinking level: high.");
@@ -284,15 +284,16 @@ describe("before_agent_start registered by the extension factory", () => {
     expect(mocks.updateRuntimeStatusForInstance).toHaveBeenCalledTimes(3);
   });
 
-  it("keeps create-team guidance on successive modern runs for an unbound lead without scanning HOME", async () => {
+  it("keeps implicit collaboration guidance on successive modern runs without scanning HOME", async () => {
     vi.stubEnv("PI_TEAM_NAME", undefined);
     vi.stubEnv("PI_AGENT_NAME", undefined);
     const run = registerExtension();
 
     for (const turn of [1, 2]) {
       const event = modernEvent(turn);
-      const section = expectModernRole(event, await run(event), "You are the pi-teams team lead.");
-      expect(section).toContain("Create a team with team_create");
+      const section = expectModernRole(event, await run(event), "You are the pi-teams lead for this main Pi conversation.");
+      expect(section).toContain("Omit team_name everywhere");
+      expect(section).not.toContain("Create a team with team_create");
       expect(section).toContain("Omit model, thinking, and default_model");
       expect(event.systemPromptOptions.sections.magic_context).toBe(`Magic Context supplied for turn ${turn}`);
     }
@@ -303,8 +304,8 @@ describe("before_agent_start registered by the extension factory", () => {
   });
 
   it.each([
-    ["team-lead", `You are the team lead for team '${teamName}'.`],
-    [teammateName, `You are teammate '${teammateName}' on team '${teamName}'.`],
+    ["team-lead", "You are the pi-teams lead for this main Pi conversation."],
+    [teammateName, `You are teammate '${teammateName}' working with the original main Pi conversation.`],
   ])("preserves both independent legacy base prompts and appends %s guidance on each run", async (agentName, roleLine) => {
     vi.stubEnv("PI_AGENT_NAME", agentName);
     const run = registerExtension();
@@ -333,7 +334,7 @@ describe("before_agent_start registered by the extension factory", () => {
     vi.stubEnv("PI_AGENT_NAME", teammateName);
     mocks.readConfig.mockRejectedValue(new Error("Simulated unavailable team config"));
     const run = registerExtension();
-    const roleLine = `You are teammate '${teammateName}' on team '${teamName}'.`;
+    const roleLine = `You are teammate '${teammateName}' working with the original main Pi conversation.`;
 
     for (const turn of [1, 2]) {
       const event = modernEvent(turn);
@@ -354,7 +355,7 @@ describe("before_agent_start registered by the extension factory", () => {
       const base = `Legacy base after config failure ${turn}`;
       const result = await run({ type: "before_agent_start", prompt: "Continue", systemPrompt: base });
       expect(result?.systemPrompt?.startsWith(base)).toBe(true);
-      expect(result?.systemPrompt).toContain(`You are teammate '${teammateName}' on team '${teamName}'.`);
+      expect(result?.systemPrompt).toContain(`You are teammate '${teammateName}' working with the original main Pi conversation.`);
       expect(result?.systemPrompt).not.toContain("You are currently using model:");
     }
     expect(mocks.readConfig).toHaveBeenCalledTimes(2);

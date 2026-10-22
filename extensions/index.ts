@@ -31,7 +31,9 @@ import { atomicWriteFileSync, atomicWriteJsonSync } from "../src/utils/atomic-fi
 import { resolveAgentRole } from "../src/utils/agent-role";
 import { applyTeamSystemPrompt, buildLeadSystemPrompt, buildTeammateSystemPrompt } from "../src/utils/team-prompts";
 import { buildPiCommand, getPiLaunchCommand } from "../src/utils/pi-command";
-import { Member, THINKING_LEVELS } from "../src/utils/models";
+import { Member, TeamConfig, THINKING_LEVELS, TeamSession } from "../src/utils/models";
+import { recoveryModeFor, windowIntentEpoch, windowIntentState } from "../src/utils/window-intent";
+import { observeTmuxPane } from "../src/utils/pane-observation";
 import {
   type AgentSettings,
   loadAgentSettings,
@@ -429,6 +431,11 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   let recoveryOutcomes: Awaited<ReturnType<typeof restoreTeamPanes>> = [];
   // /team-resume <team> <member> claims first, then must not reopen every peer.
   let suppressAutomaticRestore = false;
+  // First formal dispatch in a main conversation creates its internal record
+  // once, even if two tool calls race.
+  let collaborationEnsuring: Promise<string> | null = null;
+  // Suppress pane-loss inference while our own terminal operations close panes.
+  let closingPanes = 0;
 
   const terminal = getTerminalAdapter();
 
@@ -1293,7 +1300,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       if (isTeammate) {
         atomicWriteFileSync(path.join(paths.teamDir(teamName), `${agentName}.pid`), process.pid.toString());
         ctx.ui.setStatus("00-pi-teams", `[${agentName.toUpperCase()}]`);
-      } else ctx.ui.setStatus("pi-teams", `Lead @ ${teamName}`);
+      } else ctx.ui.setStatus("pi-teams", "Lead");
       // A same-process reload has no lost panes to restore, and peers may be
       // mid-reload themselves. `/team-resume` remains the explicit retry.
       // A named /team-resume suppresses this pass and restores only that member.
@@ -1308,7 +1315,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
           recoveryOutcomes.some(item => item.status === "blocked") ? "warning" : "info");
       }
       if (!sessionStopping) startInboxPolling();
-      if (!sessionStopping && terminal) terminal.setTitle(`${teamName}: ${agentName}`);
+      if (!sessionStopping && terminal) terminal.setTitle(agentName === "team-lead" ? "Lead" : `Teammate: ${agentName}`);
     } catch (error) {
       if (attached) {
         // A PID-file/UI/pane-restoration failure after successful admission must
@@ -1324,20 +1331,44 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   }
 
   pi.registerCommand("team-resume", {
-    description: "Reopen missing roster sessions for this lead: /team-resume <team> [member]. Omitting the member reopens every missing teammate. Never forces a live owner, never starts a new conversation, and never replays tasks.",
+    description: "Reopen original roster sessions for this lead. `/team-resume` opens every missing teammate, `/team-resume <member>` opens one; both clear a keep-closed intent and never start a new conversation or replay tasks. The legacy `/team-resume <team> [member]` alias works only for this conversation's exact lead binding.",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
-      const requested = paths.sanitizeName(parts[0] ?? "");
-      const member = parts[1] ? paths.sanitizeName(parts[1]) : undefined;
-      if (!requested || parts.length > 2) throw new Error("Usage: /team-resume <team> [member]");
+      if (parts.length > 2) throw new Error("Usage: /team-resume [member] (legacy: /team-resume <team> [member])");
       if (sessionStopping) throw new Error("Session is detaching");
       const actual = sessionIdentity(ctx);
       if (!actual) throw new Error("Persistent Pi session required");
-      if (teamName && (teamName !== requested || isTeammate)) throw new Error("Already attached to another team/member");
-      const wasAttached = !!teamName;
-      if (!wasAttached) {
+
+      let member: string | undefined;
+      let requested: string;
+      if (teamName) {
+        if (isTeammate) throw new Error("Only the team lead can resume team panes");
+        requested = teamName;
+        if (parts.length === 1) {
+          const token = paths.sanitizeName(parts[0]);
+          const config = await teams.readConfig(teamName);
+          if (config.members.some(item => item.name === token && item.agentType !== "lead" && item.name !== "team-lead")) {
+            member = token;
+          } else if (token !== teamName) {
+            if (teams.teamExists(token)) {
+              throw new Error(`Cannot associate ${token}: this main conversation already owns ${teamName}. Use a separate saved main conversation and /team-resume ${token}, or explicitly /team-shutdown confirm here before association. Both records are preserved.`);
+            }
+            throw new Error(`No teammate named ${token}`);
+          }
+        } else if (parts.length === 2) {
+          requested = paths.sanitizeName(parts[0]);
+          member = paths.sanitizeName(parts[1]);
+          if (requested !== teamName) throw new Error(`This session is attached to a different collaboration, not ${requested}`);
+        }
+      } else {
+        if (parts.length === 0) throw new Error("Usage: /team-resume <team> [member] for an existing saved collaboration");
+        requested = paths.sanitizeName(parts[0]);
+        member = parts[1] ? paths.sanitizeName(parts[1]) : undefined;
         const saved = findSessionMember(actual);
-        if (saved && (saved.teamName !== requested || saved.member.agentType !== "lead")) throw new Error("This conversation is already bound to another team/member");
+        if (saved && (saved.teamName !== requested || saved.member.agentType !== "lead")) {
+          throw new Error("This conversation is already bound to another team/member");
+        }
+        if (!teams.teamExists(requested)) throw new Error(`Collaboration ${requested} does not exist`);
         if (member) suppressAutomaticRestore = true;
         try {
           await claimSession({ team: requested, agent: "team-lead", identity: actual,
@@ -1348,21 +1379,14 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
         } finally {
           suppressAutomaticRestore = false;
         }
+        if (teamName !== requested) return;
       }
-      if (teamName !== requested) return;
-      // A fresh attach with no member already restored every missing peer.
-      if (!member && !wasAttached) return;
-      if (member) {
-        const config = await teams.readConfig(requested);
-        if (!config.members.some(item => item.name === member && item.agentType !== "lead" && item.name !== "team-lead")) {
-          throw new Error(`No teammate named ${member}`);
-        }
+
+      await performResume(requested, member);
+      if (!sessionStopping) {
+        ctx.ui.notify(recoveryOutcomes.map(item => `${item.name}: ${item.status}${item.note ? ` — ${item.note}` : ""}`).join("\n")
+          || "No missing roster members.", "info");
       }
-      recoveryOutcomes = await restoreTeamPanes({ team: requested, leaderInstanceId: runtimeInstanceId,
-        terminal, piBinary: getPiLaunchCommand(), anchorPaneId: process.env.TMUX_PANE,
-        members: member ? [member] : undefined,
-        current: () => !sessionStopping });
-      if (!sessionStopping) ctx.ui.notify(recoveryOutcomes.map(item => `${item.name}: ${item.status}${item.note ? ` — ${item.note}` : ""}`).join("\n") || "No missing roster members.", "info");
     },
   });
 
@@ -1417,28 +1441,29 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Set Teammate Model",
     description: "Change a teammate's model through its extension, without asking or running the teammate model. Works even when its old model has no quota; interrupted sessions stay paused. Only the target team's live lead may call this. Supplying model queues a request and returns pending, NOT proof of success. Omit model to query the latest request: pending, applied, refused, or no_request. Check applied before claiming success; do not resubmit just to poll. Not dispatch: does not open a work generation. In-flight turns keep their old model.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       agent_name: Type.String(),
       model: Type.Optional(Type.String({ description: "Override as provider/model. Omit to query status without sending another request." })),
       thinking: Type.Optional(Type.Union(THINKING_LEVELS.map(level => Type.Literal(level)))),
     }),
-    async execute(_toolCallId, params) {
-      await assertLiveLead(params.team_name, "change a teammate model");
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const team = await resolveTeamScope(params.team_name, ctx);
+      await assertLiveLead(team, "change a teammate model");
       if (!params.model && params.thinking) throw new Error("thinking requires model");
-      const config = await teams.readConfig(params.team_name);
+      const config = await teams.readConfig(team);
       const agent = paths.sanitizeName(params.agent_name);
       if (!config.members.some(member => member.name === agent && member.agentType !== "lead" && member.name !== "team-lead")) {
         throw new Error(`No teammate named ${agent}`);
       }
       const submitted = params.model
-        ? await submitTeammateModelChange(params.team_name, agent, params.model, params.thinking)
+        ? await submitTeammateModelChange(team, agent, params.model, params.thinking)
         : undefined;
-      const request = submitted?.request ?? readModelChange(params.team_name, agent);
-      const result = readModelChangeResult(params.team_name, agent);
+      const request = submitted?.request ?? readModelChange(team, agent);
+      const result = readModelChangeResult(team, agent);
       const status = submitted ? "pending" : !request ? "no_request"
         : result?.requestId !== request.id ? "pending" : result.ok ? "applied" : "refused";
       const details = {
-        team_name: params.team_name, agent_name: agent, status,
+        team_name: team, agent_name: agent, status,
         request_id: request?.id, model: request?.model, thinking: request?.thinking,
         ...(status === "refused" ? { error: result?.error } : {}),
       };
@@ -1765,7 +1790,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   });
 
   /** Only the lead conversation that currently owns this team's runtime lease. */
-  async function assertLiveLead(requested: string, action: "close" | "shut down" | "resume" | "change a teammate model"): Promise<void> {
+  async function assertLiveLead(requested: string, action: "close" | "shut down" | "resume" | "change a teammate model" | "launch a template"): Promise<void> {
     if (isTeammate) {
       throw new Error(action === "close"
         ? "Only the team lead can close team panes"
@@ -1773,7 +1798,9 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
           ? "Only the team lead can shut down an entire team"
           : action === "resume"
             ? "Only the team lead can resume team panes"
-            : "Only the team lead can change a teammate model");
+            : action === "launch a template"
+              ? "Only the team lead can launch a template"
+              : "Only the team lead can change a teammate model");
     }
     const owned = !!teamName && teamName === requested && !!identity
       && identity.id && identity.file;
@@ -1785,7 +1812,7 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       && status.activity !== "stopped" && runtime.isRuntimeProcessAlive(status)
       && status.sessionId === identity?.id && status.sessionFile === identity?.file;
     if (!owned || !sameConversation || !liveLease) {
-      throw new Error(`Only the live lead of ${requested} can ${action} it`);
+      throw new Error(`Only the live lead of ${requested} can ${action}${action === "launch a template" ? "" : " it"}`);
     }
   }
 
@@ -1793,40 +1820,6 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     if (terminalClosesProcesses(terminal)) return;
     const which = terminal?.name === "zellij" ? "Zellij" : "Windows Terminal";
     throw new Error(`${which} cannot close teammate panes, so /team-${action === "close" ? "close" : "shutdown"} did not change this team. No member was marked stopped.`);
-  }
-
-  /** Fail a launch that has not registered yet. Pane and window ids come from this locked record, not an earlier snapshot. */
-  async function invalidatePendingLaunch(team: string, memberName: string, action: "close" | "shut down"): Promise<{ cancelled: boolean; pane?: string; windowId?: string; phase?: "reserved" | "launched" }> {
-    const configFile = paths.configPath(team);
-    return withLock(configFile, async () => {
-      const config = JSON.parse(fs.readFileSync(configFile, "utf8")) as { members: Member[] };
-      const member = config.members.find(item => item.name === memberName);
-      const phase = member?.recovery?.phase;
-      if (!member?.recovery || phase === "attached" || phase === "failed") return { cancelled: false };
-      // A launch can appear after the preflight. Refuse before the durable failure write.
-      if (!terminalClosesProcesses(terminal)) requireCloseableTerminal(action);
-      const pane = phase === "launched" && member.tmuxPaneId ? member.tmuxPaneId : undefined;
-      const windowId = phase === "launched" && member.windowId ? member.windowId : undefined;
-      member.recovery.phase = "failed";
-      member.recovery.error = "closed before the restored session registered";
-      atomicWriteJsonSync(configFile, config);
-      return { cancelled: true, pane, windowId, phase };
-    });
-  }
-
-  /** Put a pending launch back when the terminal close did not succeed, so a later close can retry. */
-  async function restorePendingLaunch(team: string, memberName: string, phase: "reserved" | "launched"): Promise<void> {
-    const configFile = paths.configPath(team);
-    await withLock(configFile, async () => {
-      if (!fs.existsSync(configFile)) return;
-      const config = JSON.parse(fs.readFileSync(configFile, "utf8")) as { members: Member[] };
-      const member = config.members.find(item => item.name === memberName);
-      if (member?.recovery?.phase !== "failed") return;
-      if (member.recovery.error !== "closed before the restored session registered") return;
-      member.recovery.phase = phase;
-      delete member.recovery.error;
-      atomicWriteJsonSync(configFile, config);
-    });
   }
 
   async function memberIsRunning(team: string, member: Member): Promise<boolean> {
@@ -1910,22 +1903,49 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   async function deliverUnexpectedStopNotices(team: string): Promise<void> {
     const config = await teams.readConfig(team).catch(() => null);
     if (!config || !teamAcceptsWrites(team)) return;
+    const leadStatus = await runtime.readRuntimeStatus(team, "team-lead");
+    const leadObserves = !!leadStatus && leadStatus.instanceId === runtimeInstanceId
+      && !leadStatus.detached && leadStatus.activity !== "stopped"
+      && runtime.isRuntimeProcessAlive(leadStatus);
     const losses: { id: string; text: string }[] = [];
     for (const member of config.members) {
       if (member.agentType === "lead" || member.name === "team-lead") continue;
       const status = await runtime.readRuntimeStatus(team, member.name);
+      const pendingLaunch = !!member.recovery
+        && member.recovery.phase !== "attached" && member.recovery.phase !== "failed";
+      // A missing pane is durable close intent only when the lead is alive and
+      // this adapter can actually observe absence. This also covers a member
+      // whose runtime file is stale or gone: membership data is still enough.
+      // Only tmux has a tested, reliable absence check. Other adapters keep
+      // their existing notices but never create durable close intent.
+      const observes = terminal?.name === "tmux";
+      const paneChecked = !!(member.tmuxPaneId && terminal);
+      const paneMissing = paneChecked && (observes
+        ? observeTmuxPane(terminal, member.tmuxPaneId, process.env.TMUX_PANE) === "missing"
+        : !terminal!.isAlive(member.tmuxPaneId!));
+      // A tmux adapter cannot inspect iTerm/WezTerm/synthetic window IDs.
+      const windowChecked = !!(member.windowId && terminal && !observes);
+      const windowMissing = windowChecked && !terminal!.isWindowAlive(member.windowId!);
+      const lost = paneMissing || windowMissing;
+      const confirmedLoss = observes && paneMissing;
+      if (leadObserves && confirmedLoss && !closingPanes && !pendingLaunch && !status?.reloading
+        && windowIntentState(member) === "open") {
+        await withLock(paths.configPath(team) + `.window-${paths.sanitizeName(member.name)}`, async () => {
+          const latest = (await teams.readConfig(team)).members.find(item => item.name === member.name);
+          if (latest) await rememberMissingPane(team, latest);
+        });
+      }
       if (!status?.instanceId || status.reloading) continue;
       const processAlive = !status.detached && status.activity !== "stopped" && runtime.isRuntimeProcessAlive(status);
-      const paneChecked = !!(member.tmuxPaneId && terminal);
-      const paneMissing = paneChecked && !terminal!.isAlive(member.tmuxPaneId!);
       const confirmedDead = status.detached === true || status.activity === "stopped" || !runtime.isRuntimeProcessAlive(status);
-      if (processAlive && !paneMissing) continue;
-      if (!confirmedDead && !paneMissing) continue;
-      const text = paneMissing && processAlive
-        ? `${member.name} pane is missing; the process is still recorded as alive. The session stays on the roster and is not restarted.`
-        : paneMissing
-          ? `${member.name} stopped and its pane is missing. The session stays on the roster. Tasks are unchanged and it is not restarted.`
-          : paneChecked
+      if (processAlive && !lost) continue;
+      if (!confirmedDead && !lost) continue;
+      const what = paneMissing ? "pane" : "window";
+      const text = lost && processAlive
+        ? `${member.name} ${what} is missing; the process is still recorded as alive. The session stays on the roster and is not restarted.`
+        : lost
+          ? `${member.name} stopped and its ${what} is missing. The session stays on the roster. Tasks are unchanged and it is not restarted.`
+          : paneChecked || windowChecked
             ? `${member.name} stopped. The session stays on the roster. Tasks are unchanged and it is not restarted.`
             : `${member.name} stopped. The session stays on the roster. Tasks are unchanged and it is not restarted. Its pane was not checked.`;
       losses.push({ id: status.instanceId, text });
@@ -2076,12 +2096,39 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     recoveryOutcomes = await restoreTeamPanes({ team, leaderInstanceId: runtimeInstanceId,
       terminal, piBinary: getPiLaunchCommand(), anchorPaneId: process.env.TMUX_PANE,
       members: member ? [member] : undefined,
+      reopen: "resume",
       current: () => !sessionStopping });
     return recoveryOutcomes.map(item => `${item.name}: ${item.status}${item.note ? ` — ${item.note}` : ""}`).join("\n") || "No missing roster members.";
   }
 
+  /** Remember an observed loss, not the absence caused by a managed batch close.
+   * Caller holds the member's window-operation lock, excluding restore/spawn.
+   */
+  async function rememberMissingPane(team: string, member: Member, snapshotBeforeClose = false): Promise<void> {
+    if ((closingPanes && !snapshotBeforeClose) || sessionStopping || terminal?.name !== "tmux"
+      || windowIntentState(member) === "closed") return;
+    const status = await runtime.readRuntimeStatus(team, member.name);
+    if (status?.reloading || (status?.activity === "stopped" && !status.instanceId)
+      || member.recovery?.error === teams.CLOSE_CANCEL_ERROR
+      || (member.recovery && ["reserved", "launched"].includes(member.recovery.phase))) return;
+    const lead = await runtime.readRuntimeStatus(team, "team-lead");
+    if (sessionStopping || (closingPanes && !snapshotBeforeClose) || lead?.instanceId !== runtimeInstanceId
+      || lead.detached || lead.activity === "stopped" || !runtime.isRuntimeProcessAlive(lead)) return;
+    const missing = observeTmuxPane(terminal, member.tmuxPaneId, process.env.TMUX_PANE) === "missing";
+    if (missing) await teams.setWindowIntent(team, member.name, "closed", "pane-missing", windowIntentEpoch(member));
+  }
+
   /** Close live teammates and cancel pane launches that have not registered. Lead pane stays. */
   async function closeTeammatePanes(team: string, action: "close" | "shut down" = "close", only?: string): Promise<string[]> {
+    closingPanes++;
+    try {
+      return await closeTeammatePanesInner(team, action, only);
+    } finally {
+      closingPanes--;
+    }
+  }
+
+  async function closeTeammatePanesInner(team: string, action: "close" | "shut down", only?: string): Promise<string[]> {
     const config = await teams.readConfig(team);
     let teammates = config.members.filter(member => member.agentType !== "lead" && member.name !== "team-lead");
     if (only) {
@@ -2096,43 +2143,76 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     }
     if (needsTerminal) requireCloseableTerminal(action);
     const lines: string[] = [];
+    const reason = only ? "close-member" : "close-team";
     for (const member of teammates) {
-      const fresh = (await teams.readConfig(team)).members.find(item => item.name === member.name) ?? member;
-      const phase = fresh.recovery?.phase;
-      const pendingNow = !!phase && phase !== "attached" && phase !== "failed";
-      const runningNow = await memberIsRunning(team, fresh);
-      if ((pendingNow || runningNow) && !terminalClosesProcesses(terminal)) {
-        requireCloseableTerminal(action);
-      }
-      const prior = await runtime.readRuntimeStatus(team, member.name);
-      const instanceId = prior?.instanceId;
-      if (instanceId && (pendingNow || runningNow)) await expectStop(team, instanceId);
-      const pending = await invalidatePendingLaunch(team, member.name, action);
-      if (pending.cancelled) {
-        let failed = false;
-        if (terminal) {
-          if (pending.windowId && terminal.killWindow(pending.windowId) === "failed") failed = true;
-          if (pending.pane && terminal.kill(pending.pane) === "failed") failed = true;
+      // Serialize close against an explicit resume/delegate restore for this
+      // member. The lock order is window-op -> config -> runtime.
+      const line = await withLock(paths.configPath(team) + `.window-${paths.sanitizeName(member.name)}`, async () => {
+        let fresh = (await teams.readConfig(team)).members.find(item => item.name === member.name) ?? member;
+        if (!only) {
+          // Catch a user close immediately before /team-close, even when the
+          // poller has not had its next one-second observation yet.
+          await rememberMissingPane(team, fresh, true);
+          fresh = (await teams.readConfig(team)).members.find(item => item.name === member.name) ?? fresh;
         }
-        if (failed) {
-          if (pending.phase) await restorePendingLaunch(team, member.name, pending.phase);
+        const phase = fresh.recovery?.phase;
+        const pendingNow = !!phase && phase !== "attached" && phase !== "failed";
+        const runningNow = await memberIsRunning(team, fresh);
+        if ((pendingNow || runningNow) && !terminalClosesProcesses(terminal)) {
+          requireCloseableTerminal(action);
+        }
+        const prior = await runtime.readRuntimeStatus(team, member.name);
+        const instanceId = prior?.instanceId;
+        if (instanceId && (pendingNow || runningNow)) await expectStop(team, instanceId);
+
+        // Record the close intent and cancel a pending launch in one config
+        // write. A failed close restores prior state with a newer epoch,
+        // unless a newer explicit resume already changed the intent.
+        const transition = await teams.beginWindowClose(team, member.name, reason, {
+          preserveIntent: !only,
+          requireCloseableLaunch: () => requireCloseableTerminal(action),
+        });
+        const rollback = async () => {
+          if (transition.changedIntent || transition.cancelledLaunch) {
+            await teams.rollbackWindowClose(team, member.name, transition.intent?.epoch ?? 0,
+              transition.previousIntent, transition.cancelledLaunch?.phase).catch(() => false);
+          }
+        };
+
+        try {
+          const cancelled = transition.cancelledLaunch;
+          if (cancelled) {
+            let failed = false;
+            if (terminal) {
+              if (cancelled.windowId && terminal.killWindow(cancelled.windowId) === "failed") failed = true;
+              if (cancelled.pane && terminal.kill(cancelled.pane) === "failed") failed = true;
+            }
+            if (failed) {
+              await rollback();
+              if (instanceId) await clearExpectedStop(team, instanceId);
+              return `${member.name}: close failed`;
+            }
+            return `${member.name}: closed`;
+          }
+          const current = (await teams.readConfig(team)).members.find(item => item.name === member.name) ?? fresh;
+          if (!(await memberIsRunning(team, current))) {
+            if (instanceId) await markStopKnown(team, instanceId);
+            return `${current.name}: not running`;
+          }
+          if (!terminalClosesProcesses(terminal)) requireCloseableTerminal(action);
+          const outcome = await killTeammate(team, current);
+          if (outcome !== "closed") {
+            await rollback();
+            if (instanceId) await clearExpectedStop(team, instanceId);
+          }
+          return `${current.name}: ${outcome === "closed" ? "closed" : outcome === "lease-changed" ? "lease changed" : "close failed"}`;
+        } catch (error) {
+          await rollback();
           if (instanceId) await clearExpectedStop(team, instanceId);
-          lines.push(`${member.name}: close failed`);
-        } else {
-          lines.push(`${member.name}: closed`);
+          throw error;
         }
-        continue;
-      }
-      const current = (await teams.readConfig(team)).members.find(item => item.name === member.name) ?? fresh;
-      if (!(await memberIsRunning(team, current))) {
-        if (instanceId) await markStopKnown(team, instanceId);
-        lines.push(`${current.name}: not running`);
-        continue;
-      }
-      if (!terminalClosesProcesses(terminal)) requireCloseableTerminal(action);
-      const outcome = await killTeammate(team, current);
-      if (outcome !== "closed" && instanceId) await clearExpectedStop(team, instanceId);
-      lines.push(`${current.name}: ${outcome === "closed" ? "closed" : outcome === "lease-changed" ? "lease changed" : "close failed"}`);
+      });
+      lines.push(line);
     }
     return lines;
   }
@@ -2269,6 +2349,8 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       thinking: member.thinking,
       modelThinkingSource: "spawn-time hints; current/restored Pi session can differ",
       recoveryOutcome: recoveryOutcomes.find(item => item.name === member.name),
+      windowIntent: member.windowIntent,
+      recoveryMode: recoveryModeFor(member),
       awaitingConfirmation: runtimeStatus?.inboxAwaitingConfirmation,
       session: member.session ? { id: member.session.id, confirmed: member.session.confirmed } : undefined,
       recovery: member.recovery,
@@ -2404,11 +2486,104 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     await publishInFlightTurn();
   }
 
+  /** Opaque, stable collaboration id derived only from this exact main session. */
+  function internalTeamName(session: TeamSession): string {
+    return paths.sanitizeName(`session-${session.id.replace(/[^a-zA-Z0-9_-]/g, "_")}`);
+  }
+
+  /**
+   * The current main conversation is the collaboration entry. Reuse an exact
+   * existing binding if this conversation already owns one; otherwise create
+   * the internal record on first real dispatch. Never select by cwd/PID only.
+   */
+  async function ensureCollaboration(ctx: any): Promise<string> {
+    if (teamName) return teamName;
+    if (collaborationEnsuring) return collaborationEnsuring;
+    collaborationEnsuring = (async () => {
+      const actual = sessionIdentity(ctx) ?? identity;
+      identity = actual;
+      if (!actual) throw new Error("A persistent Pi session is required to start collaboration");
+
+      const saved = findSessionMember(actual);
+      if (saved) {
+        if (saved.member.agentType !== "lead") {
+          throw new Error("This conversation is a teammate session, not the collaboration lead");
+        }
+        await attachSession({ reason: "resume" }, ctx);
+        if (!teamName) throw new Error("Could not attach the existing collaboration for this conversation");
+        return teamName;
+      }
+
+      const name = internalTeamName(actual);
+      if (teams.teamExists(name)) {
+        const existing = await teams.readConfig(name);
+        const lead = existing.members.find(member => member.agentType === "lead" || member.name === "team-lead");
+        if (!lead?.session) {
+          // A pre-binding internal record can survive an older partial create.
+          // Recover only this deterministic session id, with no other members,
+          // and through normal dead-owner admission. Never guess legacy files.
+          if (!existing.internal || existing.leadSessionId !== actual.id || existing.members.length !== 1) {
+            throw new Error(`Incomplete collaboration ${name}; data preserved. Associate its original saved main conversation with /team-resume ${name} before dispatching.`);
+          }
+          await claimSession({ team: name, agent: "team-lead", identity: actual,
+            instanceId: runtimeInstanceId, pid: process.pid, processStartToken,
+            paneId: process.env.TMUX_PANE, manualAssociation: true, current: () => !sessionStopping });
+          await attachSession({ reason: "resume" }, ctx);
+          if (!teamName) throw new Error(`Could not attach recovered collaboration ${name}; data preserved`);
+          return teamName;
+        }
+        if (lead.session.id !== actual.id || lead.session.file !== actual.file) {
+          throw new Error(`Collaboration ${name} is bound to session ${lead.session.id} at ${lead.session.file}, not this session file. Restore the recorded original conversation; no mapping was changed.`);
+        }
+      } else {
+        await teams.createTeam(name, actual.id, "lead-agent", "Session collaboration", undefined, undefined, true, actual);
+      }
+      await attachCreatedTeam(name, ctx);
+      if (!teamName) throw new Error("Could not start the collaboration for this conversation");
+      return teamName;
+    })().finally(() => { collaborationEnsuring = null; });
+    return collaborationEnsuring;
+  }
+
+  /**
+   * Omitted team_name means the attached collaboration. An explicit name is a
+   * legacy alias only; it must match this exact conversation and never selects
+   * another team. `create` is limited to delegate/template dispatch.
+   */
+  async function resolveTeamScope(
+    requested: string | undefined,
+    ctx: any,
+    options: { create?: boolean } = {},
+  ): Promise<string> {
+    if (requested !== undefined) {
+      const safe = paths.sanitizeName(requested);
+      if (teamName) {
+        if (safe !== teamName) {
+          throw new Error(`This session is bound to ${teamName}; team_name is optional and cannot select another team`);
+        }
+        return teamName;
+      }
+      const actual = sessionIdentity(ctx) ?? identity;
+      if (actual) {
+        const saved = findSessionMember(actual, safe);
+        if (saved && saved.teamName === safe && saved.member.agentType === "lead") {
+          await attachSession({ reason: "resume" }, ctx);
+          if (teamName === safe) return safe;
+        }
+      }
+      throw new Error("No collaboration is attached to this session. Omit team_name; only the exact original lead conversation can reopen an existing collaboration.");
+    }
+    if (teamName) return teamName;
+    if (options.create) return await ensureCollaboration(ctx);
+    throw new Error("No active collaboration in this session yet. Delegate a task to start one.");
+  }
+
   // Tools
   pi.registerTool({
     name: "team_create",
-    label: "Create Team",
-    description: "Create a new agent team. Omit default_model to preserve configured teammate defaults; supply it only when the user explicitly requests a team-wide model override, never based on task difficulty.",
+    label: "Create Team (legacy, hidden)",
+    exposure: "hidden",
+    description: "Legacy hidden compatibility only. New usage delegates or launches a template; the current main session creates its internal collaboration record automatically. Omit default_model to preserve configured teammate defaults; supply it only when the user explicitly requests this override, never based on task difficulty.",
     parameters: Type.Object({
       team_name: Type.String(),
       description: Type.Optional(Type.String()),
@@ -2438,9 +2613,9 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   pi.registerTool({
     name: "delegate_task",
     label: "Delegate Task",
-    description: "Create a task, assign it to a teammate, and spawn or reuse that teammate as needed. This is the formal dispatch boundary: it arms the team quiescence fallback for new or follow-up work. For new teammates, omit model and thinking to use configured teammate defaults. Supply either only when the user explicitly requests that override; never choose overrides based on task difficulty. Reusing a live teammate does not change its model or thinking.",
+    description: "Create a task, assign it to a teammate, and spawn or reuse that teammate as needed. On the first call in a main Pi conversation it starts the internal collaboration record automatically; team_name is optional and defaults to this session. This is the formal dispatch boundary: it arms the team quiescence fallback for new or follow-up work. For new teammates, omit model and thinking to use configured teammate defaults. Supply either only when the user explicitly requests that override; never choose overrides based on task difficulty. Reusing a live teammate does not change its model or thinking.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       teammate_name: Type.String(),
       cwd: Type.String(),
       task_subject: Type.String(),
@@ -2452,18 +2627,14 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       separate_window: Type.Optional(Type.Boolean({ default: false })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const safeTeamName = paths.sanitizeName(params.team_name);
+      const safeTeamName = await resolveTeamScope(params.team_name, ctx, { create: true });
       const safeName = paths.sanitizeName(params.teammate_name);
       const reuse = params.reuse ?? "existing";
 
-      if (!teams.teamExists(safeTeamName)) {
-        throw new Error(`Team ${params.team_name} does not exist`);
-      }
-
       let teamConfig = await teams.readConfig(safeTeamName);
       let member = teamConfig.members.find(m => m.name === safeName && m.agentType === "teammate");
-      const memberRuntime = member ? await runtime.readRuntimeStatus(safeTeamName, member.name) : null;
-      const memberAlive = member ? isMemberAlive(safeTeamName, member, memberRuntime) : false;
+      let memberRuntime = member ? await runtime.readRuntimeStatus(safeTeamName, member.name) : null;
+      let memberAlive = member ? isMemberAlive(safeTeamName, member, memberRuntime) : false;
       const restoreExisting = !!member && reuse === "existing" && !memberAlive;
       const willSpawn = !member || reuse === "replace";
       if (restoreExisting && member?.recovery && ["reserved", "launched"].includes(member.recovery.phase)) {
@@ -2607,9 +2778,13 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
         }
       }
 
-      const restoreOutcome = restoreExisting ? (await restoreTeamPanes({ team: safeTeamName,
+      // Delegation is an explicit reopen: restoreTeamPanes clears a keep-closed
+      // intent and launches the original session under one config/window lock.
+      const reopenExisting = !!member && reuse === "existing" && !spawnConfig;
+      const restoreOutcome = reopenExisting ? (await restoreTeamPanes({ team: safeTeamName,
         leaderInstanceId: runtimeInstanceId, terminal, piBinary: getPiLaunchCommand(),
-        anchorPaneId: process.env.TMUX_PANE, members: [safeName], current: () => !sessionStopping }))[0] : undefined;
+        anchorPaneId: process.env.TMUX_PANE, members: [safeName],
+        reopen: "delegate-reuse", current: () => !sessionStopping }))[0] : undefined;
       // Restoration itself does not arm a generation; this new assignment does,
       // even if its original-session pane recovery is blocked.
       await openFormalGeneration(safeTeamName);
@@ -2629,15 +2804,14 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Spawn Lead Window",
     description: "Move the team lead to a separate OS window. The current lead session exits after the handoff so only one lead consumes the inbox.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       cwd: Type.Optional(Type.String()),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const safeTeamName = paths.sanitizeName(params.team_name);
+      const safeTeamName = await resolveTeamScope(params.team_name, ctx);
       if (isTeammate || agentName !== "team-lead" || teamName !== safeTeamName) {
-        throw new Error("spawn_lead_window must be called by the lead session currently bound to this team");
+        throw new Error("spawn_lead_window must be called by the lead session currently bound to this collaboration");
       }
-      if (!teams.teamExists(safeTeamName)) throw new Error(`Team ${params.team_name} does not exist`);
       if (!terminal || !terminal.supportsWindows()) throw new Error("Windows mode not supported.");
 
       const teamConfig = await teams.readConfig(safeTeamName);
@@ -2729,28 +2903,29 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Team Message",
     description: "Send a message to one teammate, the lead, or everyone on the team. Delivery does not resume an interrupted session; that mail stays unread until a direct user prompt in the recipient session.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       to: Type.String({ description: "Recipient name, 'team-lead', or 'all'." }),
       content: Type.String(),
       summary: Type.Optional(Type.String()),
       color: Type.Optional(Type.String()),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
+      const team = await resolveTeamScope(params.team_name, ctx);
       const summary = params.summary || params.content.split("\n")[0].slice(0, 80);
       if (params.to === "all") {
-        await messaging.broadcastMessage(params.team_name, agentName, params.content, summary, params.color);
+        await messaging.broadcastMessage(team, agentName, params.content, summary, params.color);
         return {
           content: [{ type: "text", text: "Message sent to all team members." }],
           details: { to: "all" },
         };
       }
 
-      const config = await teams.readConfig(params.team_name);
+      const config = await teams.readConfig(team);
       if (!config.members.some(m => m.name === params.to)) {
-        throw new Error(`Agent ${params.to} is not a member of team ${params.team_name}`);
+        throw new Error(`Agent ${params.to} is not a member of team ${team}`);
       }
 
-      await messaging.sendPlainMessage(params.team_name, agentName, params.to, params.content, summary, params.color);
+      await messaging.sendPlainMessage(team, agentName, params.to, params.content, summary, params.color);
       return {
         content: [{ type: "text", text: `Message sent to ${params.to}.` }],
         details: { to: params.to },
@@ -2764,17 +2939,14 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     description: "Block until this member receives a team message, no other live member can make progress, an optional timeout expires, or the call is aborted. A live interrupted peer is not progress-capable and does not auto-resume, but it keeps an indefinite wait open until it resumes, stops, or its process dies. The default is an indefinite wait.",
     executionMode: "sequential",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       timeout_seconds: Type.Optional(Type.Number({
         minimum: 0.001,
         description: "Optional positive timeout in seconds. Omit to wait indefinitely.",
       })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const safeTeamName = paths.sanitizeName(params.team_name);
-      if (!teamName || safeTeamName !== teamName) {
-        throw new Error(`This Pi session is bound to team ${teamName ?? "none"}, not ${safeTeamName}`);
-      }
+      const safeTeamName = await resolveTeamScope(params.team_name, ctx);
       if (params.timeout_seconds !== undefined && (
         !Number.isFinite(params.timeout_seconds) || params.timeout_seconds <= 0
       )) {
@@ -2896,10 +3068,11 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "List Tasks",
     description: "List all tasks for a team.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const taskList = await tasks.listTasks(params.team_name);
+      const team = await resolveTeamScope(params.team_name, ctx);
+      const taskList = await tasks.listTasks(team);
       return {
         content: [{ type: "text", text: JSON.stringify(taskList, null, 2) }],
         details: { tasks: taskList },
@@ -2912,11 +3085,12 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Claim Task",
     description: "Claim an unassigned task for the current agent using task locking.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       task_id: Type.String(),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const task = await tasks.claimTask(params.team_name, params.task_id, {
+      const team = await resolveTeamScope(params.team_name, ctx);
+      const task = await tasks.claimTask(team, params.task_id, {
         claimedBy: agentName,
       });
       return {
@@ -2931,12 +3105,13 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Complete Task",
     description: "Mark the current agent's task complete, running completion hooks before the status changes.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       task_id: Type.String(),
       summary: Type.Optional(Type.String()),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const task = await tasks.completeTask(params.team_name, params.task_id, {
+      const team = await resolveTeamScope(params.team_name, ctx);
+      const task = await tasks.completeTask(team, params.task_id, {
         completedBy: agentName,
         summary: params.summary,
       });
@@ -3008,11 +3183,12 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Read Task",
     description: "Read details of a specific task.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       task_id: Type.String(),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const task = await tasks.readTask(params.team_name, params.task_id);
+      const team = await resolveTeamScope(params.team_name, ctx);
+      const task = await tasks.readTask(team, params.task_id);
       return {
         content: [{ type: "text", text: JSON.stringify(task, null, 2) }],
         details: { task },
@@ -3025,15 +3201,16 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Check Teammate",
     description: "Check a single teammate's liveness, coordination activity (including interrupted), and unread messages.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       agent_name: Type.String(),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const config = await teams.readConfig(params.team_name);
+      const team = await resolveTeamScope(params.team_name, ctx);
+      const config = await teams.readConfig(team);
       const member = config.members.find(m => m.name === params.agent_name);
       if (!member) throw new Error(`Teammate ${params.agent_name} not found`);
 
-      const details = await memberSnapshot(params.team_name, member);
+      const details = await memberSnapshot(team, member);
 
       return {
         content: [{ type: "text", text: JSON.stringify(details, null, 2) }],
@@ -3047,15 +3224,16 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Team Status",
     description: "Show team members, task board, and runtime health in one response. Activity interrupted means that session was aborted and will not auto-resume until a direct user prompt. inboxAwaitingConfirmation means host acceptance of those message IDs is unknown, not that delivery failed; this process will not resend them.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const config = await teams.readConfig(params.team_name);
-      const taskList = await tasks.listTasks(params.team_name);
-      const members = await Promise.all(config.members.map(member => memberSnapshot(params.team_name, member)));
+      const team = await resolveTeamScope(params.team_name, ctx);
+      const config = await teams.readConfig(team);
+      const taskList = await tasks.listTasks(team);
+      const members = await Promise.all(config.members.map(member => memberSnapshot(team, member)));
 
       const result = { team: config.name, members, tasks: taskList,
-        recovery: params.team_name === teamName ? recoveryOutcomes : undefined };
+        recovery: team === teamName ? recoveryOutcomes : undefined };
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         details: result,
@@ -3068,12 +3246,13 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Close Teammate Panes",
     description: "Close one teammate pane, or every teammate pane, without removing anyone from the roster. Pass agent_name for one member; the lead stays. Omit agent_name to close every teammate and then exit this lead Pi back to its shell when every required pane actually closed. Use only when the user explicitly asks to close panes. Do not call this because a task finished or a member is idle. Closing does not complete tasks and does not delete the team.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       agent_name: Type.Optional(Type.String()),
     }),
     async execute(_toolCallId, params: any, _signal, _onUpdate, ctx) {
+      const team = await resolveTeamScope(params.team_name, ctx);
       const member = params.agent_name ? paths.sanitizeName(params.agent_name) : undefined;
-      const lines = await performClose(params.team_name, member || undefined, ctx);
+      const lines = await performClose(team, member || undefined, ctx);
       return {
         content: [{ type: "text", text: lines.join("\n") }],
         details: { lines },
@@ -3084,14 +3263,15 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   pi.registerTool({
     name: "team_resume",
     label: "Resume Teammate Panes",
-    description: "Reopen missing roster sessions for this lead. Pass agent_name to reopen one teammate; omit it to reopen every missing teammate. Uses the original Pi session, does not start a replacement conversation, and does not replay tasks. Use only when the user explicitly asks to reopen panes.",
+    description: "Reopen missing roster sessions for this lead. Pass agent_name to reopen one teammate; omit it to reopen every missing teammate, including members kept closed by a previous close. Uses the original Pi session, does not start a replacement conversation, and does not replay tasks. Use only when the user explicitly asks to reopen panes.",
     parameters: Type.Object({
-      team_name: Type.String(),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       agent_name: Type.Optional(Type.String()),
     }),
-    async execute(_toolCallId, params: any) {
+    async execute(_toolCallId, params: any, _signal, _onUpdate, ctx) {
+      const team = await resolveTeamScope(params.team_name, ctx);
       const member = params.agent_name ? paths.sanitizeName(params.agent_name) : undefined;
-      const text = await performResume(params.team_name, member || undefined);
+      const text = await performResume(team, member || undefined);
       return {
         content: [{ type: "text", text }],
         details: { recovery: recoveryOutcomes },
@@ -3159,18 +3339,17 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
   pi.registerTool({
     name: "create_predefined_team",
     label: "Create Predefined Team",
-    description: "Create a team from a predefined team configuration. Spawns all agents defined in the team template from teams.yaml. Each agent is spawned with its predefined prompt, tools, and settings. Successful worker launches arm the team quiescence fallback. Omit default_model to preserve template and configured teammate defaults; supply it only when the user explicitly requests an override, never based on task difficulty.",
+    description: "Start a predefined team template for the current main Pi session. Spawns all agents defined in the template from teams.yaml. If this conversation has no collaboration yet, its internal record is created automatically; team_name is optional and never selects another team. Successful worker launches arm the team quiescence fallback. Omit default_model to preserve template and configured teammate defaults; supply it only when the user explicitly requests an override, never based on task difficulty.",
     parameters: Type.Object({
-      team_name: Type.String({ description: "Name for the new team instance" }),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to use this session's collaboration; a different name is rejected." })),
       predefined_team: Type.String({ description: "Name of the predefined team template from teams.yaml" }),
       cwd: Type.String({ description: "Working directory for spawned agents" }),
       default_model: Type.Optional(Type.String({ description: "Optional model override (provider/model) for agents without a specified model. Omit to preserve template and configured teammate defaults. Supply only when the user explicitly requests this override, not based on task difficulty." })),
       separate_windows: Type.Optional(Type.Boolean({ default: false, description: "Open teammates in separate OS windows instead of panes" })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      if (teamName) {
-        throw new Error(`This lead session is already bound to team ${teamName}; shut it down before creating another team`);
-      }
+      if (isTeammate) throw new Error("Only the team lead can launch a template");
+      const wasAttached = !!teamName;
       const projectDir = ctx.cwd;
       const predefinedTeam = predefined.getPredefinedTeam(params.predefined_team, projectDir);
       
@@ -3183,12 +3362,17 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
         throw new Error("No terminal adapter detected.");
       }
 
-      // Create the team
-      identity = sessionIdentity(ctx) ?? identity;
-      if (!identity) throw new Error("A persistent Pi session is required to create a recoverable team");
-      if (findSessionMember(identity)) throw new Error("This conversation already has a team/member binding");
-      const config = await teams.createTeam(params.team_name, identity.id, "lead-agent", `Predefined team: ${params.predefined_team}`, params.default_model, params.separate_windows);
-      await attachCreatedTeam(params.team_name, ctx);
+      // Validate before creating any internal record; only this live main
+      // session may mutate the roster or publish a template assignment.
+      const safeTeamName = await resolveTeamScope(params.team_name, ctx, { create: true });
+      await assertLiveLead(safeTeamName, "launch a template");
+      if (!wasAttached) {
+        const teamUpdates: Partial<Pick<TeamConfig, "defaultModel" | "separateWindows">> = {};
+        if (params.default_model !== undefined) teamUpdates.defaultModel = params.default_model;
+        if (params.separate_windows !== undefined) teamUpdates.separateWindows = params.separate_windows;
+        if (Object.keys(teamUpdates).length > 0) await teams.updateTeam(safeTeamName, teamUpdates);
+      }
+      const config = await teams.readConfig(safeTeamName);
 
       const agentDefinitions = predefined.getAllAgentDefinitions(projectDir);
       const spawnResults: Array<{ name: string; status: string; error?: string }> = [];
@@ -3204,8 +3388,23 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
         }
 
         try {
+          await assertLiveLead(safeTeamName, "launch a template");
           const safeName = paths.sanitizeName(agentName);
-          const safeTeamName = paths.sanitizeName(params.team_name);
+          const existing = (await teams.readConfig(safeTeamName)).members
+            .find(member => member.name === safeName && member.agentType === "teammate");
+          if (existing) {
+            const outcome = (await restoreTeamPanes({ team: safeTeamName,
+              leaderInstanceId: runtimeInstanceId, terminal, piBinary: getPiLaunchCommand(),
+              anchorPaneId: process.env.TMUX_PANE, members: [safeName],
+              reopen: "delegate-reuse", current: () => !sessionStopping }))[0];
+            const status = outcome?.status === "restored" ? "restored"
+              : outcome?.status === "alive" ? "reused"
+                : outcome?.status === "pending" ? "restore-pending"
+                  : "restore-blocked";
+            await messaging.sendPlainMessage(safeTeamName, "team-lead", safeName, agentDef.prompt, "Initial prompt from predefined team");
+            spawnResults.push({ name: agentName, status, error: outcome?.note });
+            continue;
+          }
           
           let chosenModel = resolveTeammateModel({
             explicitModel: agentDef.model || params.default_model,
@@ -3273,13 +3472,13 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
       }
 
       const summary = spawnResults.map(r => `${r.name}: ${r.status}${r.error ? ` (${r.error})` : ""}`).join("\n");
-      if (spawnResults.some(result => result.status === "spawned" || result.status === "launch-unknown")) {
-        await openFormalGeneration(paths.sanitizeName(params.team_name));
+      if (spawnResults.some(result => ["spawned", "launch-unknown", "reused", "restored"].includes(result.status))) {
+        await openFormalGeneration(safeTeamName);
       }
 
       return {
-        content: [{ type: "text", text: `Team "${params.team_name}" created from predefined team "${params.predefined_team}".\n\nAgent spawn results:\n${summary}` }],
-        details: { teamName: params.team_name, predefinedTeam: params.predefined_team, results: spawnResults },
+        content: [{ type: "text", text: `Predefined template "${params.predefined_team}" started for this collaboration.\n\nAgent results:\n${summary}` }],
+        details: { teamName: safeTeamName, predefinedTeam: params.predefined_team, results: spawnResults },
       };
     },
   });
@@ -3289,17 +3488,17 @@ function createSessionExtension(pi: ExtensionAPI): () => void {
     label: "Save Team as Template",
     description: "Save a runtime team as a reusable predefined team template. Creates agent definition files and updates teams.yaml. Use this when you've created a team with custom prompts and want to reuse it later.",
     parameters: Type.Object({
-      team_name: Type.String({ description: "Name of the runtime team to save" }),
+      team_name: Type.Optional(Type.String({ description: "Optional legacy alias. Omit to save this session's collaboration; a different name is rejected." })),
       template_name: Type.String({ description: "Name for the template (e.g., 'modularization', 'frontend-team')" }),
       description: Type.Optional(Type.String({ description: "Description for the template" })),
       scope: Type.Optional(StringEnum(["user", "project"], { description: "Where to save: 'user' for global (~/.pi), 'project' for project-local (.pi). Defaults to 'user'." })),
     }),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
-      const teamName = params.team_name;
+      const teamName = await resolveTeamScope(params.team_name, ctx);
       
       // Verify the team exists
       if (!teams.teamExists(teamName)) {
-        throw new Error(`Team "${teamName}" does not exist. Use list_runtime_teams to see available teams.`);
+        throw new Error(`Collaboration "${teamName}" does not exist.`);
       }
 
       // Read the team configuration
@@ -3332,7 +3531,7 @@ ${agentSummary}
 Template location: ${result.teamsYamlPath}
 
 You can now use this template with:
-  create_predefined_team({ team_name: "new-team", predefined_team: "${params.template_name}", cwd: "..." })`;
+  create_predefined_team({ predefined_team: "${params.template_name}", cwd: "..." })`;
 
       return {
         content: [{ type: "text", text: message }],
@@ -3350,7 +3549,8 @@ You can now use this template with:
 
   pi.registerTool({
     name: "list_runtime_teams",
-    label: "List Runtime Teams",
+    exposure: "hidden",
+    label: "List Runtime Teams (legacy, hidden)",
     description: "List all runtime team configurations that can be saved as templates. These are active or saved teams from ~/.pi/teams/.",
     parameters: Type.Object({}),
     async execute(toolCallId, params: any, signal, onUpdate, ctx) {
@@ -3358,7 +3558,7 @@ You can now use this template with:
       
       if (runtimeTeams.length === 0) {
         return {
-          content: [{ type: "text", text: "No runtime teams found. Create a team with team_create first." }],
+          content: [{ type: "text", text: "No runtime teams found. Delegate a task to start a collaboration first." }],
           details: { teams: [] },
         };
       }
