@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.11.0] - 2026-10-23
+
+### Changed
+- **Main-session collaboration**: Delegate directly or launch a predefined template; the first dispatch creates an internal collaboration record. No explicit team creation, naming, or selection is needed. `team_name` is an optional compatibility alias for the current collaboration, not a selector. Legacy create/list tools are hidden from the model.
+- **Exact conversation scope**: Membership stays bound to the original Pi session ID and canonical file. Independent main conversations in the same directory, including new/fork/clone conversations, do not inherit each other’s teammates, tasks, or messages.
+- **Original-session reuse**: Explicit `/team-resume [member]` and new delegation reopen existing teammates in their original conversations. `/team-resume` without a member explicitly includes hidden teammates. Ordinary messages, status checks, model changes, and reloads do not reopen hidden panes.
+- **Fork installation**: Document the pinned LioTree GitHub tag instead of the upstream npm package, and identify this fork in repository/preview metadata while preserving upstream credit.
+
+### Fixed
+- **Remember individually closed panes**: Persist each member’s open/closed window intent separately from membership and runtime activity. Whole `/team-close` preserves each member’s prior intent, so a previously hidden teammate stays hidden when the original lead conversation returns.
+- **Confirmed tmux observations only**: A successful pane listing can record a missing teammate while its lead is alive. Failed queries and missing/unverifiable lead anchors do not hide members. A final snapshot catches manual closes immediately before whole close, without treating the command’s own pane removal as user intent.
+- **Safe recovery boundaries**: Explicitly reopening a hidden teammate reports blocked when its original process is still alive but its pane is missing or unverifiable, instead of starting a duplicate. Per-member operation locks and monotonic intent revisions keep close/reopen rollback from erasing newer intent. Unknown launches retain their session reservations.
+- **Dispatch admission**: Write the initial main-session binding atomically, recover matching lead-only partial internal records without guessing identities, and restrict predefined-template launches to the live lead.
+
+### Upgrade notes
+- Existing named collaborations and their original Pi conversation files are retained. Older members without window-intent metadata default to open; past manual pane closures cannot be inferred retrospectively.
+- Automatic pane restoration remains tmux-only. Windows Terminal and Zellij bulk close remain unsupported when a live teammate or pending launch still needs closing.
+- Requires Pi `>=1.1.0 <2` and Node.js `>=22.19.0`, unchanged from 0.10.0. This release does not add leader-role transfer or change message provenance.
+
 ## [0.10.0] - 2026-10-19
 
 ### Changed

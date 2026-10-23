@@ -14,11 +14,17 @@
 
 Requires Pi `>=1.1.0 <2` and Node.js `22.19.0` or newer. Pi `1.1.0` provides the aborted-settlement signal used to keep interrupted teammates paused without waking the lead, as well as the settled-agent lifecycle event and sequential custom-tool execution used by the coordination barrier.
 
-Open your Pi terminal and type:
+Install this fork’s pinned GitHub release:
 
 ```bash
-pi install npm:pi-teams
+pi install git:github.com/LioTree/pi-teams@v0.11.0
 ```
+
+This is the [LioTree/pi-teams](https://github.com/LioTree/pi-teams) fork. The `npm:pi-teams` package belongs to upstream and does not install this fork’s changes. Use only one pi-teams source at a time; remove an earlier local or upstream source before installing this one. Git tags are pinned: to upgrade an older tagged installation, install the new tag explicitly.
+
+### Upgrading to 0.11.0
+
+No explicit team creation or selection is needed: delegate directly from the current main conversation. Existing saved collaborations retain their original session bindings. Older member records without window-intent metadata default to open; the upgrade cannot retrospectively identify panes you manually closed before their intent was recorded. Automatic pane restoration remains tmux-only.
 
 ## Extension Compatibility
 
@@ -175,7 +181,7 @@ If you need to clean up agent sessions without shutting down a team, or want to 
 
 ## Recovering a Team
 
-Resume the **original lead Pi conversation**. Its exact session ID/file reattaches the inbox; on tmux, missing roster teammates reopen their **original sessions** in new panes. Live peers are kept. Model/thinking history, tasks, and unread mail are preserved; recovery does not replay assignments, send a continuation prompt, or open a new work generation. Interrupted sessions stay paused until direct user input.
+Resume the **original lead Pi conversation**. Its exact session ID/file reattaches the inbox; on tmux, missing roster teammates whose saved window intent is open reopen their **original sessions** in new panes. Live peers are kept. Model/thinking history, tasks, and unread mail are preserved; recovery does not replay assignments, send a continuation prompt, or open a new work generation. Interrupted sessions stay paused until direct user input.
 
 Quitting Pi, losing a terminal, or closing a pane does not remove membership. Reopening the original lead conversation restores only teammates whose saved window intent is open. Individually closed teammates stay closed. Whole `/team-close` preserves each teammate's prior intent. `/team-shutdown confirm` is the only deletion of roster/tasks/mail; chats remain available for manual `/resume` without automatic team reattachment. Restoring context does not roll back background tools or filesystem effects.
 
@@ -199,7 +205,7 @@ Reload is not dispatch; it leaves tasks, mail, and work generations unchanged. I
 
 `/team-close <member>` closes that one pane and leaves the lead attached. `/team-close` closes every live teammate pane, then exits the lead Pi back to its shell. If a teammate's runtime lease changes during the close, or the terminal refuses the close, that pane stays open and the lead Pi does not exit. The lead pane stays, and the team, tasks, and inbox remain in place. Only the live lead of that same team can run it. A teammate that is already stopped, detached, or dead is reported as `not running` and is not killed again. A restore that has not registered yet is cancelled. Busy teammates are stopped mid-run; their Pi sessions remain resumable. Resume the original lead conversation to reopen only previously open members. `/team-resume <member>` explicitly opens that member's original conversation; `/team-resume` explicitly opens every missing member, including hidden ones. Re-delegating to a closed member also opens its original conversation. Ordinary messages, status checks, and reloads never open hidden panes.
 
-If an original process still lives without a verifiable pane, explicit reopen reports blocked and preserves its hidden state; it never duplicates that live conversation. Retry after the process exits.
+If a hidden teammate’s original process still lives without a verifiable pane, explicit reopen reports blocked and preserves its hidden state; it never duplicates that live conversation. Retry after the process exits.
 
 On tmux, a pane confirmed missing by a successful listing while the lead is alive is kept closed (manual closure and a crash cannot reliably be distinguished). Before whole `/team-close`, a final snapshot catches panes closed before the next poll. Example: A closed and B open → whole close → resume lead → only B reopens. If the lead itself exits, later offline pane losses do not change the last saved intent.
 
@@ -440,6 +446,8 @@ No additional team settings are required. Pane mode is the default; `separate_wi
 - Window/pane titles are set at creation. Other windows cannot be renamed remotely through the CLI.
 
 ## 📜 Credits & Attribution
+
+This repository is a fork of [burggraf/pi-teams](https://github.com/burggraf/pi-teams) by Mark Burggraf. Upstream attribution and the MIT license are preserved.
 
 This project is a port of the excellent [claude-code-teams-mcp](https://github.com/cs50victor/claude-code-teams-mcp) by [cs50victor](https://github.com/cs50victor).
 
